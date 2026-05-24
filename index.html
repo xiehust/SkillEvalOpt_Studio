@@ -522,11 +522,6 @@
       white-space: nowrap;
     }
 
-    .gain {
-      color: var(--green);
-      font-weight: 600;
-    }
-
     .heat {
       color: var(--ink);
       background:
@@ -538,23 +533,6 @@
       color: #f8faf7;
       background: var(--teal) !important;
       font-weight: 700;
-    }
-
-    .bar-cell {
-      min-width: 170px;
-    }
-
-    .bar-track {
-      height: 10px;
-      background: #dce1e4;
-      border-radius: 999px;
-      overflow: hidden;
-    }
-
-    .bar {
-      height: 100%;
-      border-radius: 999px;
-      background: linear-gradient(90deg, var(--teal), var(--green));
     }
 
     .method-grid {
@@ -1379,77 +1357,6 @@
         </table>
       </div>
 
-      <div class="table-wrap" style="margin-top: 16px;">
-        <table aria-label="GPT-5.5 direct chat benchmark results">
-          <thead>
-            <tr>
-              <th>Benchmark</th>
-              <th>Harness</th>
-              <th class="num">No skill</th>
-              <th class="num">Best non-SkillOpt baseline</th>
-              <th class="num">SkillOpt</th>
-              <th class="num">Gain</th>
-              <th>SkillOpt score</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>SearchQA</td>
-              <td>Direct chat</td>
-              <td class="num">77.7</td>
-              <td class="num">84.8</td>
-              <td class="num"><strong>87.3</strong></td>
-              <td class="num gain">+9.6</td>
-              <td class="bar-cell"><div class="bar-track"><div class="bar" style="width: 87.3%;"></div></div></td>
-            </tr>
-            <tr>
-              <td>SpreadsheetBench</td>
-              <td>Direct chat</td>
-              <td class="num">41.8</td>
-              <td class="num">73.6</td>
-              <td class="num"><strong>80.7</strong></td>
-              <td class="num gain">+38.9</td>
-              <td class="bar-cell"><div class="bar-track"><div class="bar" style="width: 80.7%;"></div></div></td>
-            </tr>
-            <tr>
-              <td>OfficeQA</td>
-              <td>Direct chat</td>
-              <td class="num">33.1</td>
-              <td class="num">66.9</td>
-              <td class="num"><strong>72.1</strong></td>
-              <td class="num gain">+39.0</td>
-              <td class="bar-cell"><div class="bar-track"><div class="bar" style="width: 72.1%;"></div></div></td>
-            </tr>
-            <tr>
-              <td>DocVQA</td>
-              <td>Direct chat</td>
-              <td class="num">78.8</td>
-              <td class="num">90.6</td>
-              <td class="num"><strong>91.2</strong></td>
-              <td class="num gain">+12.4</td>
-              <td class="bar-cell"><div class="bar-track"><div class="bar" style="width: 91.2%;"></div></div></td>
-            </tr>
-            <tr>
-              <td>LiveMathBench</td>
-              <td>Direct chat</td>
-              <td class="num">37.6</td>
-              <td class="num">52.0</td>
-              <td class="num"><strong>66.9</strong></td>
-              <td class="num gain">+29.3</td>
-              <td class="bar-cell"><div class="bar-track"><div class="bar" style="width: 66.9%;"></div></div></td>
-            </tr>
-            <tr>
-              <td>ALFWorld</td>
-              <td>Direct chat</td>
-              <td class="num">83.6</td>
-              <td class="num">93.3</td>
-              <td class="num"><strong>95.5</strong></td>
-              <td class="num gain">+11.9</td>
-              <td class="bar-cell"><div class="bar-track"><div class="bar" style="width: 95.5%;"></div></div></td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
     </section>
 
     <section class="section" id="ablations">
