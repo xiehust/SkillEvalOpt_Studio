@@ -336,9 +336,10 @@ def get_target_client() -> AzureOpenAI | OpenAI:
             from skillopt.model.backend_config import get_target_backend
             if get_target_backend() == "qwen_chat":
                 from skillopt.model import qwen_backend as _qwen
+                target_config = _qwen.TARGET_CONFIG
                 _target_client = OpenAI(
-                    base_url=_qwen.BASE_URL,
-                    api_key=_qwen.API_KEY or "dummy",
+                    base_url=target_config.base_url,
+                    api_key=target_config.api_key or "dummy",
                 )
             else:
                 _target_client = _make_client("target")

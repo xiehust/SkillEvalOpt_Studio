@@ -1,6 +1,7 @@
-"""OpenAI-compatible Qwen chat backend for the target path."""
+"""OpenAI-compatible Qwen chat backend for optimizer and target paths."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import os
 import threading
@@ -17,32 +18,72 @@ from skillopt.model.common import (
     default_model_for_backend,
 )
 
-BASE_URL = os.environ.get("QWEN_CHAT_BASE_URL", "http://localhost:8000/v1")
-API_KEY = os.environ.get("QWEN_CHAT_API_KEY", "")
-TIMEOUT_SECONDS = float(os.environ.get("QWEN_CHAT_TIMEOUT_SECONDS", "300") or 300)
-MAX_TOKENS = int(os.environ.get("QWEN_CHAT_MAX_TOKENS", "8000") or 8000)
-TEMPERATURE: float | None = None
-_raw_temperature = os.environ.get("QWEN_CHAT_TEMPERATURE", "0.7").strip()
-if _raw_temperature:
-    TEMPERATURE = float(_raw_temperature)
-ENABLE_THINKING = os.environ.get("QWEN_CHAT_ENABLE_THINKING", "false").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
 
-TARGET_DEPLOYMENT = os.environ.get(
-    "TARGET_DEPLOYMENT",
-    default_model_for_backend("qwen_chat"),
-)
+@dataclass
+class QwenChatConfig:
+    base_url: str
+    api_key: str
+    timeout_seconds: float
+    max_tokens: int
+    temperature: float | None
+    enable_thinking: bool
+    deployment: str
+
+
+def _parse_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    return float(raw) if raw else None
+
+
+def _parse_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    raw = str(value).strip()
+    return int(raw) if raw else default
+
+
+def _role_env(role: str, key: str, default: str) -> str:
+    role_key = f"{role.upper()}_QWEN_CHAT_{key}"
+    generic_key = f"QWEN_CHAT_{key}"
+    return os.environ.get(role_key) or os.environ.get(generic_key) or default
+
+
+def _initial_config(role: str) -> QwenChatConfig:
+    role_upper = role.upper()
+    deployment_env = "OPTIMIZER_DEPLOYMENT" if role == "optimizer" else "TARGET_DEPLOYMENT"
+    return QwenChatConfig(
+        base_url=_role_env(role, "BASE_URL", "http://localhost:8000/v1"),
+        api_key=_role_env(role, "API_KEY", ""),
+        timeout_seconds=float(_role_env(role, "TIMEOUT_SECONDS", "300") or 300),
+        max_tokens=_parse_int(_role_env(role, "MAX_TOKENS", "8000"), 8000),
+        temperature=_parse_optional_float(_role_env(role, "TEMPERATURE", "0.7")),
+        enable_thinking=_parse_bool(_role_env(role, "ENABLE_THINKING", "false")),
+        deployment=(
+            os.environ.get(f"{role_upper}_QWEN_CHAT_MODEL")
+            or os.environ.get("QWEN_CHAT_MODEL")
+            or os.environ.get(deployment_env)
+            or default_model_for_backend("qwen_chat")
+        ),
+    )
+
+
+OPTIMIZER_CONFIG = _initial_config("optimizer")
+TARGET_CONFIG = _initial_config("target")
 
 _config_lock = threading.Lock()
 tracker = TokenTracker()
 
 
-def _chat_url() -> str:
-    base = BASE_URL.rstrip("/")
+def _chat_url(config: QwenChatConfig) -> str:
+    base = config.base_url.rstrip("/")
     if base.endswith("/chat/completions"):
         return base
     return f"{base}/chat/completions"
@@ -103,18 +144,22 @@ def _compat_message_from_payload(message: dict[str, Any], choice: dict[str, Any]
     )
 
 
-def _post_chat_completion(payload: dict[str, Any], timeout: float | None) -> dict[str, Any]:
+def _post_chat_completion(
+    payload: dict[str, Any],
+    timeout: float | None,
+    config: QwenChatConfig,
+) -> dict[str, Any]:
     headers = {"Content-Type": "application/json"}
-    if API_KEY:
-        headers["Authorization"] = f"Bearer {API_KEY}"
+    if config.api_key:
+        headers["Authorization"] = f"Bearer {config.api_key}"
     req = urllib.request.Request(
-        _chat_url(),
+        _chat_url(config),
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers=headers,
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout or TIMEOUT_SECONDS) as resp:
+        with urllib.request.urlopen(req, timeout=timeout or config.timeout_seconds) as resp:
             raw = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
@@ -133,20 +178,22 @@ def _chat_messages_impl(
     retries: int,
     stage: str,
     *,
+    role: str,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | dict[str, Any] | None = None,
     return_message: bool = False,
     deployment: str | None = None,
     timeout: float | None = None,
 ) -> tuple[Any, dict[str, int]]:
+    config = OPTIMIZER_CONFIG if role == "optimizer" else TARGET_CONFIG
     payload: dict[str, Any] = {
-        "model": deployment or TARGET_DEPLOYMENT,
+        "model": deployment or config.deployment,
         "messages": _json_safe(messages),
-        "max_tokens": min(max_completion_tokens, MAX_TOKENS),
+        "max_tokens": min(max_completion_tokens, config.max_tokens),
     }
-    payload["chat_template_kwargs"] = {"enable_thinking": ENABLE_THINKING}
-    if TEMPERATURE is not None:
-        payload["temperature"] = TEMPERATURE
+    payload["chat_template_kwargs"] = {"enable_thinking": config.enable_thinking}
+    if config.temperature is not None:
+        payload["temperature"] = config.temperature
     if tools:
         payload["tools"] = _json_safe(tools)
         if tool_choice is not None:
@@ -155,7 +202,7 @@ def _chat_messages_impl(
     last_err: Exception | None = None
     for attempt in range(retries):
         try:
-            data = _post_chat_completion(payload, timeout)
+            data = _post_chat_completion(payload, timeout, config)
             choices = data.get("choices") or []
             if not choices:
                 raise RuntimeError(f"Qwen chat API returned no choices: {data}")
@@ -183,35 +230,134 @@ def configure_qwen_chat(
     timeout_seconds: float | str | None = None,
     max_tokens: int | str | None = None,
     enable_thinking: bool | str | None = None,
+    optimizer_base_url: str | None = None,
+    optimizer_api_key: str | None = None,
+    optimizer_temperature: float | str | None = None,
+    optimizer_timeout_seconds: float | str | None = None,
+    optimizer_max_tokens: int | str | None = None,
+    optimizer_enable_thinking: bool | str | None = None,
+    target_base_url: str | None = None,
+    target_api_key: str | None = None,
+    target_temperature: float | str | None = None,
+    target_timeout_seconds: float | str | None = None,
+    target_max_tokens: int | str | None = None,
+    target_enable_thinking: bool | str | None = None,
 ) -> None:
-    global BASE_URL, API_KEY, TEMPERATURE, TIMEOUT_SECONDS, MAX_TOKENS, ENABLE_THINKING
     with _config_lock:
         if base_url is not None:
-            BASE_URL = str(base_url).strip() or BASE_URL
-            os.environ["QWEN_CHAT_BASE_URL"] = BASE_URL
+            os.environ["QWEN_CHAT_BASE_URL"] = str(base_url).strip()
         if api_key is not None:
-            API_KEY = str(api_key).strip()
-            os.environ["QWEN_CHAT_API_KEY"] = API_KEY
+            os.environ["QWEN_CHAT_API_KEY"] = str(api_key).strip()
         if temperature is not None:
-            raw = str(temperature).strip()
-            TEMPERATURE = float(raw) if raw else None
-            os.environ["QWEN_CHAT_TEMPERATURE"] = raw
+            os.environ["QWEN_CHAT_TEMPERATURE"] = str(temperature).strip()
         if timeout_seconds is not None:
-            TIMEOUT_SECONDS = float(timeout_seconds)
             os.environ["QWEN_CHAT_TIMEOUT_SECONDS"] = str(timeout_seconds)
         if max_tokens is not None:
-            MAX_TOKENS = int(max_tokens)
             os.environ["QWEN_CHAT_MAX_TOKENS"] = str(max_tokens)
         if enable_thinking is not None:
-            if isinstance(enable_thinking, str):
-                ENABLE_THINKING = enable_thinking.strip().lower() in {"1", "true", "yes", "on"}
-            else:
-                ENABLE_THINKING = bool(enable_thinking)
-            os.environ["QWEN_CHAT_ENABLE_THINKING"] = "true" if ENABLE_THINKING else "false"
+            os.environ["QWEN_CHAT_ENABLE_THINKING"] = (
+                "true" if _parse_bool(enable_thinking) else "false"
+            )
+        _update_config(
+            OPTIMIZER_CONFIG,
+            "optimizer",
+            base_url=optimizer_base_url if optimizer_base_url is not None else base_url,
+            api_key=optimizer_api_key if optimizer_api_key is not None else api_key,
+            temperature=(
+                optimizer_temperature
+                if optimizer_temperature is not None
+                else temperature
+            ),
+            timeout_seconds=(
+                optimizer_timeout_seconds
+                if optimizer_timeout_seconds is not None
+                else timeout_seconds
+            ),
+            max_tokens=optimizer_max_tokens if optimizer_max_tokens is not None else max_tokens,
+            enable_thinking=(
+                optimizer_enable_thinking
+                if optimizer_enable_thinking is not None
+                else enable_thinking
+            ),
+        )
+        _update_config(
+            TARGET_CONFIG,
+            "target",
+            base_url=target_base_url if target_base_url is not None else base_url,
+            api_key=target_api_key if target_api_key is not None else api_key,
+            temperature=target_temperature if target_temperature is not None else temperature,
+            timeout_seconds=(
+                target_timeout_seconds
+                if target_timeout_seconds is not None
+                else timeout_seconds
+            ),
+            max_tokens=target_max_tokens if target_max_tokens is not None else max_tokens,
+            enable_thinking=(
+                target_enable_thinking
+                if target_enable_thinking is not None
+                else enable_thinking
+            ),
+        )
+
+
+def _update_config(
+    config: QwenChatConfig,
+    role: str,
+    *,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    temperature: float | str | None = None,
+    timeout_seconds: float | str | None = None,
+    max_tokens: int | str | None = None,
+    enable_thinking: bool | str | None = None,
+) -> None:
+    env_prefix = role.upper()
+    if base_url is not None:
+        config.base_url = str(base_url).strip() or config.base_url
+        os.environ[f"{env_prefix}_QWEN_CHAT_BASE_URL"] = config.base_url
+    if api_key is not None:
+        config.api_key = str(api_key).strip()
+        os.environ[f"{env_prefix}_QWEN_CHAT_API_KEY"] = config.api_key
+    if temperature is not None:
+        raw = str(temperature).strip()
+        config.temperature = float(raw) if raw else None
+        os.environ[f"{env_prefix}_QWEN_CHAT_TEMPERATURE"] = raw
+    if timeout_seconds is not None:
+        config.timeout_seconds = float(timeout_seconds)
+        os.environ[f"{env_prefix}_QWEN_CHAT_TIMEOUT_SECONDS"] = str(timeout_seconds)
+    if max_tokens is not None:
+        config.max_tokens = int(max_tokens)
+        os.environ[f"{env_prefix}_QWEN_CHAT_MAX_TOKENS"] = str(max_tokens)
+    if enable_thinking is not None:
+        config.enable_thinking = _parse_bool(enable_thinking)
+        os.environ[f"{env_prefix}_QWEN_CHAT_ENABLE_THINKING"] = (
+            "true" if config.enable_thinking else "false"
+        )
 
 
 def get_max_tokens() -> int:
-    return MAX_TOKENS
+    return TARGET_CONFIG.max_tokens
+
+
+def chat_optimizer(
+    system: str,
+    user: str,
+    max_completion_tokens: int = 16384,
+    retries: int = 5,
+    stage: str = "optimizer",
+    reasoning_effort: str | None = None,
+    timeout: float | None = None,
+) -> tuple[str, dict[str, int]]:
+    del reasoning_effort
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    return _chat_messages_impl(
+        messages,
+        max_completion_tokens,
+        retries,
+        stage,
+        role="optimizer",
+        timeout=timeout,
+    )
 
 
 def chat_target(
@@ -230,6 +376,33 @@ def chat_target(
         max_completion_tokens,
         retries,
         stage,
+        role="target",
+        timeout=timeout,
+    )
+
+
+def chat_optimizer_messages(
+    messages: list[dict[str, Any]],
+    max_completion_tokens: int = 16384,
+    retries: int = 5,
+    stage: str = "optimizer",
+    reasoning_effort: str | None = None,
+    *,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+    return_message: bool = False,
+    timeout: float | None = None,
+) -> tuple[Any, dict[str, int]]:
+    del reasoning_effort
+    return _chat_messages_impl(
+        messages,
+        max_completion_tokens,
+        retries,
+        stage,
+        role="optimizer",
+        tools=tools,
+        tool_choice=tool_choice,
+        return_message=return_message,
         timeout=timeout,
     )
 
@@ -252,6 +425,7 @@ def chat_target_messages(
         max_completion_tokens,
         retries,
         stage,
+        role="target",
         tools=tools,
         tool_choice=tool_choice,
         return_message=return_message,
@@ -272,6 +446,10 @@ def set_reasoning_effort(effort: str | None) -> None:
 
 
 def set_target_deployment(deployment: str) -> None:
-    global TARGET_DEPLOYMENT
-    TARGET_DEPLOYMENT = deployment or default_model_for_backend("qwen_chat")
-    os.environ["TARGET_DEPLOYMENT"] = TARGET_DEPLOYMENT
+    TARGET_CONFIG.deployment = deployment or default_model_for_backend("qwen_chat")
+    os.environ["TARGET_DEPLOYMENT"] = TARGET_CONFIG.deployment
+
+
+def set_optimizer_deployment(deployment: str) -> None:
+    OPTIMIZER_CONFIG.deployment = deployment or default_model_for_backend("qwen_chat")
+    os.environ["OPTIMIZER_DEPLOYMENT"] = OPTIMIZER_CONFIG.deployment

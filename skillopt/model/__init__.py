@@ -64,6 +64,8 @@ def get_backend_name() -> str:
     target = get_target_backend()
     if optimizer == "claude_chat" and target == "claude_chat":
         return "claude_chat"
+    if optimizer == "qwen_chat" and target == "qwen_chat":
+        return "qwen_chat"
     if optimizer == "openai_chat" and target == "openai_chat":
         return "azure_openai"
     if optimizer == "openai_chat" and target == "codex_exec":
@@ -91,6 +93,16 @@ def chat_optimizer(
             max_completion_tokens=max_completion_tokens,
             retries=retries,
             stage=stage,
+            timeout=timeout,
+        )
+    if get_optimizer_backend() == "qwen_chat":
+        return _qwen.chat_optimizer(
+            system=system,
+            user=user,
+            max_completion_tokens=max_completion_tokens,
+            retries=retries,
+            stage=stage,
+            reasoning_effort=reasoning_effort,
             timeout=timeout,
         )
     return _openai.chat_optimizer(
@@ -174,6 +186,18 @@ def chat_optimizer_messages(
             max_completion_tokens=max_completion_tokens,
             retries=retries,
             stage=stage,
+            tools=tools,
+            tool_choice=tool_choice,
+            return_message=return_message,
+            timeout=timeout,
+        )
+    if get_optimizer_backend() == "qwen_chat":
+        return _qwen.chat_optimizer_messages(
+            messages=messages,
+            max_completion_tokens=max_completion_tokens,
+            retries=retries,
+            stage=stage,
+            reasoning_effort=reasoning_effort,
             tools=tools,
             tool_choice=tool_choice,
             return_message=return_message,
@@ -414,6 +438,18 @@ def configure_qwen_chat(
     timeout_seconds: float | str | None = None,
     max_tokens: int | str | None = None,
     enable_thinking: bool | str | None = None,
+    optimizer_base_url: str | None = None,
+    optimizer_api_key: str | None = None,
+    optimizer_temperature: float | str | None = None,
+    optimizer_timeout_seconds: float | str | None = None,
+    optimizer_max_tokens: int | str | None = None,
+    optimizer_enable_thinking: bool | str | None = None,
+    target_base_url: str | None = None,
+    target_api_key: str | None = None,
+    target_temperature: float | str | None = None,
+    target_timeout_seconds: float | str | None = None,
+    target_max_tokens: int | str | None = None,
+    target_enable_thinking: bool | str | None = None,
 ) -> None:
     _qwen.configure_qwen_chat(
         base_url=base_url,
@@ -422,6 +458,18 @@ def configure_qwen_chat(
         timeout_seconds=timeout_seconds,
         max_tokens=max_tokens,
         enable_thinking=enable_thinking,
+        optimizer_base_url=optimizer_base_url,
+        optimizer_api_key=optimizer_api_key,
+        optimizer_temperature=optimizer_temperature,
+        optimizer_timeout_seconds=optimizer_timeout_seconds,
+        optimizer_max_tokens=optimizer_max_tokens,
+        optimizer_enable_thinking=optimizer_enable_thinking,
+        target_base_url=target_base_url,
+        target_api_key=target_api_key,
+        target_temperature=target_temperature,
+        target_timeout_seconds=target_timeout_seconds,
+        target_max_tokens=target_max_tokens,
+        target_enable_thinking=target_enable_thinking,
     )
 
 
@@ -461,3 +509,4 @@ def set_target_deployment(deployment: str) -> None:
 def set_optimizer_deployment(deployment: str) -> None:
     _openai.set_optimizer_deployment(deployment)
     _claude.set_optimizer_deployment(deployment)
+    _qwen.set_optimizer_deployment(deployment)

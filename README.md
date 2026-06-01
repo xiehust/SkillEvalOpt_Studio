@@ -105,6 +105,21 @@ export QWEN_CHAT_BASE_URL="http://localhost:8000/v1"
 export QWEN_CHAT_MODEL="Qwen/Qwen3.5-4B"
 ```
 
+`qwen_chat` can also be used as the optimizer backend. When optimizer and
+target should point to different local vLLM services, use the role-specific
+settings:
+
+```bash
+python scripts/train.py \
+    --config configs/searchqa/default.yaml \
+    --optimizer_backend qwen_chat \
+    --target_backend qwen_chat \
+    --optimizer_model Qwen/Qwen3.5-4B \
+    --target_model Qwen/Qwen3.5-4B \
+    --optimizer_qwen_chat_base_url http://localhost:8001/v1 \
+    --target_qwen_chat_base_url http://localhost:8000/v1
+```
+
 #### MiniMax
 
 ```bash

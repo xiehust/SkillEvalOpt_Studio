@@ -636,6 +636,18 @@ class ReflACTTrainer:
             timeout_seconds=cfg.get("qwen_chat_timeout_seconds"),
             max_tokens=cfg.get("qwen_chat_max_tokens"),
             enable_thinking=cfg.get("qwen_chat_enable_thinking"),
+            optimizer_base_url=cfg.get("optimizer_qwen_chat_base_url") or None,
+            optimizer_api_key=cfg.get("optimizer_qwen_chat_api_key") or None,
+            optimizer_temperature=cfg.get("optimizer_qwen_chat_temperature"),
+            optimizer_timeout_seconds=cfg.get("optimizer_qwen_chat_timeout_seconds"),
+            optimizer_max_tokens=cfg.get("optimizer_qwen_chat_max_tokens"),
+            optimizer_enable_thinking=cfg.get("optimizer_qwen_chat_enable_thinking"),
+            target_base_url=cfg.get("target_qwen_chat_base_url") or None,
+            target_api_key=cfg.get("target_qwen_chat_api_key") or None,
+            target_temperature=cfg.get("target_qwen_chat_temperature"),
+            target_timeout_seconds=cfg.get("target_qwen_chat_timeout_seconds"),
+            target_max_tokens=cfg.get("target_qwen_chat_max_tokens"),
+            target_enable_thinking=cfg.get("target_qwen_chat_enable_thinking"),
         )
         configure_minimax_chat(
             base_url=cfg.get("minimax_base_url") or None,
