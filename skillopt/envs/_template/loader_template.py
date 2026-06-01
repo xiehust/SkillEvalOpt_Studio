@@ -1,103 +1,87 @@
 """
 Benchmark Data Loader Template
 ================================
-Copy this file and implement the TODO sections to load your benchmark data.
+Copy this file and implement ``load_split_items`` to load your benchmark
+data. The loader is a :class:`skillopt.datasets.base.SplitDataLoader`
+subclass — the base class handles both ``split_mode="split_dir"`` (read
+an existing train/val/test layout) and ``split_mode="ratio"`` (build the
+splits from a single raw file deterministically).
 
-The DataLoader is responsible for:
-1. Loading raw data from disk
-2. Splitting into train / validation / test sets
-3. Providing DataItem objects to the training loop
+For a fully worked example see
+``skillopt/envs/officeqa/dataloader.py``.
 """
+from __future__ import annotations
+
+import json
 from pathlib import Path
 
+from skillopt.datasets.base import SplitDataLoader
 
-class TemplateBenchmarkLoader:
+
+def _normalize_item(raw: dict) -> dict:
+    """
+    Normalise one raw entry into the dict shape SkillOpt expects.
+
+    The only **hard** requirement is ``"id"`` (str). Add whatever extra
+    fields your :class:`TemplateBenchmarkEnv.rollout` needs.
+    """
+    return {
+        "id": str(raw.get("uid") or raw.get("id") or ""),
+        "question": str(raw.get("question") or raw.get("prompt") or ""),
+        "ground_truth": str(raw.get("ground_truth") or raw.get("answer") or ""),
+        "task_type": str(raw.get("category") or raw.get("task_type") or "template"),
+        # ── add benchmark-specific keys here ──
+    }
+
+
+class TemplateBenchmarkLoader(SplitDataLoader):
     """
     Data loader for <Your Benchmark Name>.
-    
-    Rename this class and implement the methods below.
+
+    Subclass note: you usually only need to implement
+    :meth:`load_split_items`. The base class drives ``setup(cfg)``,
+    materialises ratio-mode splits, exposes ``train_items``,
+    ``val_items``, ``test_items``, and builds ``BatchSpec`` objects on
+    demand.
+
+    If you want to support ``split_mode="ratio"`` (auto-split a single
+    file into train/val/test), also implement
+    :meth:`load_raw_items(data_path)` returning the full list of items.
     """
 
-    def __init__(self, data_dir: str = "data/your_benchmark", **kwargs):
-        self.data_dir = Path(data_dir)
-        self.items = []
-        self.splits = {}
+    def load_split_items(self, split_path: str) -> list[dict]:
+        """Load all items for one split directory.
 
-    def setup(self, cfg: dict):
+        ``split_path`` is e.g. ``data/your_benchmark/train/``. Return a
+        list of dicts, each shaped like :func:`_normalize_item`'s output.
         """
-        Initialize the loader with config.
-        
-        Called once before training starts.
-        
-        Args:
-            cfg: Dict with keys like 'split_mode', 'train_ratio', 'val_ratio', etc.
-        """
-        # Step 1: Load raw data
-        self.items = self._load_items()
+        path = Path(split_path)
 
-        # Step 2: Create splits
-        split_mode = cfg.get("split_mode", "ratio")
-        if split_mode == "ratio":
-            self._split_by_ratio(
-                train_ratio=cfg.get("train_ratio", 0.7),
-                val_ratio=cfg.get("val_ratio", 0.15),
-            )
-        elif split_mode == "split_dir":
-            self._load_predefined_splits(cfg.get("split_dir", self.data_dir))
+        json_files = sorted(path.glob("*.json"))
+        if json_files:
+            with json_files[0].open(encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, list):
+                raise ValueError(
+                    f"Expected JSON array at top level of {json_files[0]}"
+                )
+            return [_normalize_item(row) for row in payload]
 
-    def _load_items(self) -> list:
-        """
-        Load raw data into structured items.
-        
-        TODO: Implement data loading. Each item should have at minimum:
-        - id: unique identifier
-        - input: the task input (question, instruction, etc.)
-        - ground_truth: the expected answer
-        - metadata: optional dict with extra info
-        
-        Example:
-            items = []
-            for path in self.data_dir.glob("*.json"):
-                data = json.loads(path.read_text())
-                for entry in data:
-                    items.append({
-                        "id": entry["id"],
-                        "input": entry["question"],
-                        "ground_truth": entry["answer"],
-                        "metadata": {"source": path.name},
-                    })
+        jsonl_files = sorted(path.glob("*.jsonl"))
+        if jsonl_files:
+            items: list[dict] = []
+            with jsonl_files[0].open(encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    items.append(_normalize_item(json.loads(line)))
             return items
-        """
-        raise NotImplementedError("Implement _load_items() for your benchmark")
 
-    def _split_by_ratio(self, train_ratio: float, val_ratio: float):
-        """Split items by ratio."""
-        import random
-        random.shuffle(self.items)
-        n = len(self.items)
-        n_train = int(n * train_ratio)
-        n_val = int(n * val_ratio)
-        self.splits = {
-            "train": self.items[:n_train],
-            "valid": self.items[n_train:n_train + n_val],
-            "test": self.items[n_train + n_val:],
-        }
+        raise FileNotFoundError(
+            f"No .json or .jsonl file found in {split_path}"
+        )
 
-    def _load_predefined_splits(self, split_dir):
-        """Load from pre-split directories."""
-        # TODO: Implement if your benchmark has pre-defined splits
-        raise NotImplementedError
-
-    def get_split_items(self, split: str) -> list:
-        """
-        Return items for a given split.
-        
-        Args:
-            split: One of "train", "valid", "test"
-            
-        Returns:
-            List of data items for the requested split
-        """
-        if split not in self.splits:
-            raise ValueError(f"Unknown split '{split}'. Available: {list(self.splits.keys())}")
-        return self.splits[split]
+    # Optional — only needed if you intend to use ``split_mode='ratio'``.
+    # def load_raw_items(self, data_path: str) -> list[dict]:
+    #     ...
