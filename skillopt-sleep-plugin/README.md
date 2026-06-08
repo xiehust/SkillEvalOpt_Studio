@@ -30,6 +30,28 @@ harvest ~/.claude transcripts → mine recurring tasks → replay offline
 Nothing live is modified until **you** run `/sleep adopt` (the Dreams "review,
 then adopt or discard" contract). Every adopt backs up the prior file first.
 
+## Install
+
+**Requirements:** Python ≥ 3.10, and the `claude` CLI (and/or `codex` CLI) on PATH.
+
+```bash
+# 1) get the code (the plugin ships inside the SkillOpt repo)
+git clone https://github.com/microsoft/SkillOpt.git
+cd SkillOpt
+
+# 2) add the plugin to Claude Code as a local marketplace
+/plugin marketplace add ./skillopt-sleep-plugin
+/plugin install skillopt-sleep@skillopt-sleep
+
+# 3) verify
+/sleep status
+```
+
+The plugin's bundled runner (`scripts/sleep.sh`) auto-selects a Python ≥ 3.10
+interpreter and calls the `skillopt.sleep` engine in the repo. No `pip install`
+is required for the default `mock` backend or for `claude`/`codex` backends —
+they shell out to the CLIs you already have.
+
 ## Quick start
 
 ```bash

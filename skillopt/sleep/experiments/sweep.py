@@ -132,13 +132,13 @@ def main(argv=None) -> int:
         if key in done:
             print(f"[sweep] ({i}/{len(plan)}) skip (done): {cfg}")
             continue
-        print(f"[sweep] ({i}/{len(plan)}) running: {cfg}")
+        print(f"[sweep] ({i}/{len(plan)}) running: {cfg}", flush=True)
         try:
             row = run_one(cfg, data_root, args.codex_path, args.limit_replay, args.limit_holdout)
         except Exception as e:  # never let one config kill the sweep
             row = {"cfg": cfg, "cfg_key": key, "error": f"{type(e).__name__}: {e}"}
         _append(args.out, row)
-        print(f"[sweep]   -> {json.dumps({k: v for k, v in row.items() if k not in ('cfg','cfg_key')})}")
+        print(f"[sweep]   -> {json.dumps({k: v for k, v in row.items() if k not in ('cfg','cfg_key')})}", flush=True)
     print(f"[sweep] done. rows in {args.out}: {len(_load_done(args.out))}")
     return 0
 
