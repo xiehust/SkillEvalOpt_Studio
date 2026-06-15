@@ -183,7 +183,7 @@ schedule, if you trust it).
 | `--scope invoked\|all` | `invoked` | this project only, or all projects |
 | `--auto-adopt` | off | apply without manual review (power users) |
 
-Deep dive: [`../docs/sleep/CONTROLLABLE_DREAMING.md`](../docs/sleep/CONTROLLABLE_DREAMING.md).
+Deep dive: [the SkillOpt-Sleep guide section](https://microsoft.github.io/SkillOpt/docs/guideline.html#sleep).
 
 ---
 
@@ -195,13 +195,13 @@ tasks the optimizer never trained on:
 - **gbrain-evals `skillopt-v1`** (the public suite gbrain scores SkillOpt on):
   deficient skills go **0.00 → 1.00** on all 4 seeds, including a real tool-use
   loop; cross-model transfer is positive; the gate blocks regressions.
-  → [`../docs/sleep/FINAL_REPORT.md`](../docs/sleep/FINAL_REPORT.md)
+  → [the SkillOpt-Sleep guide section](https://microsoft.github.io/SkillOpt/docs/guideline.html#sleep)
 - **Academic daily-cases** (math / spreadsheet / search-QA, the paper's 4:1:5
   split with dream-augmented train): see
-  [`../docs/sleep/daily_cases_results.md`](../docs/sleep/daily_cases_results.md).
+  [the SkillOpt-Sleep guide section](https://microsoft.github.io/SkillOpt/docs/guideline.html#sleep).
 - **Fresh load-test** (a "SQL must always include LIMIT" analyst, built from
   scratch): held-out **0.00 → 1.00** on both backends.
-  → [`../docs/sleep/plugin_load_test.md`](../docs/sleep/plugin_load_test.md)
+  → [the SkillOpt-Sleep guide section](https://microsoft.github.io/SkillOpt/docs/guideline.html#sleep)
 
 Try the deterministic proof yourself (no API key, no spend):
 ```bash

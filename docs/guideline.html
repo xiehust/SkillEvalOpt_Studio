@@ -288,6 +288,12 @@
       <a href="#cli">CLI scripts</a>
       <a href="#webui">WebUI</a>
     </div>
+    <div class="group">
+      <div class="glabel"><span class="num">9</span> SkillOpt-Sleep</div>
+      <a href="#sleep">Deployment companion</a>
+      <a href="#sleep-plugins">Plugins (3 agents)</a>
+      <a href="#sleep-replay">Experience replay (opt-in)</a>
+    </div>
   </nav>
 
   <!-- ───────────── MAIN CONTENT ───────────── -->
@@ -917,6 +923,57 @@ PY</code></pre>
           <tr><td><code>--share</code></td><td class="def">off</td><td>Create a public Gradio share link.</td></tr>
         </tbody>
       </table></div>
+    </section>
+
+    <section id="sleep">
+      <h2>9.1 SkillOpt-Sleep — the deployment-time companion (preview) <a class="anchor" href="#sleep">#</a></h2>
+      <p><strong>SkillOpt-Sleep</strong> applies SkillOpt's discipline to your own daily usage. It gives a
+      local coding agent a nightly <em>sleep cycle</em> that reviews your past sessions, replays your
+      recurring tasks on your own API budget, and consolidates what it learns into <strong>validated</strong>
+      long-term memory and skills — behind a held-out gate, staged for your review. The agent gets better
+      the more you use it, with no weight training and zero inference-time overhead. It is an early
+      <strong>preview</strong> we are actively iterating on; interfaces and defaults may change.</p>
+      <p>One "night":</p>
+<pre><code>harvest Claude Code / Codex transcripts &rarr; mine recurring tasks &rarr; replay offline
+   &rarr; consolidate (reflect &rarr; bounded edit &rarr; GATE on real held-out tasks)
+   &rarr; stage proposal &rarr; (you) adopt</code></pre>
+      <p>The engine lives in the top-level <code>skillopt_sleep/</code> package with <strong>zero dependency</strong>
+      on the paper's <code>skillopt/</code> experiment code (the validation gate is vendored). Deterministic
+      proof, no API key required:
+      <code>python -m skillopt_sleep.experiments.run_experiment --persona researcher --assert-improves</code>.</p>
+
+      <h2 id="sleep-plugins">9.2 Plugins (three agents) <a class="anchor" href="#sleep-plugins">#</a></h2>
+      <p>One engine, thin per-agent shells (see <a href="https://github.com/microsoft/SkillOpt/tree/main/plugins"><code>plugins/</code></a>):</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Platform</th><th>Folder</th><th>Install</th></tr></thead>
+        <tbody>
+          <tr><td>Claude Code</td><td><code>plugins/claude-code</code></td><td><code>/plugin marketplace add ./plugins/claude-code</code> &rarr; <code>/skillopt-sleep</code></td></tr>
+          <tr><td>Codex</td><td><code>plugins/codex</code></td><td><code>bash plugins/codex/install.sh</code> &rarr; <code>skillopt-sleep</code> skill</td></tr>
+          <tr><td>Copilot</td><td><code>plugins/copilot</code></td><td>register <code>plugins/copilot/mcp_server.py</code> as an MCP server</td></tr>
+        </tbody>
+      </table></div>
+      <p>Transcript source and replay backend are separate knobs: <code>--source claude</code> for Claude Code
+      transcripts, <code>--source codex</code> for Codex Desktop archived sessions under
+      <code>~/.codex/archived_sessions</code>, and <code>--backend codex</code> only when you want the
+      replay/optimizer to spend Codex budget.</p>
+
+      <h2 id="sleep-replay">9.3 Experience replay &amp; dream rollouts (opt-in) <a class="anchor" href="#sleep-replay">#</a></h2>
+      <p>Two consolidation mechanisms, both default <strong>off</strong> (so behavior is unchanged unless
+      enabled). They strengthen the nightly update when your tasks have a clean correctness signal; the
+      validation gate still governs what ships.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Config knob</th><th>Default</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td><code>dream_rollouts</code></td><td class="def">1</td><td>Run each task K times and learn from the good-vs-bad contrast (contrastive reflection).</td></tr>
+          <tr><td><code>recall_k</code></td><td class="def">0</td><td>Associative recall — pull the K most-similar past tasks (from a persisted archive) into tonight's dream.</td></tr>
+          <tr><td><code>dream_factor</code></td><td class="def">0</td><td>Add N lightweight synthetic variants of each task.</td></tr>
+        </tbody>
+      </table></div>
+      <p>On a clean-signal benchmark the gain scales with recall depth (deployment protocol: 5 nights &times;
+      10 new real tasks/night, full held-out test, GPT-5.5, gated): <code>recall_k=10</code> &rarr; +3.1 pts,
+      <code>recall_k=20</code> &rarr; +4.5 pts, full-history replay reference &rarr; +5.6 pts; a second benchmark
+      (SpreadsheetBench, GPT-5.4-nano, gate-free) gives +3.6 pts. On saturated or noisy tasks the effect is
+      flat within run-to-run noise (&plusmn;1&ndash;2 pts). Keep the gate on; it bounds the downside.</p>
 
       <div class="footer-note">
         SkillOpt — Executive Strategy for Self-Evolving Agent Skills ·

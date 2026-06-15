@@ -9,7 +9,7 @@ as the Claude Code plugin (`skillopt_sleep`), wrapped for Codex.
 > [gbrain-evals](https://github.com/garrytan/gbrain-evals) `skillopt-v1`
 > benchmark, a deliberately deficient skill goes **0.00 → 1.00** on a held-out
 > set with the Codex backend (incl. the tool-use seed via a real tool loop).
-> See [`../../docs/sleep/FINAL_REPORT.md`](../../docs/sleep/FINAL_REPORT.md).
+> See [the SkillOpt-Sleep guide section](https://microsoft.github.io/SkillOpt/docs/guideline.html#sleep).
 
 ## What Codex supports (and what we use)
 
@@ -59,7 +59,7 @@ back to Claude Code transcripts. Default backend is `mock` (no API spend).
 `--backend codex` uses your Codex budget for real improvement. All the
 controllable knobs (`--gate on|off`, `--rollouts-k`, `--budget-tokens`,
 `--preferences`, optimizer/target split) work identically — see
-[`../../docs/sleep/CONTROLLABLE_DREAMING.md`](../../docs/sleep/CONTROLLABLE_DREAMING.md).
+[the SkillOpt-Sleep guide section](https://microsoft.github.io/SkillOpt/docs/guideline.html#sleep).
 
 ## Notes / status
 

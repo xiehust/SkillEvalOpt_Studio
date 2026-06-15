@@ -92,7 +92,7 @@ Both took a brief-writer with no risks section / no confidence level and, within
 into the protected `LEARNED` block, nothing else touched. The Codex 2-night
 trace even shows the optimizer **diagnosing its own residual failure** and
 adding a meta-rule to fix it. Full writeup + reproduction:
-[`docs/sleep/real_api_results.md`](../docs/sleep/real_api_results.md).
+[the SkillOpt-Sleep guide section](https://microsoft.github.io/SkillOpt/docs/guideline.html#sleep).
 
 Reproduce:
 
@@ -115,7 +115,7 @@ python -m skillopt_sleep.experiments.run_experiment --persona programmer  --asse
 
 Each prints the held-out score rising from baseline toward 1.0 as the gate
 accepts the general rules your tasks need, and confirms the gate **rejects** an
-injected harmful edit. Recorded output: [`docs/sleep/experiment_results.md`](../docs/sleep/experiment_results.md).
+injected harmful edit. Recorded output: [the SkillOpt-Sleep guide section](https://microsoft.github.io/SkillOpt/docs/guideline.html#sleep).
 
 ## Schedule it nightly
 

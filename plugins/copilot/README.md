@@ -64,4 +64,4 @@ You should see the server info and the five `sleep_*` tools.
   portable of the three integrations (one server → CLI + IDE).
 - The engine and all its controls (gate on/off, multi-rollout, budget,
   preferences, optimizer/target split) are identical across platforms — see
-  [`../../docs/sleep/CONTROLLABLE_DREAMING.md`](../../docs/sleep/CONTROLLABLE_DREAMING.md).
+  [the SkillOpt-Sleep guide section](https://microsoft.github.io/SkillOpt/docs/guideline.html#sleep).

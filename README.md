@@ -4,12 +4,11 @@
 
 [![Project Page](https://img.shields.io/badge/Project%20Page-SkillOpt-8dbb3c)](https://microsoft.github.io/SkillOpt/) [![Paper](https://img.shields.io/badge/Paper-arXiv-b31b1b)](https://arxiv.org/abs/2605.23904) [![Project Video](https://img.shields.io/badge/Project%20Video-Watch%20Demo-ff0000)](https://youtu.be/JUBMDTCiM0M) [![PyPI](https://img.shields.io/badge/PyPI-skillopt-green.svg)](https://pypi.org/project/skillopt/) [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> 📖 **For installation, data preparation, training/eval commands, the full configuration reference, and framework internals, see the [Documentation & Reproduction Guide](docs/guideline.html)** — view it [rendered online](https://htmlpreview.github.io/?https://github.com/microsoft/SkillOpt/blob/main/docs/guideline.html) or via [GitHub Pages](https://microsoft.github.io/SkillOpt/docs/guideline.html).
+> 📖 **For installation, data preparation, training/eval commands, the full configuration reference, and framework internals, see the [Documentation & Reproduction Guide](https://microsoft.github.io/SkillOpt/docs/guideline.html)** (rendered on GitHub Pages).
 
 ---
 
 ## News 🔥🔥🔥
-- **[2026-06-14]** 😴 **SkillOpt-Sleep (preview).** A nightly *sleep cycle* for local coding agents (Claude Code / Codex / Copilot): review past sessions offline, replay recurring tasks, and consolidate validated skills behind a held-out gate. This is an early **preview** — open-source and decoupled from the paper code — that we'll keep iterating on. See [`plugins/`](plugins/) and the [section below](#-skillopt-sleep--the-deployment-time-companion).
 - **[2026-06-03]** 🎉 **[gbrain](https://github.com/garrytan/gbrain), [gbrain-evals](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-06-03-skillopt.md), and [darwin-skill](https://github.com/alchaincyf/darwin-skill) have all integrated SkillOpt.**
 - **[2026-06-02]** 🎉 **SkillOpt [v0.1.0](https://github.com/microsoft/SkillOpt/releases/tag/v0.1.0) is now available on [PyPI](https://pypi.org/project/skillopt/)!** Install with `pip install skillopt`. This initial release includes the full training loop (rollout → reflect → aggregate → select → update → evaluate), multi-backend support (OpenAI / Azure / Claude / Qwen / MiniMax), six built-in benchmarks, and WebUI dashboard.
 
@@ -50,59 +49,6 @@ https://github.com/user-attachments/assets/eb12d3bc-371c-467f-904d-91b61f339ed7
 <p align="center">
   <a href="https://youtu.be/JUBMDTCiM0M"><b>▶ Watch the full demo on YouTube</b></a>
 </p>
-
----
-
-## 😴 SkillOpt-Sleep — the deployment-time companion
-
-> **Preview.** SkillOpt-Sleep is an early preview that we are actively iterating
-> on; interfaces and defaults may change. Feedback and issues are welcome.
-
-SkillOpt (above) trains a skill offline on a benchmark. **SkillOpt-Sleep**
-applies the same discipline to *your own daily usage*: it gives a local coding
-agent a nightly **sleep cycle** that reviews your past sessions, replays your
-recurring tasks on your own API budget, and consolidates what it learns into
-**validated** long-term memory and skills — behind a held-out gate, staged for
-your review. The agent gets better the more you use it, with no weight training.
-
-It synthesizes **SkillOpt** (validation-gated bounded text edits), **Claude
-Dreams** (offline consolidation; review-then-adopt), and the **agent sleep**
-idea (short-term experience → long-term competence). One "night":
-
-```
-harvest Claude Code / Codex Desktop transcripts → mine recurring tasks → replay offline
-   → consolidate (reflect → bounded edit → GATE on real held-out tasks)
-   → stage proposal → (you) adopt
-```
-
-**Plugins for three agents** (one engine, three thin shells — see [`plugins/`](plugins/)):
-
-| Platform | Folder | Install |
-|---|---|---|
-| **Claude Code** | [`plugins/claude-code`](plugins/claude-code) | `/plugin marketplace add ./plugins/claude-code` → `/skillopt-sleep` |
-| **Codex** | [`plugins/codex`](plugins/codex) | `bash plugins/codex/install.sh` → `skillopt-sleep` skill |
-| **Copilot** | [`plugins/copilot`](plugins/copilot) | register `plugins/copilot/mcp_server.py` as an MCP server |
-
-**Validated on real models.** On the public
-[gbrain-evals](https://github.com/garrytan/gbrain-evals) `skillopt-v1` benchmark,
-deficient skills go **0.00 → 1.00** on held-out sets with **both Claude and
-Codex** (all 4 seeds, including a real tool-use loop), cross-model transfer is
-positive, and the gate blocks regressions
-([full results](docs/sleep/FINAL_REPORT.md)).
-
-> **Open-source tool, decoupled from the research.** The engine lives in the
-> top-level [`skillopt_sleep/`](skillopt_sleep) package with **zero dependency**
-> on the paper's `skillopt/` experiment code (the validation gate is vendored).
-> Controls — optional gate, multi-rollout contrastive reflection, token/time
-> budget, multi-objective reward, user preferences, optimizer/target split — are
-> documented in [`docs/sleep/CONTROLLABLE_DREAMING.md`](docs/sleep/CONTROLLABLE_DREAMING.md).
-
-Deterministic proof (no API key): `python -m skillopt_sleep.experiments.run_experiment --persona researcher --assert-improves`.
-
-For local sleep cycles, transcript source and replay backend are separate knobs:
-use `--source claude` for Claude Code transcripts, `--source codex` for Codex
-Desktop archived sessions under `~/.codex/archived_sessions`, and
-`--backend codex` only when you want the replay/optimizer to spend Codex budget.
 
 ---
 
