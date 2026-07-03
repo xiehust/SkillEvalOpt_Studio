@@ -27,6 +27,10 @@ external/
 # SkillOpt-Sleep runtime state (staging proposals, config, diagnostics, cron logs)
 .skillopt-sleep/
 
+# Local dev-tooling state (codegraph index, supergoal run artifacts)
+.codegraph/
+.supergoal/
+
 /BabyVision/
 /MMRB/
 /SpreadsheetBench/
