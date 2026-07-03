@@ -19,6 +19,8 @@ data/*
 !data/spreadsheetbench_id_split/**
 !data/alfworld_path_split/
 !data/alfworld_path_split/**
+!data/skilleval_demo/
+!data/skilleval_demo/**
 outputs/
 logs/
 external/
