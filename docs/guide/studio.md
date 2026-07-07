@@ -56,12 +56,20 @@ export OPENAI_AUTH_MODE=openai_compatible
 |---|---|---|
 | 总览 | `/` | 状态统计、运行中任务卡(进度短语)、近 10 任务表、快捷发起按钮 |
 | 技能库 | `/skills` | 四源扫描分组(claude/codex/kiro/agents 色标)+ 上传 zip(uploaded 组);详情页渲染 SKILL.md 与文件树 |
-| 任务集 | `/tasksets` | single(单 tasks.json)/ split(train/val/test)两种模式;保存前 fail-fast 校验(缺 rubric 等直接 400 并指出条目) |
+| 任务集 | `/tasksets` | single(单 tasks.json)/ split(train/val/test)两种模式;新建支持文件上传 / 手动逐条输入 / AI 自动生成三种方式(内嵌 JSON 格式说明);已有任务集可编辑;保存前 fail-fast 校验(缺 rubric 等直接 400 并指出条目) |
 | 发起评估 | `/evaluate` | 选技能 × 任务集 × 参数(执行后端 claude_code_exec / codex_exec、目标模型/判分模型/workers/timeout)→ 真实 eval job |
 | 发起训练 | `/train` | 额外支持 trainable_files 多选(与 SKILL.md 打包成 bundle 训练)、split 或 single+ratio、num_epochs/gate_metric/learning_rate/eval_test,同样可选执行后端 |
 | 任务管理 | `/jobs` | 全部任务 + 状态/类型筛选 + 取消;详情页四 tab:概览 / 日志(增量轮询)/ 结果(eval 表格或训练时间线 + val 曲线 + skill diff)/ 产物浏览 |
 
 执行后端按技能来源自动推荐(codex 源技能默认 Codex 执行);`GET /api/environment` 检测 `claude` / `codex` CLI 是否安装,向导里未检测到会红字提醒,提交时后端同样 fail-fast 拒绝。目标模型留空 = 用所选后端的默认模型。
+
+## 任务集:编辑 / 手动录入 / AI 自动生成
+
+**编辑修改。** 详情页“编辑任务集”进入编辑模式:每个分组一个逐条编辑器(split 集 train/val/test 各自独立,test 分组清空保存即删除),支持重命名(显示名变、id 与 URL 不变)。编辑器打开时按 `?full=1` 拉取全量任务(只读视图仅预览 20 条),行对象只覆写 id/question/rubric/task_type 四个字段——`files` 与任何未识别字段原样透传,不会被编辑丢掉。保存是**全量替换**:先整体校验、原子落盘,失败时原文件保持不变。注意:编辑影响后续使用该任务集的评估/训练运行(已排队/运行中的训练在提交时已拷贝文件,不受影响;排队中的评估会读到新内容)。
+
+**手动逐条输入。** 新建表单的第二个 tab:行式编辑器(id 自动建议 task_001 风格、行级中文校验:必填缺失/重复 id/非法字符),产出 single 模式任务集;需要预分割 train/val/test 请用文件上传。两个 tab 均内嵌可折叠的 **JSON 格式说明**(字段表 + 完整示例 + 复制按钮),对应 `POST /api/tasksets/items`(JSON body)与 `PUT /api/tasksets/{id}`(全量更新)。
+
+**AI 自动生成。** 第三个 tab:选一个待评估技能 + 执行后端(claude_code_exec / codex_exec,推荐规则与评估向导一致)+ 数量(1-30)+ 可选生成指引,提交为 `taskgen` 作业(底层是 `python3 scripts/generate_tasks.py`:agent 阅读技能后把任务写入 `generated_tasks.json`,经 `load_tasks` 严格校验,失败自动带错误反馈重试一次)。生成结果**不直接落库**——作业详情页审阅任务表后点“导入为新任务集”,条目预填进手动编辑器,确认/修改后再保存。
 
 ## 任务产物在哪
 

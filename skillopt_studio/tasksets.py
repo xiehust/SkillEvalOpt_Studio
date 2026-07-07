@@ -8,6 +8,7 @@ task set on disk.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -78,6 +79,81 @@ def save_taskset(config: StudioConfig, name: str, files: dict[str, bytes], mode:
         json.dumps(info.model_dump(), ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return info
+
+
+def _serialize_tasks(items: list[dict]) -> bytes:
+    return json.dumps(items, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def create_taskset_from_items(
+    config: StudioConfig, name: str, mode: str, tasks_by_split: dict[str, list[dict]]
+) -> TaskSetInfo:
+    """Create a task set from in-memory items (manual editor / AI import path).
+
+    Split keys follow the file-upload convention: single mode uses 'tasks',
+    split mode uses train/val(/test).  Validation and atomicity are exactly
+    :func:`save_taskset`'s — a bad item leaves nothing on disk.
+    """
+    files = {split: _serialize_tasks(items) for split, items in tasks_by_split.items()}
+    return save_taskset(config, name, files, mode)
+
+
+def update_taskset(
+    config: StudioConfig,
+    taskset_id: str,
+    tasks_by_split: dict[str, list[dict]],
+    name: str | None = None,
+) -> TaskSetInfo:
+    """Full-replace update; validates every split before touching stored files.
+
+    ``tasks_by_split`` carries ALL splits that should exist after the edit
+    (single: 'tasks'; split: train+val required, omitting test deletes an
+    existing test.json).  All splits are written to ``*.tmp`` and validated
+    with :func:`load_tasks` first, then swapped in with ``os.replace`` — a
+    validation failure leaves the stored files and meta byte-identical.
+    Raises KeyError when the task set does not exist, ValueError on any
+    invalid input.
+    """
+    info = get_taskset(config, taskset_id)
+    if info is None:
+        raise KeyError(taskset_id)
+    directory = _taskset_dir(config, taskset_id)
+    serialized = {split: _serialize_tasks(items) for split, items in tasks_by_split.items()}
+    on_disk = _expected_files(info.mode, serialized)
+
+    counts_by_split: dict[str, int] = {}
+    tmp_by_final: dict[Path, Path] = {}
+    try:
+        for filename, payload in on_disk.items():
+            final = directory / filename
+            tmp = directory / f"{filename}.tmp"
+            tmp.write_bytes(payload)
+            tmp_by_final[final] = tmp
+            counts_by_split[final.stem] = len(load_tasks(str(tmp)))
+    except Exception:
+        for tmp in tmp_by_final.values():
+            tmp.unlink(missing_ok=True)
+        raise
+    for final, tmp in tmp_by_final.items():
+        os.replace(tmp, final)
+    if info.mode == "split":
+        for split in SPLIT_NAMES:
+            stale = directory / f"{split}.json"
+            if f"{split}.json" not in on_disk and stale.exists():
+                stale.unlink()
+
+    updated = info.model_copy(
+        update={
+            "name": name.strip() if name and name.strip() else info.name,
+            "task_count": sum(counts_by_split.values()),
+            "counts_by_split": counts_by_split,
+            "updated_at": _now_iso(),
+        }
+    )
+    (directory / _META_FILE).write_text(
+        json.dumps(updated.model_dump(), ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return updated
 
 
 def list_tasksets(config: StudioConfig) -> list[TaskSetInfo]:

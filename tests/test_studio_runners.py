@@ -18,7 +18,7 @@ from skillopt_studio.app import create_app
 from skillopt_studio.config import StudioConfig
 from skillopt_studio.jobs import JobManager
 from skillopt_studio.models import JobInfo
-from skillopt_studio.runners import build_eval_command, build_train_command
+from skillopt_studio.runners import build_eval_command, build_taskgen_command, build_train_command
 from skillopt_studio.skill_sources import upload_skill_zip
 from skillopt_studio.tasksets import save_taskset
 
@@ -100,6 +100,31 @@ print("  [STEP 2 done] epoch=1 action=reject current=0.5 best=0.5", flush=True)
 """
 
 
+FAKE_GEN_SCRIPT = """\
+import argparse, json, os
+p = argparse.ArgumentParser()
+for flag in ("--skill", "--backend", "--model", "--guidance", "--out_root"):
+    p.add_argument(flag, default="")
+for flag in ("--count", "--timeout"):
+    p.add_argument(flag, type=int, default=0)
+a = p.parse_args()
+os.makedirs(a.out_root, exist_ok=True)
+tasks = [
+    {"id": f"gen_{i:03d}", "question": f"Generated Q{i}?", "rubric": f"Must satisfy criterion {i}.",
+     "task_type": "generated"}
+    for i in range(a.count)
+]
+print(f"[taskgen] attempt 1/2", flush=True)
+with open(os.path.join(a.out_root, "generated_tasks.json"), "w", encoding="utf-8") as f:
+    json.dump(tasks, f)
+summary = {"count": len(tasks), "requested_count": a.count, "backend": a.backend,
+           "model": a.model, "skill": a.skill, "attempts": 1, "duration_s": 0.1}
+with open(os.path.join(a.out_root, "gen_summary.json"), "w", encoding="utf-8") as f:
+    json.dump(summary, f)
+print(f"[taskgen] done: {len(tasks)} tasks", flush=True)
+"""
+
+
 @pytest.fixture
 def studio_config(tmp_path: Path) -> StudioConfig:
     return StudioConfig(
@@ -114,13 +139,16 @@ def stub_scripts(tmp_path: Path, monkeypatch) -> dict[str, Path]:
     eval_path.write_text(FAKE_EVAL_SCRIPT, encoding="utf-8")
     train_path = tmp_path / "stub_train.py"
     train_path.write_text(FAKE_TRAIN_SCRIPT, encoding="utf-8")
+    gen_path = tmp_path / "stub_generate_tasks.py"
+    gen_path.write_text(FAKE_GEN_SCRIPT, encoding="utf-8")
     monkeypatch.setattr(runners, "EVAL_SCRIPT", eval_path)
     monkeypatch.setattr(runners, "TRAIN_SCRIPT", train_path)
+    monkeypatch.setattr(runners, "GEN_SCRIPT", gen_path)
     # hermetic: pretend both exec CLIs are installed regardless of the host
     monkeypatch.setattr(
         runners, "cli_path", lambda backend: f"/stub/bin/{runners.EXEC_BACKENDS[backend]}"
     )
-    return {"eval": eval_path, "train": train_path}
+    return {"eval": eval_path, "train": train_path, "taskgen": gen_path}
 
 
 @pytest.fixture
@@ -292,6 +320,61 @@ class TestBuildTrainConfig:
         assert cfg["env"]["skill_dir"] == str(skill_dir)
 
 
+class TestBuildTaskgenCommand:
+    def test_argv_full_params(self, studio_config, stub_scripts, claude_skill):
+        job_dir = job_dir_of(studio_config, "gen-full")
+        argv = build_taskgen_command(
+            studio_config,
+            {"skill_id": "claude--local-skill", "target_backend": "codex_exec",
+             "count": 7, "model": "gpt-5.5", "guidance": "侧重边界场景", "timeout": 600},
+            job_dir,
+        )
+        assert argv[:2] == [runners.PYTHON, str(stub_scripts["taskgen"])]
+        assert argv[argv.index("--skill") + 1] == str(claude_skill)
+        assert argv[argv.index("--backend") + 1] == "codex_exec"
+        assert argv[argv.index("--count") + 1] == "7"
+        assert argv[argv.index("--out_root") + 1] == str(job_dir / "out")
+        assert argv[argv.index("--model") + 1] == "gpt-5.5"
+        assert argv[argv.index("--guidance") + 1] == "侧重边界场景"
+        assert argv[argv.index("--timeout") + 1] == "600"
+
+    def test_defaults_count_5_no_model_flag(self, studio_config, stub_scripts, claude_skill):
+        argv = build_taskgen_command(
+            studio_config, {"skill_id": "claude--local-skill"}, job_dir_of(studio_config, "gen-min")
+        )
+        assert argv[argv.index("--backend") + 1] == "claude_code_exec"
+        assert argv[argv.index("--count") + 1] == "5"
+        assert "--model" not in argv
+        assert "--guidance" not in argv
+
+    def test_count_out_of_range(self, studio_config, stub_scripts, claude_skill):
+        with pytest.raises(ValueError, match="count must be between 1 and 30"):
+            build_taskgen_command(
+                studio_config,
+                {"skill_id": "claude--local-skill", "count": 31},
+                job_dir_of(studio_config, "gen-range"),
+            )
+
+    def test_unknown_backend_and_missing_cli(self, studio_config, stub_scripts, claude_skill, monkeypatch):
+        with pytest.raises(ValueError, match="target_backend must be one of"):
+            build_taskgen_command(
+                studio_config,
+                {"skill_id": "claude--local-skill", "target_backend": "bogus_exec"},
+                job_dir_of(studio_config, "gen-bogus"),
+            )
+        monkeypatch.setattr(runners, "cli_path", lambda backend: None)
+        with pytest.raises(ValueError, match="requires the 'claude' CLI"):
+            build_taskgen_command(
+                studio_config, {"skill_id": "claude--local-skill"}, job_dir_of(studio_config, "gen-nocli")
+            )
+
+    def test_unknown_skill_fails_fast(self, studio_config, stub_scripts):
+        with pytest.raises(ValueError, match="skill 'claude--ghost' not found"):
+            build_taskgen_command(
+                studio_config, {"skill_id": "claude--ghost"}, job_dir_of(studio_config, "gen-ghost")
+            )
+
+
 class TestStudioApiE2E:
     @pytest.fixture
     def client(self, studio_config, stub_scripts):
@@ -349,6 +432,30 @@ class TestStudioApiE2E:
         echo = client.get(f"/api/jobs/{job_id}/artifacts", params={"path": "config_echo.json"}).json()
         assert echo["kind"] == "text"
         assert json.loads(echo["content"])["env"]["name"] == "skilleval"
+
+    def test_taskgen_job_end_to_end(self, studio_config, client, claude_skill):
+        response = client.post(
+            "/api/jobs",
+            json={"type": "taskgen",
+                  "params": {"skill_id": "claude--local-skill", "count": 3,
+                             "guidance": "覆盖边界场景"}},
+        )
+        assert response.status_code == 200, response.text
+        job_id = response.json()["id"]
+        assert job_id.startswith("taskgen-")
+        self._wait_status(client, job_id, "succeeded")
+
+        body = client.get(f"/api/jobs/{job_id}/results").json()
+        assert body["type"] == "taskgen"
+        assert [t["id"] for t in body["tasks"]] == ["gen_000", "gen_001", "gen_002"]
+        assert body["tasks"][0]["rubric"] == "Must satisfy criterion 0."
+        assert body["summary"]["requested_count"] == 3
+        assert body["summary"]["backend"] == "claude_code_exec"
+
+    def test_unsupported_type_message_lists_taskgen(self, client):
+        response = client.post("/api/jobs", json={"type": "bogus", "params": {}})
+        assert response.status_code == 400
+        assert "taskgen" in response.json()["detail"]
 
     def test_post_eval_validation_400(self, client, claude_skill, single_taskset):
         response = client.post(

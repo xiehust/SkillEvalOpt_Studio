@@ -21,11 +21,13 @@ from skillopt_studio.jobs import JobManager
 from skillopt_studio.models import SkillInfo
 from skillopt_studio.skill_sources import scan_skills, upload_skill_zip
 from skillopt_studio.tasksets import (
+    create_taskset_from_items,
     delete_taskset,
     get_taskset,
     get_taskset_tasks,
     list_tasksets,
     save_taskset,
+    update_taskset,
 )
 
 SOURCES = ("claude", "codex", "kiro", "agents")
@@ -54,12 +56,15 @@ def make_zip(entries: dict[str, str]) -> bytes:
     return buffer.getvalue()
 
 
-def valid_tasks(prefix: str = "t", count: int = 2) -> bytes:
-    items = [
+def valid_items(prefix: str = "t", count: int = 2) -> list[dict]:
+    return [
         {"id": f"{prefix}{i}", "question": f"Q{i}?", "rubric": f"Answer must mention {i}."}
         for i in range(count)
     ]
-    return json.dumps(items).encode("utf-8")
+
+
+def valid_tasks(prefix: str = "t", count: int = 2) -> bytes:
+    return json.dumps(valid_items(prefix, count)).encode("utf-8")
 
 
 def wait_until(predicate, timeout: float = 20.0, interval: float = 0.05) -> bool:
@@ -255,6 +260,187 @@ class TestTaskSets:
         assert info.id == "算术-回归集"
         assert get_taskset(studio_config, "算术-回归集").name == "算术 回归集"
         assert (studio_config.tasksets_dir / "算术-回归集" / "tasks.json").is_file()
+
+
+class TestCreateTasksetFromItems:
+    def test_single_create(self, studio_config):
+        info = create_taskset_from_items(
+            studio_config, "手动集", "single", {"tasks": valid_items(count=3)}
+        )
+        assert info.id == "手动集"
+        assert info.task_count == 3
+        assert info.updated_at is None
+        tasks = get_taskset_tasks(studio_config, "手动集")
+        assert [t["id"] for t in tasks["tasks"]] == ["t0", "t1", "t2"]
+
+    def test_split_create(self, studio_config):
+        info = create_taskset_from_items(
+            studio_config,
+            "split items",
+            "split",
+            {"train": valid_items("tr", 4), "val": valid_items("va", 2)},
+        )
+        assert info.mode == "split"
+        assert info.counts_by_split == {"train": 4, "val": 2}
+
+    def test_missing_rubric_failfast_no_partial_dir(self, studio_config):
+        with pytest.raises(ValueError, match="rubric"):
+            create_taskset_from_items(
+                studio_config, "bad items", "single",
+                {"tasks": [{"id": "x", "question": "Q?"}]},
+            )
+        assert not (studio_config.tasksets_dir / "bad-items").exists()
+
+    def test_duplicate_id_rejected(self, studio_config):
+        items = valid_items(count=1) + valid_items(count=1)
+        with pytest.raises(ValueError, match="duplicate id"):
+            create_taskset_from_items(studio_config, "dupe ids", "single", {"tasks": items})
+
+    def test_duplicate_name_rejected(self, studio_config):
+        create_taskset_from_items(studio_config, "same", "single", {"tasks": valid_items()})
+        with pytest.raises(ValueError, match="already exists"):
+            create_taskset_from_items(studio_config, "same", "single", {"tasks": valid_items()})
+
+
+class TestUpdateTaskset:
+    def test_update_changes_content_and_meta(self, studio_config):
+        created = create_taskset_from_items(
+            studio_config, "edit me", "single", {"tasks": valid_items(count=2)}
+        )
+        items = get_taskset_tasks(studio_config, "edit-me")["tasks"]
+        items[0]["rubric"] = "Must cite the source document."
+        updated = update_taskset(studio_config, "edit-me", {"tasks": items})
+        assert updated.updated_at is not None
+        assert updated.created_at == created.created_at
+        reread = get_taskset_tasks(studio_config, "edit-me")["tasks"]
+        assert reread[0]["rubric"] == "Must cite the source document."
+
+    def test_update_add_remove_items_counts(self, studio_config):
+        create_taskset_from_items(studio_config, "resize", "single", {"tasks": valid_items(count=3)})
+        update_taskset(studio_config, "resize", {"tasks": valid_items("new", 5)})
+        info = get_taskset(studio_config, "resize")
+        assert info.task_count == 5
+        assert info.counts_by_split == {"tasks": 5}
+
+    def test_update_validation_failure_leaves_files_untouched(self, studio_config):
+        create_taskset_from_items(studio_config, "atomic", "single", {"tasks": valid_items(count=2)})
+        tasks_path = studio_config.tasksets_dir / "atomic" / "tasks.json"
+        meta_path = studio_config.tasksets_dir / "atomic" / "meta.json"
+        before_tasks = tasks_path.read_bytes()
+        before_meta = meta_path.read_bytes()
+        with pytest.raises(ValueError, match="rubric"):
+            update_taskset(studio_config, "atomic", {"tasks": [{"id": "x", "question": "q", "rubric": ""}]})
+        assert tasks_path.read_bytes() == before_tasks
+        assert meta_path.read_bytes() == before_meta
+        assert not list(tasks_path.parent.glob("*.tmp"))
+
+    def test_rename_only(self, studio_config):
+        create_taskset_from_items(studio_config, "old name", "single", {"tasks": valid_items()})
+        updated = update_taskset(
+            studio_config, "old-name", {"tasks": valid_items()}, name="new name"
+        )
+        assert updated.name == "new name"
+        assert updated.id == "old-name"
+        assert get_taskset(studio_config, "old-name").name == "new name"
+
+    def test_split_omitting_test_deletes_file(self, studio_config):
+        create_taskset_from_items(
+            studio_config, "sp", "split",
+            {"train": valid_items("tr", 2), "val": valid_items("va", 1), "test": valid_items("te", 1)},
+        )
+        updated = update_taskset(
+            studio_config, "sp",
+            {"train": valid_items("tr", 2), "val": valid_items("va", 1)},
+        )
+        assert "test" not in updated.counts_by_split
+        assert not (studio_config.tasksets_dir / "sp" / "test.json").exists()
+
+    def test_update_unknown_id_keyerror(self, studio_config):
+        with pytest.raises(KeyError):
+            update_taskset(studio_config, "nope", {"tasks": valid_items()})
+
+    def test_update_wrong_split_keys_rejected(self, studio_config):
+        create_taskset_from_items(studio_config, "single set", "single", {"tasks": valid_items()})
+        with pytest.raises(ValueError, match="single mode"):
+            update_taskset(studio_config, "single-set", {"train": valid_items(), "val": valid_items()})
+
+    def test_legacy_meta_without_updated_at_still_parses(self, studio_config):
+        create_taskset_from_items(studio_config, "legacy", "single", {"tasks": valid_items()})
+        meta_path = studio_config.tasksets_dir / "legacy" / "meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta.pop("updated_at", None)
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        listed = list_tasksets(studio_config)
+        assert [t.id for t in listed] == ["legacy"]
+        assert listed[0].updated_at is None
+
+
+class TestTaskSetItemsApi:
+    @pytest.fixture
+    def client(self, studio_config):
+        app = create_app(studio_config)
+        with TestClient(app) as test_client:
+            yield test_client
+
+    def test_post_items_and_get(self, client):
+        response = client.post(
+            "/api/tasksets/items",
+            json={"name": "json set", "mode": "single", "tasks_by_split": {"tasks": valid_items(count=2)}},
+        )
+        assert response.status_code == 200
+        assert response.json()["task_count"] == 2
+        detail = client.get("/api/tasksets/json-set").json()
+        assert [t["id"] for t in detail["tasks_by_split"]["tasks"]] == ["t0", "t1"]
+
+    def test_post_items_invalid_400_names_item(self, client):
+        response = client.post(
+            "/api/tasksets/items",
+            json={"name": "bad", "mode": "single", "tasks_by_split": {"tasks": [{"id": "x", "question": "q"}]}},
+        )
+        assert response.status_code == 400
+        assert "rubric" in response.json()["detail"]
+        assert "item #0" in response.json()["detail"]
+
+    def test_put_roundtrip_and_errors(self, client):
+        client.post(
+            "/api/tasksets/items",
+            json={"name": "编辑集", "mode": "single", "tasks_by_split": {"tasks": valid_items(count=2)}},
+        )
+        before = client.get("/api/tasksets/编辑集").json()["tasks_by_split"]["tasks"]
+        edited = [dict(t) for t in before]
+        edited[1]["question"] = "改过的问题?"
+        response = client.put(
+            "/api/tasksets/编辑集",
+            json={"name": "编辑集v2", "tasks_by_split": {"tasks": edited}},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["name"] == "编辑集v2"
+        assert body["updated_at"]
+        after = client.get("/api/tasksets/编辑集").json()
+        assert after["info"]["name"] == "编辑集v2"
+        assert after["tasks_by_split"]["tasks"][1]["question"] == "改过的问题?"
+
+        assert client.put("/api/tasksets/missing", json={"tasks_by_split": {"tasks": valid_items()}}).status_code == 404
+        bad = client.put(
+            "/api/tasksets/编辑集",
+            json={"tasks_by_split": {"tasks": [{"id": "a/b", "question": "q", "rubric": "r"}]}},
+        )
+        assert bad.status_code == 400
+        assert "filesystem-safe" in bad.json()["detail"]
+
+    def test_full_detail_and_files_preserved(self, client):
+        items = valid_items(count=25)
+        items[0]["files"] = {"data/input.txt": "hello"}
+        client.post(
+            "/api/tasksets/items",
+            json={"name": "big", "mode": "single", "tasks_by_split": {"tasks": items}},
+        )
+        preview = client.get("/api/tasksets/big").json()["tasks_by_split"]["tasks"]
+        assert len(preview) == 20
+        full = client.get("/api/tasksets/big?full=1").json()["tasks_by_split"]["tasks"]
+        assert len(full) == 25
+        assert full[0]["files"] == {"data/input.txt": "hello"}
 
 
 class TestJobManager:

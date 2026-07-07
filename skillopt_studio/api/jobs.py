@@ -1,8 +1,8 @@
-"""Job endpoints: submit (echo/eval/train), list, inspect, cancel, logs,
-results and artifact browsing.
+"""Job endpoints: submit (echo/eval/train/taskgen), list, inspect, cancel,
+logs, results and artifact browsing.
 
-``echo`` is an internal harmless job type kept for tests; ``eval`` and
-``train`` build real CLI commands via the runners module.
+``echo`` is an internal harmless job type kept for tests; ``eval``, ``train``
+and ``taskgen`` build real CLI commands via the runners module.
 """
 from __future__ import annotations
 
@@ -37,7 +37,13 @@ def _build_echo_command(params: dict) -> list[str]:
     return [sys.executable, "-c", f"print({message!r})"]
 
 
-RUNNER_TYPES = ("eval", "train")
+RUNNER_TYPES = ("eval", "train", "taskgen")
+
+_COMMAND_BUILDERS = {
+    "eval": runners.build_eval_command,
+    "train": runners.build_train_command,
+    "taskgen": runners.build_taskgen_command,
+}
 
 
 @router.post("", response_model=JobInfo)
@@ -51,16 +57,14 @@ def create_job(
     if body.type not in RUNNER_TYPES:
         raise HTTPException(
             status_code=400,
-            detail=f"unsupported job type {body.type!r}; supported: ['echo', 'eval', 'train']",
+            detail=f"unsupported job type {body.type!r}; supported: "
+                   f"{['echo', *RUNNER_TYPES]}",
         )
 
     job_id = jobs.allocate_job_id(body.type)
     job_dir = config.jobs_dir / job_id
     try:
-        if body.type == "eval":
-            cmd = runners.build_eval_command(config, body.params, job_dir)
-        else:
-            cmd = runners.build_train_command(config, body.params, job_dir)
+        cmd = _COMMAND_BUILDERS[body.type](config, body.params, job_dir)
     except ValueError as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -134,6 +138,14 @@ def get_job_results(
                 detail=f"results not available yet (job status: {job.status})",
             )
         return {"type": "train", "summary": summary, "skill_diff": artifacts.skill_diff(config, job)}
+    if job.type == "taskgen":
+        results = artifacts.taskgen_results(config, job)
+        if results is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"results not available yet (job status: {job.status})",
+            )
+        return {"type": "taskgen", **results}
     raise HTTPException(status_code=400, detail=f"job type {job.type!r} has no results view")
 
 

@@ -78,6 +78,19 @@ def eval_results(config: StudioConfig, job: JobInfo) -> dict | None:
     }
 
 
+def taskgen_results(config: StudioConfig, job: JobInfo) -> dict | None:
+    """Generated tasks + summary from out/generated_tasks.json (None until it exists)."""
+    out = job_out_root(config, job)
+    tasks = _read_json(out / "generated_tasks.json")
+    if not isinstance(tasks, list):
+        return None
+    summary = _read_json(out / "gen_summary.json")
+    return {
+        "tasks": [t for t in tasks if isinstance(t, dict)],
+        "summary": summary if isinstance(summary, dict) else {},
+    }
+
+
 def train_summary(config: StudioConfig, job: JobInfo) -> dict | None:
     """Step timeline + final summary from history.json / summary.json.
 

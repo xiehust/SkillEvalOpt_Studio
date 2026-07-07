@@ -32,6 +32,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # Module-level so tests can monkeypatch them to stub CLIs.
 EVAL_SCRIPT = PROJECT_ROOT / "scripts" / "evaluate_skill.py"
 TRAIN_SCRIPT = PROJECT_ROOT / "scripts" / "train.py"
+GEN_SCRIPT = PROJECT_ROOT / "scripts" / "generate_tasks.py"
 TRAIN_BASE_CONFIG = PROJECT_ROOT / "configs" / "skilleval" / "default.yaml"
 BUNDLE_MODULE = "skillopt.envs.skilleval.bundle"
 
@@ -100,6 +101,7 @@ PARAM_RANGES = {
     "limit": (0, 10000),
     "num_epochs": (1, 10),
     "learning_rate": (1, 16),
+    "count": (1, 30),
 }
 
 
@@ -144,6 +146,30 @@ def build_eval_command(config: StudioConfig, params: dict, job_dir: Path) -> lis
         value = _validated_int(params, key)
         if value is not None:
             argv += [flag, str(value)]
+    return argv
+
+
+def build_taskgen_command(config: StudioConfig, params: dict, job_dir: Path) -> list[str]:
+    """argv for scripts/generate_tasks.py; output goes to <job_dir>/out."""
+    _require_script(GEN_SCRIPT)
+    skill = _resolve_skill(config, str(params.get("skill_id", "")))
+    target_backend = _resolve_target_backend(params)
+
+    count = _validated_int(params, "count")
+    argv = [
+        PYTHON, str(GEN_SCRIPT),
+        "--skill", skill.path,
+        "--backend", target_backend,
+        "--count", str(count if count is not None else 5),
+        "--out_root", str(job_dir / "out"),
+    ]
+    if params.get("model"):
+        argv += ["--model", str(params["model"])]
+    if params.get("guidance"):
+        argv += ["--guidance", str(params["guidance"])]
+    timeout = _validated_int(params, "timeout")
+    if timeout is not None:
+        argv += ["--timeout", str(timeout)]
     return argv
 
 

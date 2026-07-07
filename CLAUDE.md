@@ -22,6 +22,7 @@ python3 -m py_compile <files>
 python3 scripts/train.py --config configs/searchqa/default.yaml   # train a skill
 python3 scripts/eval_only.py --config <cfg> --skill <skill.md>    # score one skill on a benchmark env
 python3 scripts/evaluate_skill.py --skill <SKILL.md> --tasks <tasks.json> --out_root <dir>  # evaluate an arbitrary skill on a custom task set
+python3 scripts/generate_tasks.py --skill <skill> --backend claude_code_exec --count 5 --out_root <dir>  # AI-generate a skilleval task set for a skill (Studio job type "taskgen")
 bash scripts/run_searchqa.sh                   # wrapper with env-var model selection
 
 # SkillOpt Studio (localhost web console for skilleval + train; see docs/guide/studio.md)

@@ -1,34 +1,206 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { api, ApiError, TaskSetDetail } from "../api";
+import { api, ApiError, TaskItem, TaskSetDetail } from "../api";
+import TaskItemsEditor, { emptyItem, validateItems } from "../components/TaskItemsEditor";
 import { Card, ErrorBanner, Mono, PageHeader, Spinner, truncate } from "../components/ui";
+
+const SPLIT_ORDER = ["tasks", "train", "val", "test"];
+
+/** train/val (and single's tasks) must keep >=1 task; test may be emptied to delete it. */
+const OPTIONAL_SPLITS = new Set(["test"]);
 
 export default function TaskSetDetailPage() {
   const { id = "" } = useParams();
   const [detail, setDetail] = useState<TaskSetDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    setDetail(null);
-    setError(null);
+  const [editing, setEditing] = useState(false);
+  const [editName, setEditName] = useState("");
+  const [editSplits, setEditSplits] = useState<Record<string, TaskItem[]> | null>(null);
+  const [loadingEdit, setLoadingEdit] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [savedAt, setSavedAt] = useState<string | null>(null);
+
+  const loadDetail = () => {
     api
       .tasksetDetail(id)
       .then(setDetail)
       .catch((err) => setError(err instanceof ApiError ? err.message : String(err)));
+  };
+
+  useEffect(() => {
+    setDetail(null);
+    setError(null);
+    setEditing(false);
+    setEditSplits(null);
+    setSavedAt(null);
+    loadDetail();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
+
+  const enterEdit = async () => {
+    // Editing must start from the FULL task list — the read view is a preview.
+    setLoadingEdit(true);
+    setSaveError(null);
+    setSavedAt(null);
+    try {
+      const full = await api.tasksetDetail(id, true);
+      setEditName(full.info.name);
+      setEditSplits(JSON.parse(JSON.stringify(full.tasks_by_split)));
+      setEditing(true);
+    } catch (err) {
+      setSaveError(err instanceof ApiError ? err.message : String(err));
+    } finally {
+      setLoadingEdit(false);
+    }
+  };
+
+  const cancelEdit = () => {
+    if (!window.confirm("放弃未保存的修改?")) return;
+    setEditing(false);
+    setEditSplits(null);
+    setSaveError(null);
+  };
+
+  const save = async () => {
+    if (!detail || !editSplits) return;
+    setSaveError(null);
+    if (!editName.trim()) {
+      setSaveError("名称不能为空");
+      return;
+    }
+    const payload: Record<string, TaskItem[]> = {};
+    const problems: string[] = [];
+    for (const [split, items] of Object.entries(editSplits)) {
+      if (OPTIONAL_SPLITS.has(split) && items.length === 0) continue; // emptied test = delete it
+      for (const message of validateItems(items)) problems.push(`${split}:${message}`);
+      payload[split] = items;
+    }
+    if (Object.keys(payload).length === 0) problems.push("任务集不能为空");
+    if (problems.length > 0) {
+      setSaveError(problems.join("\n"));
+      return;
+    }
+    setSaving(true);
+    try {
+      await api.updateTaskset(id, { name: editName.trim(), tasks_by_split: payload });
+      setEditing(false);
+      setEditSplits(null);
+      setSavedAt(new Date().toLocaleTimeString());
+      loadDetail();
+    } catch (err) {
+      setSaveError(err instanceof ApiError ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const editableSplits = editSplits
+    ? SPLIT_ORDER.filter((split) => split in editSplits)
+    : [];
+  const canAddTest =
+    editing && detail?.info.mode === "split" && editSplits !== null && !("test" in editSplits);
 
   return (
     <div>
       <PageHeader
         title={detail ? detail.info.name : "任务集详情"}
-        sub={detail ? `模式 ${detail.info.mode} · 共 ${detail.info.task_count} 个任务(每分组最多预览 20 条)` : undefined}
-        actions={<Link to="/tasksets" className="btn-ghost">返回任务集</Link>}
+        sub={
+          detail
+            ? `模式 ${detail.info.mode} · 共 ${detail.info.task_count} 个任务` +
+              (editing ? "(编辑中)" : "(每分组最多预览 20 条)")
+            : undefined
+        }
+        actions={
+          <div className="flex gap-2">
+            {detail && !editing && (
+              <button
+                className="btn-primary"
+                onClick={enterEdit}
+                disabled={loadingEdit}
+                data-testid="taskset-edit"
+              >
+                {loadingEdit ? "加载全量任务…" : "编辑任务集"}
+              </button>
+            )}
+            <Link to="/tasksets" className="btn-ghost">返回任务集</Link>
+          </div>
+        }
       />
 
       {error && <ErrorBanner message={error} />}
+      {savedAt && !editing && (
+        <div className="mb-4 rounded border border-green/50 bg-green/10 px-3 py-2 text-sm text-green" data-testid="taskset-saved">
+          已保存({savedAt})— 编辑将影响后续使用该任务集的评估/训练运行
+        </div>
+      )}
       {!detail && !error && <Spinner />}
 
+      {detail && editing && editSplits && (
+        <Card title="编辑任务集" className="mb-6">
+          <div className="space-y-4">
+            <div className="max-w-md">
+              <label className="label">名称</label>
+              <input
+                className="input"
+                value={editName}
+                onChange={(event) => setEditName(event.target.value)}
+                data-testid="taskset-rename"
+              />
+            </div>
+
+            {editableSplits.map((split) => (
+              <div key={split}>
+                <div className="label mb-2">
+                  {split === "tasks" ? "任务列表" : `${split} 分组`}
+                  {OPTIONAL_SPLITS.has(split) && (
+                    <span className="text-muted">(清空全部任务并保存 = 删除该分组)</span>
+                  )}
+                </div>
+                <TaskItemsEditor
+                  items={editSplits[split]}
+                  onChange={(items) => setEditSplits({ ...editSplits, [split]: items })}
+                />
+              </div>
+            ))}
+
+            {canAddTest && (
+              <button
+                type="button"
+                className="btn-ghost text-sm"
+                onClick={() => setEditSplits({ ...editSplits, test: [emptyItem([])] })}
+                data-testid="taskset-add-test"
+              >
+                + 添加 test 分组
+              </button>
+            )}
+
+            {saveError && (
+              <div data-testid="taskset-save-error">
+                <ErrorBanner message={saveError} />
+              </div>
+            )}
+
+            <div className="flex gap-2">
+              <button
+                className="btn-primary"
+                onClick={save}
+                disabled={saving}
+                data-testid="taskset-save"
+              >
+                {saving ? "校验并保存中…" : "校验并保存"}
+              </button>
+              <button className="btn-ghost" onClick={cancelEdit} data-testid="taskset-cancel">
+                取消
+              </button>
+            </div>
+          </div>
+        </Card>
+      )}
+
       {detail &&
+        !editing &&
         Object.entries(detail.tasks_by_split).map(([split, tasks]) => (
           <Card key={split} title={`${split}(${detail.info.counts_by_split[split] ?? tasks.length} 条)`} className="mb-6">
             <div className="overflow-x-auto -m-4">

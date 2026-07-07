@@ -12,7 +12,7 @@ const STATUS_LABELS: Record<string, string> = {
 const STATUS_TONES: Record<string, string> = {
   running: "amber", queued: "muted", succeeded: "green", failed: "red", cancelled: "purple",
 };
-const TYPE_LABELS: Record<string, string> = { eval: "评估", train: "训练", echo: "测试" };
+const TYPE_LABELS: Record<string, string> = { eval: "评估", train: "训练", taskgen: "任务生成", echo: "测试" };
 
 export default function Dashboard() {
   const { data, error, loading } = usePolling(() => api.dashboard(), 3000);

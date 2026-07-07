@@ -1,15 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
 import {
-  api, ApiError, EvalResults, JobInfo, JobResults, TrainResults, usePolling,
+  api, ApiError, EvalResults, JobInfo, JobResults, TaskgenResults, TrainResults, usePolling,
   ArtifactDir, ArtifactFile,
 } from "../api";
 import {
   Card, ErrorBanner, Mono, PageHeader, Spinner, StatBadge, StatusPill,
-  formatDuration, formatTime, jobDuration,
+  formatDuration, formatTime, jobDuration, truncate,
 } from "../components/ui";
 
 const TABS = [
@@ -21,7 +21,7 @@ const TABS = [
 
 type TabKey = (typeof TABS)[number]["key"];
 
-const TYPE_LABELS: Record<string, string> = { eval: "评估", train: "训练", echo: "测试" };
+const TYPE_LABELS: Record<string, string> = { eval: "评估", train: "训练", taskgen: "任务生成", echo: "测试" };
 
 function isActive(job: JobInfo | null): boolean {
   return job?.status === "running" || job?.status === "queued";
@@ -263,9 +263,73 @@ function ResultsTab({ job }: { job: JobInfo }) {
       </Card>
     );
   }
-  return results.type === "eval"
-    ? <EvalResultsView results={results} />
-    : <TrainResultsView results={results} />;
+  if (results.type === "eval") return <EvalResultsView results={results} />;
+  if (results.type === "taskgen") return <TaskgenResultsView results={results} job={job} />;
+  return <TrainResultsView results={results} />;
+}
+
+function TaskgenResultsView({ results, job }: { results: TaskgenResults; job: JobInfo }) {
+  const navigate = useNavigate();
+  const { tasks, summary } = results;
+
+  const suggestedName = () => {
+    const skillId = String(job.params.skill_id ?? "");
+    const base = skillId.includes("--") ? skillId.split("--").slice(1).join("--") : skillId;
+    return `${base || "任务集"}-自动生成`;
+  };
+
+  const importTasks = () => {
+    navigate("/tasksets", {
+      state: { importItems: tasks, importName: suggestedName() },
+    });
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="flex flex-wrap gap-3">
+        <StatBadge label="生成任务数" value={tasks.length} tone="green" />
+        {summary.requested_count != null && <StatBadge label="请求数量" value={summary.requested_count} />}
+        {summary.backend && <StatBadge label="后端" value={summary.backend} tone="cyan" />}
+        {summary.model != null && <StatBadge label="模型" value={summary.model || "CLI 默认"} tone="muted" />}
+        {summary.attempts != null && <StatBadge label="尝试次数" value={summary.attempts} tone="muted" />}
+        {summary.duration_s != null && (
+          <StatBadge label="耗时" value={formatDuration(summary.duration_s)} tone="muted" />
+        )}
+      </div>
+
+      <Card
+        title="生成的任务(审阅后导入)"
+        actions={
+          <button className="btn-primary" onClick={importTasks} data-testid="taskgen-import">
+            导入为新任务集
+          </button>
+        }
+      >
+        <div className="overflow-x-auto -m-4">
+          <table className="w-full" data-testid="taskgen-results-table">
+            <thead>
+              <tr>
+                <th className="th">ID</th>
+                <th className="th">类型</th>
+                <th className="th">问题</th>
+                <th className="th">评分标准(rubric)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {tasks.map((task) => (
+                <tr key={task.id} className="hover:bg-panel2/40">
+                  <td className="td"><Mono className="text-cyan">{task.id}</Mono></td>
+                  <td className="td"><Mono className="text-xs text-muted">{task.task_type ?? "default"}</Mono></td>
+                  <td className="td text-sm max-w-md">{truncate(task.question, 120)}</td>
+                  <td className="td text-sm text-muted max-w-md">{truncate(task.rubric, 120)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+    </div>
+  );
 }
 
 function EvalResultsView({ results }: { results: EvalResults }) {

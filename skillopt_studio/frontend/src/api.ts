@@ -23,13 +23,17 @@ export interface TaskSetInfo {
   task_count: number;
   counts_by_split: Record<string, number>;
   created_at: string;
+  updated_at?: string | null;
 }
 
+/** Task objects keep unknown ride-along fields so editor round-trips never drop data. */
 export interface TaskItem {
   id: string;
   question: string;
   rubric: string;
   task_type?: string;
+  files?: Record<string, string>;
+  [key: string]: unknown;
 }
 
 export interface TaskSetDetail {
@@ -119,7 +123,23 @@ export interface TrainResults {
   skill_diff: string;
 }
 
-export type JobResults = EvalResults | TrainResults;
+export interface TaskgenSummary {
+  count?: number;
+  requested_count?: number;
+  backend?: string;
+  model?: string;
+  skill?: string;
+  attempts?: number;
+  duration_s?: number;
+}
+
+export interface TaskgenResults {
+  type: "taskgen";
+  tasks: TaskItem[];
+  summary: TaskgenSummary;
+}
+
+export type JobResults = EvalResults | TrainResults | TaskgenResults;
 
 export interface ArtifactDir {
   kind: "dir";
@@ -186,7 +206,8 @@ export const api = {
     return request<SkillInfo>("/api/skills/upload", { method: "POST", body: form });
   },
   tasksets: () => request<TaskSetInfo[]>("/api/tasksets"),
-  tasksetDetail: (id: string) => request<TaskSetDetail>(`/api/tasksets/${encodeURIComponent(id)}`),
+  tasksetDetail: (id: string, full = false) =>
+    request<TaskSetDetail>(`/api/tasksets/${encodeURIComponent(id)}${full ? "?full=1" : ""}`),
   createTaskset: (name: string, mode: "single" | "split", files: Record<string, File>) => {
     const form = new FormData();
     form.append("name", name);
@@ -194,6 +215,18 @@ export const api = {
     for (const [key, file] of Object.entries(files)) form.append(key, file);
     return request<TaskSetInfo>("/api/tasksets", { method: "POST", body: form });
   },
+  createTasksetItems: (name: string, mode: "single" | "split", tasksBySplit: Record<string, TaskItem[]>) =>
+    request<TaskSetInfo>("/api/tasksets/items", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, mode, tasks_by_split: tasksBySplit }),
+    }),
+  updateTaskset: (id: string, payload: { name?: string; tasks_by_split: Record<string, TaskItem[]> }) =>
+    request<TaskSetInfo>(`/api/tasksets/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
   deleteTaskset: (id: string) =>
     request<{ ok: boolean }>(`/api/tasksets/${encodeURIComponent(id)}`, { method: "DELETE" }),
   jobs: () => request<JobInfo[]>("/api/jobs"),

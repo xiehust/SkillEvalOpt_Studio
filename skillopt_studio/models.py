@@ -32,6 +32,22 @@ class TaskSetInfo(BaseModel):
     task_count: int
     counts_by_split: dict[str, int] = Field(default_factory=dict)
     created_at: str
+    updated_at: Optional[str] = None  # absent on task sets never edited
+
+
+class TaskSetItemsCreate(BaseModel):
+    """JSON-body create (manual editor / AI-generated import path)."""
+
+    name: str
+    mode: TaskSetMode = "single"
+    tasks_by_split: dict[str, list[dict]]
+
+
+class TaskSetUpdate(BaseModel):
+    """Full-replace update: carries ALL splits that should exist after the edit."""
+
+    name: Optional[str] = None
+    tasks_by_split: dict[str, list[dict]]
 
 
 class JobInfo(BaseModel):

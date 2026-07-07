@@ -19,10 +19,11 @@ const TYPE_FILTERS = [
   { value: "all", label: "全部类型" },
   { value: "eval", label: "评估" },
   { value: "train", label: "训练" },
+  { value: "taskgen", label: "任务生成" },
   { value: "echo", label: "测试" },
 ];
 
-const TYPE_LABELS: Record<string, string> = { eval: "评估", train: "训练", echo: "测试" };
+const TYPE_LABELS: Record<string, string> = { eval: "评估", train: "训练", taskgen: "任务生成", echo: "测试" };
 
 export default function Jobs() {
   const { data: jobs, error, loading } = usePolling(() => api.jobs(), 2000);
