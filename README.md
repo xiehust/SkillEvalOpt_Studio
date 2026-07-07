@@ -25,12 +25,16 @@
 
 ### 快速开始
 
+#### ⚠️提前安装好claude code cli或者codex cli
+
 ```bash
 git clone https://github.com/microsoft/SkillOpt && cd SkillOpt
 pip install -e .
 
 # 构建前端(一次即可)
 cd skillopt_studio/frontend && npm install && npm run build && cd ../..
+
+cp .env.example .env ##设计.env里的bedrock api key
 
 # 配置模型网关(评估判分与训练优化器需要;参考 .env.example 写 .env)
 # start.sh 会自动加载 .env
