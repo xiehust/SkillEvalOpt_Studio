@@ -22,15 +22,17 @@ _OPENAI_COMPATIBLE_API_VERSION = "openai-compat"
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 ENDPOINT = os.environ.get(
-    "AZURE_OPENAI_ENDPOINT",
+    "OPENAI_ENDPOINT",
     "",  # Set via env var or config: e.g. "https://your-resource.openai.azure.com/"
 )
-API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+# Azure-only concept (query param on real Azure endpoints); irrelevant in
+# openai_compatible mode. Override via config key model.azure_openai_api_version.
+API_VERSION = "2024-12-01-preview"
 API_KEY = os.environ.get(
-    "AZURE_OPENAI_API_KEY",
+    "OPENAI_API_KEY",
     "",
 )
-AUTH_MODE = os.environ.get("AZURE_OPENAI_AUTH_MODE", "azure_cli").strip().lower()
+AUTH_MODE = os.environ.get("OPENAI_AUTH_MODE", "azure_cli").strip().lower()
 AD_SCOPE = os.environ.get(
     "AZURE_OPENAI_AD_SCOPE",
     "https://cognitiveservices.azure.com/.default",
@@ -41,43 +43,35 @@ MANAGED_IDENTITY_CLIENT_ID = os.environ.get(
 ).strip()
 
 OPTIMIZER_ENDPOINT = (
-    os.environ.get("OPTIMIZER_AZURE_OPENAI_ENDPOINT")
-    or os.environ.get("AZURE_OPENAI_OPTIMIZER_ENDPOINT")
+    os.environ.get("OPTIMIZER_OPENAI_ENDPOINT")
+    or os.environ.get("OPENAI_OPTIMIZER_ENDPOINT")
     or ENDPOINT
 )
 TARGET_ENDPOINT = (
-    os.environ.get("TARGET_AZURE_OPENAI_ENDPOINT")
-    or os.environ.get("AZURE_OPENAI_TARGET_ENDPOINT")
+    os.environ.get("TARGET_OPENAI_ENDPOINT")
+    or os.environ.get("OPENAI_TARGET_ENDPOINT")
     or ENDPOINT
 )
-OPTIMIZER_API_VERSION = (
-    os.environ.get("OPTIMIZER_AZURE_OPENAI_API_VERSION")
-    or os.environ.get("AZURE_OPENAI_OPTIMIZER_API_VERSION")
-    or API_VERSION
-)
-TARGET_API_VERSION = (
-    os.environ.get("TARGET_AZURE_OPENAI_API_VERSION")
-    or os.environ.get("AZURE_OPENAI_TARGET_API_VERSION")
-    or API_VERSION
-)
+OPTIMIZER_API_VERSION = API_VERSION
+TARGET_API_VERSION = API_VERSION
 OPTIMIZER_API_KEY = (
-    os.environ.get("OPTIMIZER_AZURE_OPENAI_API_KEY")
-    or os.environ.get("AZURE_OPENAI_OPTIMIZER_API_KEY")
+    os.environ.get("OPTIMIZER_OPENAI_API_KEY")
+    or os.environ.get("OPENAI_OPTIMIZER_API_KEY")
     or API_KEY
 )
 TARGET_API_KEY = (
-    os.environ.get("TARGET_AZURE_OPENAI_API_KEY")
-    or os.environ.get("AZURE_OPENAI_TARGET_API_KEY")
+    os.environ.get("TARGET_OPENAI_API_KEY")
+    or os.environ.get("OPENAI_TARGET_API_KEY")
     or API_KEY
 )
 OPTIMIZER_AUTH_MODE = (
-    os.environ.get("OPTIMIZER_AZURE_OPENAI_AUTH_MODE")
-    or os.environ.get("AZURE_OPENAI_OPTIMIZER_AUTH_MODE")
+    os.environ.get("OPTIMIZER_OPENAI_AUTH_MODE")
+    or os.environ.get("OPENAI_OPTIMIZER_AUTH_MODE")
     or AUTH_MODE
 ).strip().lower()
 TARGET_AUTH_MODE = (
-    os.environ.get("TARGET_AZURE_OPENAI_AUTH_MODE")
-    or os.environ.get("AZURE_OPENAI_TARGET_AUTH_MODE")
+    os.environ.get("TARGET_OPENAI_AUTH_MODE")
+    or os.environ.get("OPENAI_TARGET_AUTH_MODE")
     or AUTH_MODE
 ).strip().lower()
 OPTIMIZER_AD_SCOPE = (
@@ -289,7 +283,7 @@ def _make_client(role: str) -> AzureOpenAI | OpenAI:
         raise ValueError(
             f"Azure OpenAI endpoint is not configured for {role}. "
             "Pass --azure_openai_endpoint https://your-resource.openai.azure.com/ "
-            "or set AZURE_OPENAI_ENDPOINT in your environment."
+            "or set OPENAI_ENDPOINT in your environment."
         )
     auth_mode = cfg["auth_mode"]
     if auth_mode in {"openai_compatible", "compat", "openai"}:
@@ -302,7 +296,7 @@ def _make_client(role: str) -> AzureOpenAI | OpenAI:
         if not cfg["api_key"]:
             raise ValueError(
                 f"Azure OpenAI API key is not configured for {role}. "
-                "Set model.azure_openai_api_key in the config or export AZURE_OPENAI_API_KEY."
+                "Set model.azure_openai_api_key in the config or export OPENAI_API_KEY."
             )
         return AzureOpenAI(
             api_version=cfg["api_version"],
@@ -635,11 +629,12 @@ def configure_azure_openai(
             str_value = str_value.lower()
         return str_value
 
-    def _set(global_name: str, value: str | None, env_key: str) -> None:
+    def _set(global_name: str, value: str | None, env_key: str | None = None) -> None:
         if value is None:
             return
         globals()[global_name] = value
-        os.environ[env_key] = value
+        if env_key:  # api_version has no env interface — module global only
+            os.environ[env_key] = value
 
     shared_endpoint = _clean(endpoint)
     shared_api_version = _clean(api_version)
@@ -653,10 +648,10 @@ def configure_azure_openai(
         if shared_api_version is None:
             shared_api_version = _OPENAI_COMPATIBLE_API_VERSION
 
-    _set("ENDPOINT", shared_endpoint, "AZURE_OPENAI_ENDPOINT")
-    _set("API_VERSION", shared_api_version, "AZURE_OPENAI_API_VERSION")
-    _set("API_KEY", shared_api_key, "AZURE_OPENAI_API_KEY")
-    _set("AUTH_MODE", shared_auth_mode, "AZURE_OPENAI_AUTH_MODE")
+    _set("ENDPOINT", shared_endpoint, "OPENAI_ENDPOINT")
+    _set("API_VERSION", shared_api_version)
+    _set("API_KEY", shared_api_key, "OPENAI_API_KEY")
+    _set("AUTH_MODE", shared_auth_mode, "OPENAI_AUTH_MODE")
     _set("AD_SCOPE", shared_ad_scope, "AZURE_OPENAI_AD_SCOPE")
     _set(
         "MANAGED_IDENTITY_CLIENT_ID",
@@ -694,28 +689,20 @@ def configure_azure_openai(
         if resolved_target_api_version is None:
             resolved_target_api_version = _OPENAI_COMPATIBLE_API_VERSION
 
-    _set("OPTIMIZER_ENDPOINT", resolved_optimizer_endpoint, "OPTIMIZER_AZURE_OPENAI_ENDPOINT")
-    _set(
-        "OPTIMIZER_API_VERSION",
-        resolved_optimizer_api_version,
-        "OPTIMIZER_AZURE_OPENAI_API_VERSION",
-    )
-    _set("OPTIMIZER_API_KEY", resolved_optimizer_api_key, "OPTIMIZER_AZURE_OPENAI_API_KEY")
-    _set("OPTIMIZER_AUTH_MODE", resolved_optimizer_auth_mode, "OPTIMIZER_AZURE_OPENAI_AUTH_MODE")
+    _set("OPTIMIZER_ENDPOINT", resolved_optimizer_endpoint, "OPTIMIZER_OPENAI_ENDPOINT")
+    _set("OPTIMIZER_API_VERSION", resolved_optimizer_api_version)
+    _set("OPTIMIZER_API_KEY", resolved_optimizer_api_key, "OPTIMIZER_OPENAI_API_KEY")
+    _set("OPTIMIZER_AUTH_MODE", resolved_optimizer_auth_mode, "OPTIMIZER_OPENAI_AUTH_MODE")
     _set("OPTIMIZER_AD_SCOPE", resolved_optimizer_ad_scope, "OPTIMIZER_AZURE_OPENAI_AD_SCOPE")
     _set(
         "OPTIMIZER_MANAGED_IDENTITY_CLIENT_ID",
         resolved_optimizer_mi,
         "OPTIMIZER_AZURE_OPENAI_MANAGED_IDENTITY_CLIENT_ID",
     )
-    _set("TARGET_ENDPOINT", resolved_target_endpoint, "TARGET_AZURE_OPENAI_ENDPOINT")
-    _set(
-        "TARGET_API_VERSION",
-        resolved_target_api_version,
-        "TARGET_AZURE_OPENAI_API_VERSION",
-    )
-    _set("TARGET_API_KEY", resolved_target_api_key, "TARGET_AZURE_OPENAI_API_KEY")
-    _set("TARGET_AUTH_MODE", resolved_target_auth_mode, "TARGET_AZURE_OPENAI_AUTH_MODE")
+    _set("TARGET_ENDPOINT", resolved_target_endpoint, "TARGET_OPENAI_ENDPOINT")
+    _set("TARGET_API_VERSION", resolved_target_api_version)
+    _set("TARGET_API_KEY", resolved_target_api_key, "TARGET_OPENAI_API_KEY")
+    _set("TARGET_AUTH_MODE", resolved_target_auth_mode, "TARGET_OPENAI_AUTH_MODE")
     _set("TARGET_AD_SCOPE", resolved_target_ad_scope, "TARGET_AZURE_OPENAI_AD_SCOPE")
     _set(
         "TARGET_MANAGED_IDENTITY_CLIENT_ID",

@@ -37,9 +37,9 @@ def test_build_training_env_loads_project_dotenv(tmp_path, monkeypatch):
 
 
 def test_preflight_reports_missing_openai_chat_endpoint(tmp_path, monkeypatch):
-    monkeypatch.delenv("AZURE_OPENAI_ENDPOINT", raising=False)
-    monkeypatch.delenv("OPTIMIZER_AZURE_OPENAI_ENDPOINT", raising=False)
-    monkeypatch.delenv("TARGET_AZURE_OPENAI_ENDPOINT", raising=False)
+    monkeypatch.delenv("OPENAI_ENDPOINT", raising=False)
+    monkeypatch.delenv("OPTIMIZER_OPENAI_ENDPOINT", raising=False)
+    monkeypatch.delenv("TARGET_OPENAI_ENDPOINT", raising=False)
     config_path = _write_config(
         tmp_path,
         {

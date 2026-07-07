@@ -1,10 +1,12 @@
-"""SkillEval rollout — drive Claude Code CLI on each task under the skill.
+"""SkillEval rollout — drive an exec agent CLI on each task under the skill.
 
 Each task gets an isolated work_dir seeded with the skill document (via
 ``prepare_workspace``, which writes ``.agents/skills/skillopt-target/SKILL.md``)
-plus any task-declared files, then ``run_claude_code_exec`` drives the agent.
+plus any task-declared files, then the configured exec backend drives the
+agent: ``run_claude_code_exec`` for ``claude_code_exec`` (default) or
+``run_codex_exec`` when the target backend is ``codex_exec``.
 Failures are isolated per task: one crashing task never aborts the batch, and
-rollout adds no retry of its own (``run_claude_code_exec`` owns retries).
+rollout adds no retry of its own (the exec harness owns retries).
 """
 from __future__ import annotations
 
@@ -13,7 +15,8 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-from skillopt.model.codex_harness import prepare_workspace, run_claude_code_exec
+from skillopt.model.backend_config import get_target_backend
+from skillopt.model.codex_harness import prepare_workspace, run_claude_code_exec, run_codex_exec
 
 GUIDE_PROMPT = (
     "Read `.agents/skills/skillopt-target/SKILL.md` first and follow it while "
@@ -63,7 +66,9 @@ def _rollout_one(
     skill_files: list[tuple[str, str]] | None = None,
     skill_docs: dict[str, str] | None = None,
 ) -> dict:
-    work_dir = os.path.join(out_root, "rollouts", item["id"])
+    # absolute: codex exec receives work_dir both as cwd and as `-C`, so a
+    # relative path would be resolved twice and fail with ENOENT
+    work_dir = os.path.abspath(os.path.join(out_root, "rollouts", item["id"]))
     result = {
         "id": str(item["id"]),
         "task_type": item.get("task_type", "default"),
@@ -89,15 +94,24 @@ def _rollout_one(
         )
         # Artifact-producing tasks are the norm in skill evaluation: allow file
         # edits (the default exec prompt injects "Do not modify files.") and
-        # extend the read-only default tool set accordingly.
-        response, _raw = run_claude_code_exec(
-            work_dir=work_dir,
-            prompt=GUIDE_PROMPT,
-            model=model,
-            timeout=timeout,
-            allowed_tools="Read,Bash,Write,Edit,Glob,Grep",
-            allow_file_edits=True,
-        )
+        # extend the read-only default tool set accordingly. codex_exec gets
+        # the same freedom through its workspace-write sandbox default.
+        if get_target_backend() == "codex_exec":
+            response, _raw = run_codex_exec(
+                work_dir=work_dir,
+                prompt=GUIDE_PROMPT,
+                model=model,
+                timeout=timeout,
+            )
+        else:
+            response, _raw = run_claude_code_exec(
+                work_dir=work_dir,
+                prompt=GUIDE_PROMPT,
+                model=model,
+                timeout=timeout,
+                allowed_tools="Read,Bash,Write,Edit,Glob,Grep",
+                allow_file_edits=True,
+            )
         result["response"] = response
     except Exception as exc:  # noqa: BLE001 — isolate task failures
         result["error"] = f"{type(exc).__name__}: {exc}"

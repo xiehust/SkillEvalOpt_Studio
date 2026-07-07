@@ -1,0 +1,265 @@
+"""Command builders for real eval/train runs.
+
+Pure-ish logic (writes only inside the given job_dir) so it is fully unit
+testable with stub CLIs: tests monkeypatch ``EVAL_SCRIPT`` / ``TRAIN_SCRIPT``
+to fake scripts that write realistic artifacts in seconds.
+
+Train configs are never hand-templated: ``skillopt.config.load_config``
+parses ``configs/skilleval/default.yaml`` (resolving ``_base_``), overrides
+are applied on the structured dict, and the result is dumped to
+``<job_dir>/config.yaml`` — so studio configs can't drift from what
+scripts/train.py actually accepts.
+"""
+from __future__ import annotations
+
+import re
+import shlex
+import shutil
+import sys
+from pathlib import Path
+
+import yaml
+
+from skillopt.config import load_config as load_structured_config
+from skillopt.model.common import default_model_for_backend
+
+from skillopt_studio import skill_sources, tasksets
+from skillopt_studio.config import StudioConfig
+from skillopt_studio.models import SkillInfo
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# Module-level so tests can monkeypatch them to stub CLIs.
+EVAL_SCRIPT = PROJECT_ROOT / "scripts" / "evaluate_skill.py"
+TRAIN_SCRIPT = PROJECT_ROOT / "scripts" / "train.py"
+TRAIN_BASE_CONFIG = PROJECT_ROOT / "configs" / "skilleval" / "default.yaml"
+BUNDLE_MODULE = "skillopt.envs.skilleval.bundle"
+
+PYTHON = sys.executable
+
+
+def _resolve_skill(config: StudioConfig, skill_id: str) -> SkillInfo:
+    skill = skill_sources.get_skill(config, skill_id)
+    if skill is None:
+        raise ValueError(f"skill {skill_id!r} not found")
+    return skill
+
+
+def _resolve_taskset_file(config: StudioConfig, taskset_id: str) -> Path:
+    """The single task file an eval run consumes (split sets prefer test)."""
+    try:
+        paths = tasksets.taskset_file_paths(config, taskset_id)
+    except KeyError:
+        raise ValueError(f"task set {taskset_id!r} not found") from None
+    for split in ("tasks", "test", "val", "train"):
+        if split in paths:
+            return paths[split]
+    raise ValueError(f"task set {taskset_id!r} has no task files")
+
+
+def _require_script(path: Path) -> None:
+    if not path.is_file():
+        raise ValueError(f"CLI entry point not found: {path}")
+
+
+# Exec backends the studio can run tasks with, and the CLI each one shells out to.
+EXEC_BACKENDS = {
+    "claude_code_exec": "claude",
+    "codex_exec": "codex",
+}
+
+
+def cli_path(backend: str) -> str | None:
+    """Absolute path of the backend's CLI on PATH, or None when not installed."""
+    cli = EXEC_BACKENDS.get(backend)
+    return shutil.which(cli) if cli else None
+
+
+def _resolve_target_backend(params: dict) -> str:
+    """Validated exec backend from params (default claude_code_exec); fail-fast
+    when its CLI is not installed so no job is queued that can only crash."""
+    backend = str(params.get("target_backend") or "claude_code_exec")
+    if backend not in EXEC_BACKENDS:
+        raise ValueError(
+            f"target_backend must be one of {sorted(EXEC_BACKENDS)}, got {backend!r}"
+        )
+    if cli_path(backend) is None:
+        raise ValueError(
+            f"target_backend {backend!r} requires the '{EXEC_BACKENDS[backend]}' CLI, "
+            "which was not found on PATH — install it and log in first"
+        )
+    return backend
+
+
+_SPLIT_RATIO_RE = re.compile(r"^[1-9]\d*:[1-9]\d*:[1-9]\d*$")
+
+# key → (min, max); mirrored by the wizard forms so both sides agree
+PARAM_RANGES = {
+    "workers": (1, 8),
+    "timeout": (60, 3600),
+    "limit": (0, 10000),
+    "num_epochs": (1, 10),
+    "learning_rate": (1, 16),
+}
+
+
+def _validated_int(params: dict, key: str) -> int | None:
+    """Range-checked int from params (None when absent); ValueError names the field."""
+    value = params.get(key)
+    if value is None:
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be an integer, got {value!r}") from None
+    low, high = PARAM_RANGES[key]
+    if not low <= number <= high:
+        raise ValueError(f"{key} must be between {low} and {high}, got {number}")
+    return number
+
+
+def build_eval_command(config: StudioConfig, params: dict, job_dir: Path) -> list[str]:
+    """argv for scripts/evaluate_skill.py; output goes to <job_dir>/out."""
+    _require_script(EVAL_SCRIPT)
+    skill = _resolve_skill(config, str(params.get("skill_id", "")))
+    tasks_file = _resolve_taskset_file(config, str(params.get("taskset_id", "")))
+    target_backend = _resolve_target_backend(params)
+
+    argv = [
+        PYTHON, str(EVAL_SCRIPT),
+        "--skill", skill.path,
+        "--tasks", str(tasks_file),
+        "--out_root", str(job_dir / "out"),
+        "--target_backend", target_backend,
+    ]
+    for flag, key in (
+        ("--model", "model"),
+        ("--optimizer_model", "optimizer_model"),
+        ("--optimizer_backend", "optimizer_backend"),
+    ):
+        value = params.get(key)
+        if value:
+            argv += [flag, str(value)]
+    for flag, key in (("--workers", "workers"), ("--timeout", "timeout"), ("--limit", "limit")):
+        value = _validated_int(params, key)
+        if value is not None:
+            argv += [flag, str(value)]
+    return argv
+
+
+def _materialize_split_dir(config: StudioConfig, taskset_id: str, job_dir: Path) -> tuple[Path, bool]:
+    """Copy a split taskset's flat files into the train/ val/ test/ items.json
+    layout SplitDataLoader requires.  Returns (split_dir, has_real_test):
+    when the taskset has no test.json, val doubles as test so the loader's
+    all-three-splits check passes, and eval_test should default off."""
+    paths = tasksets.taskset_file_paths(config, taskset_id)
+    if "train" not in paths or "val" not in paths:
+        raise ValueError(f"task set {taskset_id!r} is not a split set with train/val files")
+    split_root = job_dir / "split"
+    has_real_test = "test" in paths
+    plan = {"train": paths["train"], "val": paths["val"], "test": paths.get("test", paths["val"])}
+    for split, source in plan.items():
+        split_dir = split_root / split
+        split_dir.mkdir(parents=True, exist_ok=True)
+        (split_dir / "items.json").write_bytes(source.read_bytes())
+    return split_root, has_real_test
+
+
+def build_train_command(config: StudioConfig, params: dict, job_dir: Path) -> list[str]:
+    """Write <job_dir>/config.yaml and return the argv (or bash pipeline when
+    a bundle step must run first) for scripts/train.py."""
+    _require_script(TRAIN_SCRIPT)
+    if not TRAIN_BASE_CONFIG.is_file():
+        raise ValueError(f"base train config not found: {TRAIN_BASE_CONFIG}")
+    skill = _resolve_skill(config, str(params.get("skill_id", "")))
+    taskset_id = str(params.get("taskset_id", ""))
+    taskset = tasksets.get_taskset(config, taskset_id)
+    if taskset is None:
+        raise ValueError(f"task set {taskset_id!r} not found")
+
+    target_backend = _resolve_target_backend(params)
+    cfg = load_structured_config(str(TRAIN_BASE_CONFIG))
+    job_dir.mkdir(parents=True, exist_ok=True)
+    skill_dir = Path(skill.path)
+
+    cfg["model"]["target_backend"] = target_backend
+    if params.get("target_model"):
+        cfg["model"]["target"] = str(params["target_model"])
+    elif target_backend == "codex_exec":
+        # the YAML default target is a Claude model — swap to the backend's default
+        cfg["model"]["target"] = default_model_for_backend(target_backend)
+    if params.get("optimizer_model"):
+        cfg["model"]["optimizer"] = str(params["optimizer_model"])
+    num_epochs = _validated_int(params, "num_epochs")
+    if num_epochs is not None:
+        cfg["train"]["num_epochs"] = num_epochs
+    learning_rate = _validated_int(params, "learning_rate")
+    if learning_rate is not None:
+        cfg["optimizer"]["learning_rate"] = learning_rate
+    if params.get("gate_metric"):
+        gate_metric = str(params["gate_metric"])
+        if gate_metric not in ("hard", "soft", "mixed"):
+            raise ValueError(f"gate_metric must be hard | soft | mixed, got {gate_metric!r}")
+        cfg["evaluation"]["gate_metric"] = gate_metric
+
+    trainable_files = [str(f) for f in (params.get("trainable_files") or []) if str(f).strip()]
+    bundle_path = job_dir / "seed_bundle.md"
+    if trainable_files:
+        cfg["env"]["skill_init"] = str(bundle_path)
+        cfg["env"]["trainable_files"] = trainable_files
+    else:
+        cfg["env"]["skill_init"] = str(skill_dir / "SKILL.md")
+    cfg["env"]["skill_dir"] = str(skill_dir)
+
+    if taskset.mode == "split":
+        split_root, has_real_test = _materialize_split_dir(config, taskset_id, job_dir)
+        cfg["env"]["split_mode"] = "split_dir"
+        cfg["env"]["split_dir"] = str(split_root)
+        cfg["env"].pop("data_path", None)
+        if not has_real_test and params.get("eval_test") is None:
+            cfg["evaluation"]["eval_test"] = False  # test/ is a copy of val — don't score it
+    else:
+        tasks_file = _resolve_taskset_file(config, taskset_id)
+        split_ratio = str(params.get("split_ratio") or "4:3:3")
+        if not _SPLIT_RATIO_RE.match(split_ratio):
+            raise ValueError(f"split_ratio must look like '4:3:3', got {split_ratio!r}")
+        cfg["env"]["split_mode"] = "ratio"
+        cfg["env"]["data_path"] = str(tasks_file)
+        cfg["env"]["split_ratio"] = split_ratio
+        cfg["env"]["split_output_dir"] = str(job_dir / "split")
+        cfg["env"].pop("split_dir", None)
+    if params.get("eval_test") is not None:
+        cfg["evaluation"]["eval_test"] = bool(params["eval_test"])
+    for cfg_key in ("workers", "timeout", "limit"):
+        value = _validated_int(params, cfg_key)
+        if value is not None:
+            cfg["env"][cfg_key] = value
+
+    config_path = job_dir / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), encoding="utf-8"
+    )
+
+    train_argv = [
+        PYTHON, str(TRAIN_SCRIPT),
+        "--config", str(config_path),
+        "--out_root", str(job_dir / "out"),
+    ]
+    if not trainable_files:
+        return train_argv
+
+    bundle_argv = [
+        PYTHON, "-m", BUNDLE_MODULE, "build", str(skill_dir),
+        "--files", ",".join(trainable_files),
+        "--out", str(bundle_path),
+    ]
+    # Two sequential steps in one process tree; echo markers make it obvious
+    # in log.txt whether a failure came from the bundle step or the train step.
+    script = (
+        "set -e\n"
+        "echo '[studio] step 1/2: bundle build'\n"
+        f"{shlex.join(bundle_argv)}\n"
+        "echo '[studio] step 2/2: train'\n"
+        f"{shlex.join(train_argv)}\n"
+    )
+    return ["bash", "-c", script]

@@ -1,0 +1,100 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-bg text-text font-sans antialiased;
+  /* faint blueprint grid — gives the console depth without noise */
+  background-image:
+    radial-gradient(ellipse 80% 50% at 50% -10%, rgba(86, 199, 214, 0.06), transparent),
+    linear-gradient(rgba(42, 54, 71, 0.22) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(42, 54, 71, 0.22) 1px, transparent 1px);
+  background-size: 100% 100%, 32px 32px, 32px 32px;
+}
+
+::selection {
+  background: rgba(166, 219, 76, 0.3);
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: #2a3647;
+  border-radius: 5px;
+  border: 2px solid #0e1524;
+}
+
+@layer components {
+  .card {
+    @apply bg-panel border border-line rounded-md shadow-card;
+  }
+  .btn {
+    @apply inline-flex items-center gap-2 px-4 py-2 rounded font-medium text-sm
+      transition-colors duration-150 cursor-pointer select-none
+      disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+  .btn-primary {
+    @apply btn bg-green text-bg hover:bg-[#b8ec5e] shadow-glow;
+  }
+  .btn-ghost {
+    @apply btn bg-panel2 text-text border border-line hover:border-muted;
+  }
+  .btn-danger {
+    @apply btn bg-transparent text-red border border-red/50 hover:bg-red/10;
+  }
+  .input {
+    @apply bg-bg border border-line rounded px-3 py-2 text-sm text-text w-full
+      placeholder:text-muted/60 focus:outline-none focus:border-cyan;
+  }
+  .label {
+    @apply block text-xs uppercase tracking-widest text-muted mb-1.5;
+  }
+  .section-title {
+    @apply text-xs uppercase tracking-[0.2em] text-muted font-semibold;
+  }
+  .th {
+    @apply text-left text-xs uppercase tracking-wider text-muted font-medium
+      px-4 py-2.5 border-b border-line whitespace-nowrap;
+  }
+  .td {
+    @apply px-4 py-2.5 border-b border-line/60 text-sm align-top;
+  }
+  .prose-dark h1, .prose-dark h2, .prose-dark h3, .prose-dark h4 {
+    @apply text-text font-semibold mt-5 mb-2;
+  }
+  .prose-dark h1 { @apply text-xl border-b border-line pb-2; }
+  .prose-dark h2 { @apply text-lg; }
+  .prose-dark h3 { @apply text-base; }
+  .prose-dark p { @apply my-2 leading-relaxed text-sm text-text/90; }
+  .prose-dark ul, .prose-dark ol { @apply my-2 pl-5 text-sm space-y-1; }
+  .prose-dark ul { @apply list-disc; }
+  .prose-dark ol { @apply list-decimal; }
+  .prose-dark code {
+    @apply font-mono text-[0.85em] bg-panel2 border border-line rounded px-1 py-0.5 text-cyan;
+  }
+  .prose-dark pre {
+    @apply bg-bg border border-line rounded-md p-3 my-3 overflow-x-auto;
+  }
+  .prose-dark pre code { @apply bg-transparent border-0 p-0 text-text/90; }
+  .prose-dark a { @apply text-cyan underline decoration-cyan/40; }
+  .prose-dark blockquote { @apply border-l-2 border-green/60 pl-3 my-2 text-muted; }
+  .prose-dark table { @apply my-3 w-full text-sm; }
+  .prose-dark th, .prose-dark td { @apply border border-line px-2 py-1 text-left; }
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.pulse-dot {
+  animation: pulse-dot 1.4s ease-in-out infinite;
+}

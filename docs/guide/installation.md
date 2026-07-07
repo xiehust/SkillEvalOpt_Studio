@@ -65,8 +65,8 @@ Edit `.env` with your API keys:
 
 ```ini
 # Azure OpenAI (default backend)
-AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
-AZURE_OPENAI_API_KEY=your-key
+OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
+OPENAI_API_KEY=your-key
 
 # Or use OpenAI directly
 OPENAI_API_KEY=sk-...

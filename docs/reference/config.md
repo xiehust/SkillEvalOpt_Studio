@@ -72,8 +72,8 @@ Complete reference for all SkillOpt configuration parameters.
 
 | Variable | Description |
 |---|---|
-| `AZURE_OPENAI_ENDPOINT` / `model.azure_openai_endpoint` | Azure resource endpoint |
-| `AZURE_OPENAI_API_KEY` / `model.azure_openai_api_key` | Azure API key |
+| `OPENAI_ENDPOINT` / `model.azure_openai_endpoint` | Azure resource endpoint |
+| `OPENAI_API_KEY` / `model.azure_openai_api_key` | Azure API key |
 | `OPENAI_API_KEY` | OpenAI API key (for `openai_chat` backend) |
 | `ANTHROPIC_API_KEY` | Anthropic API key (for `claude_code_exec` backend) |
 | `QWEN_CHAT_BASE_URL` | Shared local vLLM endpoint for `qwen_chat` |

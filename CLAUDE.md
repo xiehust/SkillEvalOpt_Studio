@@ -24,6 +24,11 @@ python3 scripts/eval_only.py --config <cfg> --skill <skill.md>    # score one sk
 python3 scripts/evaluate_skill.py --skill <SKILL.md> --tasks <tasks.json> --out_root <dir>  # evaluate an arbitrary skill on a custom task set
 bash scripts/run_searchqa.sh                   # wrapper with env-var model selection
 
+# SkillOpt Studio (localhost web console for skilleval + train; see docs/guide/studio.md)
+./start.sh && ./stop.sh                        # start/stop wrapper (pidfile, health check, auto frontend build)
+python3 -m skillopt_studio                     # serve on 127.0.0.1:8321 (needs frontend built once)
+cd skillopt_studio/frontend && npm run build   # build the frontend (tsc + vite → dist/)
+
 # Data: data/*_id_split/ contains ID-only manifests (no content, licensing).
 # Hydrate before running benchmarks, e.g.:
 python3 scripts/materialize_searchqa.py        # needs `pip install datasets`
@@ -38,6 +43,7 @@ Three top-level packages, deliberately decoupled:
 - **`skillopt/`** — the research framework (training loop).
 - **`skillopt_sleep/`** — SkillOpt-Sleep, a standalone nightly self-evolution tool for local coding agents. **Zero dependency on `skillopt/`** (the validation gate is vendored). Don't introduce cross-imports.
 - **`skillopt_webui/`** — optional Gradio dashboard.
+- **`skillopt_studio/`** — FastAPI + React localhost console for skilleval evaluation and training (wraps the CLIs as subprocesses; only imports `skillopt` for config parsing and task validation). Frontend lives in `skillopt_studio/frontend/` (Vite+React+TS+Tailwind); tests in `tests/test_studio_core.py` / `tests/test_studio_runners.py` (stub CLIs, no model calls).
 
 ### The training loop (skillopt/)
 

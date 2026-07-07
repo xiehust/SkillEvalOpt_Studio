@@ -51,6 +51,7 @@ nav:
     - Add a New Benchmark: guide/new-benchmark.md
     - Local Environment Smoke Tests: guide/local-env-smoke.md
     - Add a New Model Backend: guide/new-backend.md
+    - SkillOpt Studio (Web Console): guide/studio.md
   - Reference:
     - Configuration Reference: reference/config.md
     - CLI Reference: reference/cli.md

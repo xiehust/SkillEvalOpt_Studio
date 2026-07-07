@@ -77,6 +77,15 @@ A benchmark = a `skillopt/envs/<name>/` package with a `dataloader.py`, a
 [`docs/guide/new-benchmark.md`](docs/guide/new-benchmark.md) for the full
 contract; the simplest reference is `skillopt/envs/searchqa/`.
 
+### SkillOpt Studio (web console)
+
+A localhost FastAPI + React console for the full skill workflow — scan/upload
+skills, build rubric-judged task sets, launch real evaluations and training
+runs, and inspect logs, per-task results, training timelines and skill diffs
+in the browser. Build the frontend once (`cd skillopt_studio/frontend && npm
+install && npm run build`), then `python3 -m skillopt_studio` and open
+http://127.0.0.1:8321. See [`docs/guide/studio.md`](docs/guide/studio.md).
+
 ### WebUI
 
 Launch the monitoring dashboard (optional):

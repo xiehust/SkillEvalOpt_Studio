@@ -374,6 +374,38 @@ class TestRunBatch:
     def test_empty_items_returns_empty(self, tmp_path) -> None:
         assert run_batch([], "# skill", str(tmp_path)) == []
 
+    def test_codex_backend_dispatches_to_codex_exec(self, tmp_path, monkeypatch) -> None:
+        claude_calls, codex_calls = [], []
+        monkeypatch.setattr(rollout_mod, "prepare_workspace", lambda **kw: ("", ""))
+        monkeypatch.setattr(
+            rollout_mod, "run_claude_code_exec",
+            lambda **kw: claude_calls.append(kw) or ("claude answer", "raw"),
+        )
+        monkeypatch.setattr(
+            rollout_mod, "run_codex_exec",
+            lambda **kw: codex_calls.append(kw) or ("codex answer", "raw"),
+        )
+        monkeypatch.setattr(rollout_mod, "get_target_backend", lambda: "codex_exec")
+
+        results = run_batch([_valid_item("t1")], "# skill", str(tmp_path), model="gpt-5.5")
+        assert results[0]["response"] == "codex answer"
+        assert not claude_calls
+        assert codex_calls[0]["model"] == "gpt-5.5"
+        assert codex_calls[0]["prompt"] == rollout_mod.GUIDE_PROMPT
+        assert os.path.isabs(codex_calls[0]["work_dir"])  # codex -C needs an absolute path
+
+    def test_default_backend_still_uses_claude(self, tmp_path, monkeypatch) -> None:
+        codex_calls = []
+        self._patch_harness(monkeypatch, lambda **kw: ("claude answer", "raw"))
+        monkeypatch.setattr(
+            rollout_mod, "run_codex_exec",
+            lambda **kw: codex_calls.append(kw) or ("codex answer", "raw"),
+        )
+        monkeypatch.setattr(rollout_mod, "get_target_backend", lambda: "claude_code_exec")
+        results = run_batch([_valid_item("t1")], "# skill", str(tmp_path))
+        assert results[0]["response"] == "claude answer"
+        assert not codex_calls
+
 
 # ── CLI / report ──────────────────────────────────────────────────────────
 

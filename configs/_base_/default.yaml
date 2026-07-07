@@ -27,20 +27,20 @@ model:
   codex_trace_to_optimizer: true
   azure_openai_endpoint: ""           # e.g. "https://your-resource.openai.azure.com/"
   azure_openai_api_version: "2024-12-01-preview"
-  azure_openai_api_key: ""       # Fill locally if you do not export AZURE_OPENAI_API_KEY
-  azure_openai_auth_mode: ""           # empty → fall back to AZURE_OPENAI_AUTH_MODE env (default "azure_cli")
+  azure_openai_api_key: ""       # Fill locally if you do not export OPENAI_API_KEY
+  azure_openai_auth_mode: ""           # empty → fall back to OPENAI_AUTH_MODE env (default "azure_cli")
   azure_openai_ad_scope: "https://cognitiveservices.azure.com/.default"
   azure_openai_managed_identity_client_id: ""
   optimizer_azure_openai_endpoint: ""   # e.g. "https://your-resource.openai.azure.com/"
   optimizer_azure_openai_api_version: "2024-12-01-preview"
   optimizer_azure_openai_api_key: ""
-  optimizer_azure_openai_auth_mode: ""           # empty → fall back to OPTIMIZER_AZURE_OPENAI_AUTH_MODE env, then shared
+  optimizer_azure_openai_auth_mode: ""           # empty → fall back to OPTIMIZER_OPENAI_AUTH_MODE env, then shared
   optimizer_azure_openai_ad_scope: "https://cognitiveservices.azure.com/.default"
   optimizer_azure_openai_managed_identity_client_id: ""
   target_azure_openai_endpoint: ""   # e.g. "https://your-resource.openai.azure.com/"
   target_azure_openai_api_version: "2024-12-01-preview"
   target_azure_openai_api_key: ""
-  target_azure_openai_auth_mode: ""           # empty → fall back to TARGET_AZURE_OPENAI_AUTH_MODE env, then shared
+  target_azure_openai_auth_mode: ""           # empty → fall back to TARGET_OPENAI_AUTH_MODE env, then shared
   target_azure_openai_ad_scope: "https://cognitiveservices.azure.com/.default"
   target_azure_openai_managed_identity_client_id: ""
 

@@ -119,8 +119,8 @@ SkillOpt brings the familiar deep-learning training paradigm to agentic prompt o
 pip install -e .
 
 # Configure credentials
-export AZURE_OPENAI_ENDPOINT="https://your-resource.openai.azure.com/"
-export AZURE_OPENAI_API_KEY="your-key"
+export OPENAI_ENDPOINT="https://your-resource.openai.azure.com/"
+export OPENAI_API_KEY="your-key"
 
 # Train on SearchQA
 python scripts/train.py --config configs/searchqa/default.yaml

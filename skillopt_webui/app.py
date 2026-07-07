@@ -83,12 +83,15 @@ def build_training_env() -> dict[str, str]:
         for env_file in sorted(secrets_dir.glob("*.env")):
             _load_env_file(env_file, env)
 
-    # Propagate OPTIMIZER_* to base AZURE_OPENAI_* when base is missing,
-    # so target/default endpoints inherit from optimizer config.
-    for suffix in (
-        "ENDPOINT", "API_VERSION", "AUTH_MODE", "MANAGED_IDENTITY_CLIENT_ID",
-        "AD_SCOPE", "API_KEY",
-    ):
+    # Propagate OPTIMIZER_* to the base vars when base is missing, so
+    # target/default endpoints inherit from optimizer config.
+    # (api-version has no env interface — config key only.)
+    for suffix in ("ENDPOINT", "AUTH_MODE", "API_KEY"):
+        base_key = f"OPENAI_{suffix}"
+        optimizer_key = f"OPTIMIZER_OPENAI_{suffix}"
+        if not env.get(base_key) and env.get(optimizer_key):
+            env[base_key] = env[optimizer_key]
+    for suffix in ("MANAGED_IDENTITY_CLIENT_ID", "AD_SCOPE"):
         base_key = f"AZURE_OPENAI_{suffix}"
         optimizer_key = f"OPTIMIZER_AZURE_OPENAI_{suffix}"
         if not env.get(base_key) and env.get(optimizer_key):
@@ -115,7 +118,7 @@ def validate_training_config(
     shared_endpoint = (
         cfg.get("azure_openai_endpoint")
         or cfg.get("azure_endpoint")
-        or env.get("AZURE_OPENAI_ENDPOINT")
+        or env.get("OPENAI_ENDPOINT")
     )
     missing_openai_roles = []
     for role in ("optimizer", "target"):
@@ -123,7 +126,7 @@ def validate_training_config(
             continue
         role_endpoint = (
             cfg.get(f"{role}_azure_openai_endpoint")
-            or env.get(f"{role.upper()}_AZURE_OPENAI_ENDPOINT")
+            or env.get(f"{role.upper()}_OPENAI_ENDPOINT")
             or shared_endpoint
         )
         if not role_endpoint:
@@ -139,7 +142,7 @@ def validate_training_config(
         return (
             "❌ Model backend is not ready: missing Azure/OpenAI-compatible endpoint "
             f"for {', '.join(missing_openai_roles)}.\n"
-            "Set model.azure_openai_endpoint (or AZURE_OPENAI_ENDPOINT), or change "
+            "Set model.azure_openai_endpoint (or OPENAI_ENDPOINT), or change "
             "the role backends to the backend you intend to use."
             f"{detail}"
         )

@@ -68,3 +68,7 @@ docs/让*
 tests/run_*.sh
 tests/launch_*.py
 *.launch.log
+
+# SkillOpt Studio frontend build artifacts
+skillopt_studio/frontend/node_modules/
+skillopt_studio/frontend/dist/

@@ -128,8 +128,8 @@ Model credentials are loaded from environment variables:
 
 | Variable | Backend | Description |
 |---|---|---|
-| `AZURE_OPENAI_ENDPOINT` | azure_openai | Azure resource endpoint |
-| `AZURE_OPENAI_API_KEY` | azure_openai | Azure API key |
+| `OPENAI_ENDPOINT` | azure_openai | Azure resource endpoint |
+| `OPENAI_API_KEY` | azure_openai | Azure API key |
 | `OPENAI_API_KEY` | openai | OpenAI API key |
 | `ANTHROPIC_API_KEY` | claude | Anthropic API key |
 | `QWEN_API_BASE` | qwen | Local Qwen vLLM endpoint |
