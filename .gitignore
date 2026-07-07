@@ -4,7 +4,7 @@ __pycache__/
 build/
 dist/
 site/
-
+.pytest_cache/
 data/*
 !data/README.md
 !data/searchqa_id_split/
