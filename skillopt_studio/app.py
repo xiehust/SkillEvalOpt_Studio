@@ -37,11 +37,16 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
             )
         return {"backends": backends}
 
+    from skillopt_studio import auth
     from skillopt_studio.api import dashboard as dashboard_api
     from skillopt_studio.api import jobs as jobs_api
     from skillopt_studio.api import skills as skills_api
     from skillopt_studio.api import tasksets as tasksets_api
 
+    # Session gate for internet-facing (prod) deployments; no-op unless
+    # STUDIO_AUTH_PASSWORD is set, so local dev and tests are unaffected.
+    app.middleware("http")(auth.middleware)
+    app.include_router(auth.router, prefix="/api")
     app.include_router(skills_api.router, prefix="/api")
     app.include_router(tasksets_api.router, prefix="/api")
     app.include_router(jobs_api.router, prefix="/api")
@@ -62,10 +67,15 @@ def _mount_frontend(app: FastAPI, dist: Path) -> None:
     index_html = dist / "index.html"
     dist_resolved = dist.resolve()
 
+    # index.html must never be cached (deploys swap the hashed asset names it
+    # points at); the /assets bundles are content-hashed and cache forever.
+    _NO_CACHE = {"Cache-Control": "no-cache"}
+
     @app.get("/{full_path:path}", include_in_schema=False)
     def spa_fallback(full_path: str) -> FileResponse:
         if full_path:
             candidate = (dist_resolved / full_path).resolve()
             if dist_resolved in candidate.parents and candidate.is_file():
-                return FileResponse(candidate)
-        return FileResponse(index_html)
+                headers = None if full_path.startswith("assets/") else _NO_CACHE
+                return FileResponse(candidate, headers=headers)
+        return FileResponse(index_html, headers=_NO_CACHE)

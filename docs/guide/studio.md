@@ -27,10 +27,11 @@ skillopt_studio/
 
 ```bash
 # 最简:仓库根目录的启停脚本(自动补前端构建、健康检查、pidfile)
-./start.sh                                 # http://127.0.0.1:8321(STUDIO_PORT/STUDIO_HOST 可覆盖)
+./start.sh                                 # dev:http://127.0.0.1:8321,无鉴权(STUDIO_PORT/STUDIO_HOST 可覆盖)
+./start.sh --prod                          # prod:0.0.0.0:8321,登录验证开启(见下)
 ./stop.sh                                  # 停服;运行中的 job 不会被杀(先在 UI 取消)
 
-# 生产模式(手动单命令;需先构建一次前端)
+# 手动单命令(需先构建一次前端)
 cd skillopt_studio/frontend && npm install && npm run build && cd ../..
 python3 -m skillopt_studio                 # http://127.0.0.1:8321
 
@@ -40,6 +41,15 @@ cd skillopt_studio/frontend && npm run dev # 终端 2:Vite dev server(:5173)
 ```
 
 参数:`--host`(默认 127.0.0.1)、`--port`(默认 8321)、`--reload`。
+
+### prod 模式与登录验证
+
+`./start.sh --prod` 面向公网暴露场景(ALB / CloudFront 后面):绑定 `0.0.0.0`、检测到前端源码比 dist 新会自动重建,并强制**用户名/密码登录**:
+
+- 用户名:`STUDIO_AUTH_USERNAME`(默认 `admin`);密码:`STUDIO_AUTH_PASSWORD`,未设置时首次启动自动生成并持久化到 `outputs/studio/auth_password`(chmod 600)。两者都可写进 `.env`。
+- 鉴权是无状态签名会话 cookie(HttpOnly,12 小时有效):`POST /api/auth/login` 颁发,所有 `/api/*` 与 `/docs` 未登录一律 401;`/api/health`(负载均衡健康检查)与 SPA 静态壳保持开放。轮换密码即吊销全部会话。
+- 前端未登录时整站切换为登录页;会话过期任意请求 401 会自动弹回登录页;侧栏底部有退出登录。
+- 不设置 `STUDIO_AUTH_PASSWORD` 时(默认 dev 启动)行为与从前完全一致,零鉴权。
 
 模型网关环境变量要在**启动 shell**里就绪(与 train.py/eval_only.py 同一套约定),例如 mantle 网关:
 

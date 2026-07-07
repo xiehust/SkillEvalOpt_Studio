@@ -181,6 +181,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(0, "无法连接后端服务");
   }
   if (!response.ok) {
+    // Session expired / not logged in — flip the app back to the login gate
+    // (the login endpoint's own 401 is a wrong-credentials error, not expiry).
+    if (response.status === 401 && !path.startsWith("/api/auth/")) {
+      window.dispatchEvent(new Event("studio-unauthorized"));
+    }
     let message = `HTTP ${response.status}`;
     try {
       const body = await response.json();
@@ -194,8 +199,21 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
+export interface AuthStatus {
+  auth_required: boolean;
+  authenticated: boolean;
+}
+
 export const api = {
   health: () => request<{ status: string }>("/api/health"),
+  authStatus: () => request<AuthStatus>("/api/auth/status"),
+  login: (username: string, password: string) =>
+    request<{ ok: boolean }>("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    }),
+  logout: () => request<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
   environment: () => request<{ backends: BackendStatus[] }>("/api/environment"),
   skills: () => request<SkillInfo[]>("/api/skills"),
   skillDetail: (id: string) => request<SkillDetail>(`/api/skills/${encodeURIComponent(id)}`),

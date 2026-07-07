@@ -1,4 +1,5 @@
 import { NavLink, Route, Routes } from "react-router-dom";
+import { LogoutButton } from "./components/AuthGate";
 import Dashboard from "./pages/Dashboard";
 import Skills from "./pages/Skills";
 import SkillDetailPage from "./pages/SkillDetail";
@@ -55,8 +56,9 @@ export default function App() {
             </NavLink>
           ))}
         </nav>
-        <div className="px-5 py-4 border-t border-line text-[11px] text-muted font-mono">
-          {window.location.host}
+        <div className="px-5 py-4 border-t border-line text-[11px] text-muted font-mono flex items-center justify-between gap-2">
+          <span className="truncate">{window.location.host}</span>
+          <LogoutButton />
         </div>
       </aside>
       <main className="flex-1 min-w-0">
