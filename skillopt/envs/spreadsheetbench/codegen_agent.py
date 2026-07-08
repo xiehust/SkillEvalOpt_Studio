@@ -31,9 +31,16 @@ def _timeout_handler(signum, frame):
 from skillopt.model.azure_openai import (
     get_reasoning_effort,
     get_target_client,
-    _needs_responses_api,
     tracker,
 )
+from skillopt.model.mantle_openai import needs_responses_api_for
+
+
+def _needs_responses_api(deployment: str) -> bool:
+    # Mantle-aware: openai.gpt* on a bedrock-mantle target endpoint is
+    # Responses-only; everything else follows azure_openai's stock list.
+    return needs_responses_api_for(deployment, role="target")
+
 from skillopt.model import get_codex_exec_config, get_target_backend, is_target_exec_backend
 from skillopt.model.codex_harness import prepare_workspace, render_skill_md, run_target_exec
 from skillopt.prompts import load_prompt

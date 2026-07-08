@@ -6,6 +6,7 @@ from typing import Any
 
 from skillopt.model import azure_openai as _openai
 from skillopt.model import claude_backend as _claude
+from skillopt.model import mantle_openai as _mantle
 from skillopt.model import minimax_backend as _minimax
 from skillopt.model import qwen_backend as _qwen
 from skillopt.model.backend_config import (  # noqa: F401
@@ -21,6 +22,12 @@ from skillopt.model.backend_config import (  # noqa: F401
     set_target_backend,
     set_optimizer_backend,
 )
+
+
+def _openai_module(role: str):
+    """azure_openai, or the mantle wrapper when the role's endpoint is a
+    Bedrock mantle gateway (openai.gpt* models are Responses-API-only there)."""
+    return _mantle if _mantle.uses_mantle(role) else _openai
 
 
 def set_backend(name: str | None) -> str:
@@ -105,7 +112,7 @@ def chat_optimizer(
             reasoning_effort=reasoning_effort,
             timeout=timeout,
         )
-    return _openai.chat_optimizer(
+    return _openai_module("optimizer").chat_optimizer(
         system=system,
         user=user,
         max_completion_tokens=max_completion_tokens,
@@ -158,7 +165,7 @@ def chat_target(
             "chat_target is only supported with target_backend=openai_chat, claude_chat, qwen_chat, or minimax_chat. "
             "Exec backends are handled in environment-specific rollout code."
         )
-    return _openai.chat_target(
+    return _openai_module("target").chat_target(
         system=system,
         user=user,
         max_completion_tokens=max_completion_tokens,
@@ -204,7 +211,7 @@ def chat_optimizer_messages(
             return_message=return_message,
             timeout=timeout,
         )
-    return _openai.chat_optimizer_messages(
+    return _openai_module("optimizer").chat_optimizer_messages(
         messages=messages,
         max_completion_tokens=max_completion_tokens,
         retries=retries,
@@ -268,7 +275,7 @@ def chat_target_messages(
             "chat_target_messages is only supported with target_backend=openai_chat, claude_chat, qwen_chat, or minimax_chat. "
             "Exec backends are handled in environment-specific rollout code."
         )
-    return _openai.chat_target_messages(
+    return _openai_module("target").chat_target_messages(
         messages=messages,
         max_completion_tokens=max_completion_tokens,
         retries=retries,
@@ -294,7 +301,7 @@ def chat_messages_with_deployment(
     return_message: bool = False,
     timeout: int | None = None,
 ) -> tuple[Any, dict]:
-    return _openai.chat_messages_with_deployment(
+    return _openai_module("optimizer").chat_messages_with_deployment(
         deployment=deployment,
         messages=messages,
         max_completion_tokens=max_completion_tokens,
@@ -318,7 +325,7 @@ def chat_with_deployment(
     reasoning_effort: str | None = None,
     timeout: int | None = None,
 ) -> tuple[str, dict]:
-    return _openai.chat_with_deployment(
+    return _openai_module("optimizer").chat_with_deployment(
         deployment=deployment,
         system=system,
         user=user,
