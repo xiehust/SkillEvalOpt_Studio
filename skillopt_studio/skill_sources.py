@@ -17,9 +17,11 @@ from pathlib import Path
 import yaml
 
 from skillopt_studio.config import StudioConfig
-from skillopt_studio.models import SkillDetail, SkillInfo
+from skillopt_studio.models import SkillDetail, SkillFile, SkillInfo
 
 UPLOAD_SOURCE = "uploaded"
+
+MAX_SKILL_FILE_BYTES = 512 * 1024
 
 # \w covers CJK and other unicode word chars — Chinese names are first-class here
 _SLUG_RE = re.compile(r"[^\w.-]+", re.UNICODE)
@@ -137,6 +139,47 @@ def get_skill_detail(config: StudioConfig, skill_id: str) -> SkillDetail | None:
     skill_md = (skill_dir / "SKILL.md").read_text(encoding="utf-8", errors="replace")
     file_tree = sorted(str(p.relative_to(skill_dir)) for p in skill_dir.rglob("*") if p.is_file())
     return SkillDetail(**skill.model_dump(), skill_md=skill_md, file_tree=file_tree)
+
+
+def skill_file_path(config: StudioConfig, skill_id: str, rel_path: str) -> Path | None:
+    """Resolved path of one file inside the skill directory; None if skill/file missing.
+
+    Traversal (``..``, absolute, ``~``, empty) raises ValueError → API 400.
+    """
+    skill = get_skill(config, skill_id)
+    if skill is None:
+        return None
+    rel = str(rel_path or "").strip()
+    if not rel or rel.startswith(("/", "\\", "~")):
+        raise ValueError(f"file path must be relative, got {rel!r}")
+    root = Path(skill.path).resolve()
+    candidate = (root / rel).resolve()
+    if candidate != root and root not in candidate.parents:
+        raise ValueError(f"file path {rel!r} escapes the skill directory")
+    if not candidate.is_file():
+        return None
+    return candidate
+
+
+def read_skill_file(config: StudioConfig, skill_id: str, rel_path: str) -> SkillFile | None:
+    """Content of one file inside the skill directory (see skill_file_path for errors).
+
+    Binary files (or non-UTF-8) return metadata only, never bytes.
+    """
+    candidate = skill_file_path(config, skill_id, rel_path)
+    if candidate is None:
+        return None
+    rel = str(rel_path).strip()
+    size = candidate.stat().st_size
+    with open(candidate, "rb") as f:
+        data = f.read(MAX_SKILL_FILE_BYTES + 1)
+    if b"\x00" in data:
+        return SkillFile(path=rel, kind="binary", size=size)
+    try:
+        text = data[:MAX_SKILL_FILE_BYTES].decode("utf-8")
+    except UnicodeDecodeError:
+        return SkillFile(path=rel, kind="binary", size=size)
+    return SkillFile(path=rel, kind="text", size=size, truncated=size > MAX_SKILL_FILE_BYTES, content=text)
 
 
 def _safe_members(archive: zipfile.ZipFile, target_dir: Path) -> list[zipfile.ZipInfo]:

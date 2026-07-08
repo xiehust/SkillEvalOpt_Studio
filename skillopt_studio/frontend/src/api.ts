@@ -16,6 +16,15 @@ export interface SkillDetail extends SkillInfo {
   file_tree: string[];
 }
 
+/** One file inside a skill directory; binary files carry metadata only. */
+export interface SkillFile {
+  path: string;
+  kind: "text" | "binary";
+  size: number;
+  truncated?: boolean;
+  content?: string | null;
+}
+
 export interface TaskSetInfo {
   id: string;
   name: string;
@@ -217,6 +226,13 @@ export const api = {
   environment: () => request<{ backends: BackendStatus[] }>("/api/environment"),
   skills: () => request<SkillInfo[]>("/api/skills"),
   skillDetail: (id: string) => request<SkillDetail>(`/api/skills/${encodeURIComponent(id)}`),
+  skillFile: (id: string, path: string) =>
+    request<SkillFile>(
+      `/api/skills/${encodeURIComponent(id)}/files?path=${encodeURIComponent(path)}`,
+    ),
+  // Plain URL (not a fetch): used as <a href> for the 下载 button — auth rides on the session cookie.
+  skillFileRawUrl: (id: string, path: string) =>
+    `/api/skills/${encodeURIComponent(id)}/files/raw?path=${encodeURIComponent(path)}`,
   uploadSkill: (file: File, name?: string) => {
     const form = new FormData();
     form.append("file", file);

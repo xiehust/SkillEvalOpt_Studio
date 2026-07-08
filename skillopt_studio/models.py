@@ -25,6 +25,16 @@ class SkillDetail(SkillInfo):
     file_tree: list[str] = Field(default_factory=list)
 
 
+class SkillFile(BaseModel):
+    """One file inside a skill directory (binary files return metadata only)."""
+
+    path: str
+    kind: Literal["text", "binary"]
+    size: int
+    truncated: bool = False
+    content: Optional[str] = None
+
+
 class TaskSetInfo(BaseModel):
     id: str
     name: str

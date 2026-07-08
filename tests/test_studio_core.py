@@ -552,6 +552,68 @@ class TestStudioApi:
     def test_skill_detail_404(self, client):
         assert client.get("/api/skills/uploaded--nope").status_code == 404
 
+    def test_skill_file_content(self, studio_config, client):
+        skill_dir = make_skill(
+            studio_config.skill_sources["claude"],
+            "ref-skill",
+            "# Ref Skill\n\nSee [references/guide.md](references/guide.md)\n",
+        )
+        (skill_dir / "references").mkdir()
+        (skill_dir / "references" / "guide.md").write_text("# Guide\n\nDetails here.\n", encoding="utf-8")
+
+        response = client.get(
+            "/api/skills/claude--ref-skill/files", params={"path": "references/guide.md"}
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["kind"] == "text"
+        assert body["path"] == "references/guide.md"
+        assert "Details here." in body["content"]
+
+    def test_skill_file_binary_and_missing_404(self, studio_config, client):
+        skill_dir = make_skill(studio_config.skill_sources["claude"], "bin-skill")
+        (skill_dir / "blob.bin").write_bytes(b"\x00\x01\x02")
+
+        response = client.get("/api/skills/claude--bin-skill/files", params={"path": "blob.bin"})
+        assert response.status_code == 200
+        assert response.json()["kind"] == "binary"
+        assert response.json().get("content") is None
+
+        assert (
+            client.get("/api/skills/claude--bin-skill/files", params={"path": "nope.md"}).status_code
+            == 404
+        )
+        assert (
+            client.get("/api/skills/claude--none/files", params={"path": "SKILL.md"}).status_code
+            == 404
+        )
+
+    def test_skill_file_traversal_400(self, studio_config, client):
+        make_skill(studio_config.skill_sources["claude"], "safe-skill")
+        (studio_config.skill_sources["claude"] / "secret.txt").write_text("s", encoding="utf-8")
+        for bad in ("../secret.txt", "/etc/passwd", "~/x", ""):
+            response = client.get("/api/skills/claude--safe-skill/files", params={"path": bad})
+            assert response.status_code == 400, bad
+            response = client.get("/api/skills/claude--safe-skill/files/raw", params={"path": bad})
+            assert response.status_code == 400, bad
+
+    def test_skill_file_raw_download(self, studio_config, client):
+        skill_dir = make_skill(studio_config.skill_sources["claude"], "dl-skill")
+        (skill_dir / "references").mkdir()
+        (skill_dir / "references" / "guide.md").write_text("# Guide\n", encoding="utf-8")
+
+        response = client.get(
+            "/api/skills/claude--dl-skill/files/raw", params={"path": "references/guide.md"}
+        )
+        assert response.status_code == 200
+        assert response.content == b"# Guide\n"
+        assert 'filename="guide.md"' in response.headers["content-disposition"]
+
+        assert (
+            client.get("/api/skills/claude--dl-skill/files/raw", params={"path": "nope.md"}).status_code
+            == 404
+        )
+
     def test_upload_endpoint_and_zip_slip_400(self, studio_config, client):
         good = make_zip({"SKILL.md": "# uploaded via api\n"})
         response = client.post(
