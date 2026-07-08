@@ -502,6 +502,27 @@ class TestStudioApiE2E:
             assert response.status_code == 400, bad
             assert "escapes" in response.json()["detail"] or "relative" in response.json()["detail"]
 
+    def test_artifact_raw_download(self, studio_config, client, claude_skill, single_taskset):
+        response = client.post(
+            "/api/jobs",
+            json={"type": "eval",
+                  "params": {"skill_id": "claude--local-skill", "taskset_id": "single-set"}},
+        )
+        job_id = response.json()["id"]
+        self._wait_status(client, job_id, "succeeded")
+
+        raw = client.get(f"/api/jobs/{job_id}/artifacts/raw", params={"path": "report.md"})
+        assert raw.status_code == 200
+        assert "stub" in raw.text
+        assert 'filename="report.md"' in raw.headers["content-disposition"]
+
+        assert client.get(f"/api/jobs/{job_id}/artifacts/raw", params={"path": "nope.md"}).status_code == 404
+        assert client.get(f"/api/jobs/{job_id}/artifacts/raw", params={"path": ""}).status_code == 404  # dir, not file
+        assert client.get("/api/jobs/ghost/artifacts/raw", params={"path": "report.md"}).status_code == 404
+        for bad in ("../job.json", "/etc/passwd"):
+            response = client.get(f"/api/jobs/{job_id}/artifacts/raw", params={"path": bad})
+            assert response.status_code == 400, bad
+
     def test_dashboard_aggregation(self, studio_config, client, claude_skill, single_taskset):
         done = client.post(
             "/api/jobs",

@@ -3,29 +3,10 @@ import { Link, useParams } from "react-router-dom";
 import ReactMarkdown, { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { api, ApiError, SkillDetail, SkillFile } from "../api";
-import { CodeHighlight, languageForFile, markdownPre } from "../components/highlight";
-import { Card, ErrorBanner, Mono, PageHeader, SourceTag, Spinner } from "../components/ui";
-
-/** Resolve a relative markdown href against the directory of the file being viewed. */
-function resolveRelative(baseFile: string, href: string): string {
-  const clean = href.split(/[?#]/)[0];
-  const segments = baseFile.split("/").slice(0, -1);
-  for (const part of clean.split("/")) {
-    if (!part || part === ".") continue;
-    if (part === "..") segments.pop();
-    else segments.push(part);
-  }
-  return segments.join("/");
-}
-
-/** Absolute URLs, fragments and site-absolute paths keep default anchor behavior. */
-const isExternalHref = (href: string) => /^([a-z][a-z0-9+.-]*:|#|\/)/i.test(href);
-
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-}
+import {
+  CodeHighlight, isExternalHref, languageForFile, markdownPre, resolveRelative,
+} from "../components/highlight";
+import { Card, ErrorBanner, Mono, PageHeader, SourceTag, Spinner, formatSize } from "../components/ui";
 
 export default function SkillDetailPage() {
   const { id = "" } = useParams();

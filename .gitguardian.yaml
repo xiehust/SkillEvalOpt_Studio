@@ -1,0 +1,26 @@
+# GitGuardian ggshield configuration (v2 format).
+# Purpose: stop secret scanners from flagging deliberately fake credentials
+# used as test fixtures (redaction tests in tests/test_sleep_engine.py,
+# auth tests in tests/test_studio_auth.py). None of these are real secrets.
+version: 2
+
+secret:
+  # Test fixtures are the only sanctioned home for secret-shaped strings in
+  # this repo; real credentials belong in .env (gitignored) or the
+  # environment. See CLAUDE.md conventions.
+  ignored_paths:
+    - 'tests/**'
+
+  # Specific fixture values GitGuardian has flagged (kept explicit so a scan
+  # outside tests/ still catches accidental reuse of anything else).
+  ignored_matches:
+    - name: fake bearer token in redaction test (commit 5487e2c)
+      match: sk-LEAKED99887766abcdef
+    - name: AWS documentation example key, not a credential
+      match: AKIAIOSFODNN7EXAMPLE
+    - name: fake GitHub token in redaction test
+      match: ghp_AbCdEf0123456789AbCdEf0123
+    - name: fake JWT in redaction test
+      match: eyJhbGciOi.JIUzI1Ni.qwerty
+    - name: pytest STUDIO_AUTH_PASSWORD fixture (commit 6857ce3)
+      match: s3cret-pass

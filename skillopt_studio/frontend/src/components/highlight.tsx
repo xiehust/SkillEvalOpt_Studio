@@ -1,4 +1,5 @@
-// Shared Prism syntax highlighting (PrismLight — only registered languages ship in the bundle).
+// Shared Prism syntax highlighting (PrismLight — only registered languages ship
+// in the bundle) plus markdown-viewer link helpers used by the file previews.
 import { Children, isValidElement, ReactElement, ReactNode } from "react";
 import { PrismLight as SyntaxHighlighter } from "react-syntax-highlighter";
 import { Components } from "react-markdown";
@@ -75,6 +76,21 @@ export function CodeHighlight({
     </SyntaxHighlighter>
   );
 }
+
+/** Resolve a relative markdown href against the directory of the file being viewed. */
+export function resolveRelative(baseFile: string, href: string): string {
+  const clean = href.split(/[?#]/)[0];
+  const segments = baseFile.split("/").slice(0, -1);
+  for (const part of clean.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") segments.pop();
+    else segments.push(part);
+  }
+  return segments.join("/");
+}
+
+/** Absolute URLs, fragments and site-absolute paths keep default anchor behavior. */
+export const isExternalHref = (href: string) => /^([a-z][a-z0-9+.-]*:|#|\/)/i.test(href);
 
 /** react-markdown `pre` renderer: fenced blocks → CodeHighlight (replaces the
  * wrapper pre entirely so we don't nest SyntaxHighlighter's pre inside it);

@@ -10,6 +10,7 @@ import shutil
 import sys
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
 
 from skillopt_studio import artifacts, runners
 from skillopt_studio.api import get_config, get_job_manager
@@ -168,3 +169,23 @@ def browse_artifacts(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"artifact not found: {exc}") from exc
+
+
+@router.get("/{job_id}/artifacts/raw")
+def download_artifact(
+    job_id: str,
+    path: str = Query(""),
+    jobs: JobManager = Depends(get_job_manager),
+    config: StudioConfig = Depends(get_config),
+) -> FileResponse:
+    """Raw bytes with attachment disposition — the 下载 button links here."""
+    job = jobs.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"job {job_id!r} not found")
+    try:
+        target = artifacts.safe_target(config, job, path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail=f"artifact not found: {path!r}")
+    return FileResponse(target, filename=target.name)

@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
+import ReactMarkdown, { Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
@@ -8,8 +10,11 @@ import {
   ArtifactDir, ArtifactFile,
 } from "../api";
 import {
+  CodeHighlight, isExternalHref, languageForFile, markdownPre, resolveRelative,
+} from "../components/highlight";
+import {
   Card, ErrorBanner, Mono, PageHeader, Spinner, StatBadge, StatusPill,
-  formatDuration, formatTime, jobDuration, truncate,
+  formatDuration, formatSize, formatTime, jobDuration, truncate,
 } from "../components/ui";
 
 const TABS = [
@@ -542,21 +547,7 @@ function ArtifactsTab({ job }: { job: JobInfo }) {
       {error && <ErrorBanner message={error} />}
 
       {file ? (
-        <Card title={<Mono>{file.path}</Mono>}>
-          {file.kind === "binary" ? (
-            <p className="text-sm text-muted">
-              二进制文件,共 {file.size} 字节——不在页面内渲染。
-            </p>
-          ) : (
-            <pre
-              className="bg-bg border border-line rounded-md p-4 text-xs font-mono leading-relaxed overflow-auto max-h-[32rem]"
-              data-testid="artifact-content"
-            >
-              {file.content}
-              {file.truncated && "\n… (文件过大,已截断)"}
-            </pre>
-          )}
-        </Card>
+        <ArtifactFileView jobId={job.id} file={file} onOpen={setPath} />
       ) : listing ? (
         <Card title="目录">
           <ul className="divide-y divide-line/60" data-testid="artifact-listing">
@@ -591,5 +582,85 @@ function ArtifactsTab({ job }: { job: JobInfo }) {
         !error && <Spinner />
       )}
     </div>
+  );
+}
+
+/** File preview: markdown rendered, code highlighted, binary → download hint.
+ * Mirrors the skill-library file viewer (SkillDetail.tsx). */
+function ArtifactFileView({
+  jobId, file, onOpen,
+}: { jobId: string; file: ArtifactFile; onOpen: (path: string) => void }) {
+  const isMarkdown = /\.(md|markdown)$/i.test(file.path);
+
+  // Relative links in the markdown open the referenced artifact in this
+  // viewer instead of navigating the SPA (where they would 404).
+  const markdownComponents: Components = {
+    pre: markdownPre,
+    a: ({ node: _node, href, children, ...rest }) => {
+      if (!href || isExternalHref(href)) {
+        const external = !!href && /^https?:/i.test(href);
+        return (
+          <a href={href} target={external ? "_blank" : undefined} rel={external ? "noreferrer" : undefined} {...rest}>
+            {children}
+          </a>
+        );
+      }
+      const target = resolveRelative(file.path, href);
+      return (
+        <a
+          href={api.jobArtifactRawUrl(jobId, target)}
+          onClick={(event) => {
+            event.preventDefault();
+            onOpen(target);
+          }}
+          {...rest}
+        >
+          {children}
+        </a>
+      );
+    },
+  };
+
+  return (
+    <Card
+      title={<Mono>{file.path}</Mono>}
+      actions={
+        <a
+          className="btn-ghost"
+          href={api.jobArtifactRawUrl(jobId, file.path)}
+          download
+          data-testid="artifact-download"
+        >
+          下载
+        </a>
+      }
+    >
+      {file.kind === "binary" ? (
+        <p className="text-sm text-muted py-6 text-center">
+          二进制文件({formatSize(file.size)}),无法预览 —— 请使用右上角「下载」。
+        </p>
+      ) : (
+        <div data-testid="artifact-content">
+          {isMarkdown ? (
+            <div className="prose-dark max-w-none">
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                {file.content ?? ""}
+              </ReactMarkdown>
+            </div>
+          ) : (
+            <CodeHighlight
+              language={languageForFile(file.path)}
+              code={file.content ?? ""}
+              maxHeight="32rem"
+            />
+          )}
+          {file.truncated && (
+            <p className="text-xs text-amber mt-3">
+              文件过大,预览已截断({formatSize(file.size)})—— 完整内容请下载。
+            </p>
+          )}
+        </div>
+      )}
+    </Card>
   );
 }
