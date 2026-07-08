@@ -77,6 +77,10 @@ def update_taskset(
 
 @router.delete("/{taskset_id}")
 def delete_taskset(taskset_id: str, config: StudioConfig = Depends(get_config)) -> dict:
-    if not tasksets.delete_taskset(config, taskset_id):
+    try:
+        deleted = tasksets.delete_taskset(config, taskset_id)
+    except ValueError as exc:  # built-in sample: read-only
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not deleted:
         raise HTTPException(status_code=404, detail=f"task set {taskset_id!r} not found")
     return {"ok": True}

@@ -69,7 +69,7 @@ export OPENAI_AUTH_MODE=openai_compatible
 | 任务集 | `/tasksets` | single(单 tasks.json)/ split(train/val/test)两种模式;新建支持文件上传 / 手动逐条输入 / AI 自动生成三种方式(内嵌 JSON 格式说明);已有任务集可编辑;保存前 fail-fast 校验(缺 rubric 等直接 400 并指出条目) |
 | 发起评估 | `/evaluate` | 选技能 × 任务集 × 参数(执行后端 claude_code_exec / codex_exec、目标模型/判分模型/workers/timeout)→ 真实 eval job |
 | 发起训练 | `/train` | 额外支持 trainable_files 多选(与 SKILL.md 打包成 bundle 训练)、split 或 single+ratio、num_epochs/gate_metric/learning_rate/eval_test,同样可选执行后端 |
-| 任务管理 | `/jobs` | 全部任务 + 状态/类型筛选 + 取消;详情页四 tab:概览 / 日志(增量轮询)/ 结果(eval 表格或训练时间线 + val 曲线 + skill diff)/ 产物浏览 |
+| 任务管理 | `/jobs` | 全部任务 + 状态/类型筛选 + 取消;详情页四 tab:概览 / 日志(增量轮询)/ 结果(eval 表格或训练时间线 + val 曲线 + skill diff)/ 产物浏览(md 渲染、代码高亮、逐文件下载,与技能库文件预览一致) |
 
 执行后端按技能来源自动推荐(codex 源技能默认 Codex 执行);`GET /api/environment` 检测 `claude` / `codex` CLI 是否安装,向导里未检测到会红字提醒,提交时后端同样 fail-fast 拒绝。目标模型留空 = 用所选后端的默认模型。
 
@@ -80,6 +80,41 @@ export OPENAI_AUTH_MODE=openai_compatible
 **手动逐条输入。** 新建表单的第二个 tab:行式编辑器(id 自动建议 task_001 风格、行级中文校验:必填缺失/重复 id/非法字符),产出 single 模式任务集;需要预分割 train/val/test 请用文件上传。两个 tab 均内嵌可折叠的 **JSON 格式说明**(字段表 + 完整示例 + 复制按钮),对应 `POST /api/tasksets/items`(JSON body)与 `PUT /api/tasksets/{id}`(全量更新)。
 
 **AI 自动生成。** 第三个 tab:选一个待评估技能 + 执行后端(claude_code_exec / codex_exec,推荐规则与评估向导一致)+ 数量(1-30)+ 可选生成指引,提交为 `taskgen` 作业(底层是 `python3 scripts/generate_tasks.py`:agent 阅读技能后把任务写入 `generated_tasks.json`,经 `load_tasks` 严格校验,失败自动带错误反馈重试一次)。生成结果**不直接落库**——作业详情页审阅任务表后点“导入为新任务集”,条目预填进手动编辑器,确认/修改后再保存。
+
+## 内置样例(Samples)
+
+启动时 Studio 会把仓库里的预置素材物化成可直接使用的样例(`skillopt_studio/samples.py`):样例 skill 复制到 `<studio_root>/samples/skills/<slug>/`,以「内置样例」分组显示在技能库最前;样例任务集写入任务集目录,meta 带 `sample: true`。默认开启,`SKILLOPT_STUDIO_SAMPLES=0` 关闭(关闭后磁盘上残留的样例也不会出现在列表里)。物化每次启动重建,与仓库保持同步。
+
+**样例 skill(9 个)。** SKILL.md 与仓库源文件**字节一致**(评测保真);中文名/描述来自隐藏边车文件 `.studio_sample.json`,它不进文件树、不可通过文件接口访问、也不会被复制进评测工作区。
+
+| id | 来源 | 说明 |
+|---|---|---|
+| `sample--searchqa-gpt5.5` | `ckpt/searchqa/gpt5.5_skill.md` | 论文 checkpoint;可配 `sample-searchqa` 任务集 |
+| `sample--alfworld-gpt5.5` | `ckpt/alfworld/gpt5.5_skill.md` | 论文 checkpoint;无内置任务集 |
+| `sample--docvqa-gpt5.5` | `ckpt/docvqa/gpt5.5_skill.md` | 论文 checkpoint;无内置任务集 |
+| `sample--livemath-gpt5.5` | `ckpt/livemath/gpt5.5_skill.md` | 论文 checkpoint;无内置任务集 |
+| `sample--officeqa-gpt5.5` | `ckpt/officeqa/gpt5.5_skill.md` | 论文 checkpoint;无内置任务集 |
+| `sample--spreadsheetbench-gpt5.5` | `ckpt/spreadsheetbench/gpt5.5_skill.md` | 论文 checkpoint;无内置任务集 |
+| `sample--logtriage` | `data/skilleval_demo/logtriage_skill/` | 多文件弱基线,配 `sample-logtriage`,适合演示训练提升 |
+| `sample--logtriage-v2` | `data/skilleval_demo/logtriage_skill_v2/` | 多文档训练演示(含故意错误的 report-template) |
+| `sample--report` | `data/skilleval_demo/report_skill/initial.md` | 单文件弱基线,配 `sample-report` / `sample-xlsx` |
+
+「无内置任务集」的 5 个 benchmark checkpoint 仍可评测:用第三个 tab 的 **AI 自动生成**为它生成任务集,或上传自带任务集。
+
+**样例任务集(6 套,只读)。**
+
+| id | 模式 | 规模 | 建议搭配 |
+|---|---|---|---|
+| `sample-logtriage` | split | 4/3/3 | `sample--logtriage` 或 `sample--logtriage-v2` |
+| `sample-report` | split | 4/3/3 | `sample--report` |
+| `sample-xlsx` | single | 3 | `sample--report` |
+| `sample-searchqa` | split | 12/6/12 | `sample--searchqa-gpt5.5` |
+| `sample-livemath` | split | 12/6/12 | `sample--livemath-gpt5.5` |
+| `sample-officeqa` | split | 12/6/12 | `sample--officeqa-gpt5.5` |
+
+后三套由本机 benchmark 数据转换而来(各 split 取前 12/6/12 条,rubric 由标准答案生成,宽松匹配 1.0/0.0):`sample-searchqa` 需 `data/searchqa_split`(`python3 scripts/materialize_searchqa.py`),question 内嵌检索上下文;`sample-livemath` 需 `data/livemathematicianbench_split`,单选题、答案为选项字母;`sample-officeqa` 需 `data/officeqa_split` + `data/officeqa_docs_official`(HF gated,需申请访问),question 内嵌 oracle 文档(超 16k 字符截断)。任一源数据不存在时自动跳过该套,其余样例不受影响。
+
+样例任务集**只读**:编辑/删除会被 API 以 400 拒绝;详情页用「另存为我的任务集」创建可编辑副本。快速上手:发起评估 → 技能选 `sample--logtriage` → 任务集选 `sample-logtriage` → 提交,即可看到完整的评测链路与产物。
 
 ## 任务产物在哪
 

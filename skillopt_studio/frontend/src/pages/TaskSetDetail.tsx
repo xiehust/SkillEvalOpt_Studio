@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, ApiError, TaskItem, TaskSetDetail } from "../api";
 import TaskItemsEditor, { emptyItem, validateItems } from "../components/TaskItemsEditor";
-import { Card, ErrorBanner, Mono, PageHeader, Spinner, truncate } from "../components/ui";
+import { Card, ErrorBanner, Mono, PageHeader, SampleTag, Spinner, truncate } from "../components/ui";
 
 const SPLIT_ORDER = ["tasks", "train", "val", "test"];
 
@@ -11,6 +11,7 @@ const OPTIONAL_SPLITS = new Set(["test"]);
 
 export default function TaskSetDetailPage() {
   const { id = "" } = useParams();
+  const navigate = useNavigate();
   const [detail, setDetail] = useState<TaskSetDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -21,6 +22,32 @@ export default function TaskSetDetailPage() {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<string | null>(null);
+  const [copying, setCopying] = useState(false);
+  const [copyError, setCopyError] = useState<string | null>(null);
+
+  const isSample = detail?.info.sample === true;
+
+  const saveCopy = async () => {
+    if (!detail) return;
+    const name = window.prompt("新任务集名称:", `${detail.info.name} 副本`);
+    if (!name || !name.trim()) return;
+    setCopying(true);
+    setCopyError(null);
+    try {
+      // 样例详情默认是预览(每分组截断 20 条),副本必须从全量数据创建
+      const full = await api.tasksetDetail(id, true);
+      const created = await api.createTasksetItems(
+        name.trim(),
+        full.info.mode,
+        full.tasks_by_split,
+      );
+      navigate(`/tasksets/${encodeURIComponent(created.id)}`);
+    } catch (err) {
+      setCopyError(err instanceof ApiError ? err.message : String(err));
+    } finally {
+      setCopying(false);
+    }
+  };
 
   const loadDetail = () => {
     api
@@ -105,16 +132,26 @@ export default function TaskSetDetailPage() {
   return (
     <div>
       <PageHeader
-        title={detail ? detail.info.name : "任务集详情"}
+        title={
+          detail ? (
+            <span className="flex items-center gap-2">
+              {detail.info.name}
+              {isSample && <SampleTag />}
+            </span>
+          ) : (
+            "任务集详情"
+          )
+        }
         sub={
           detail
             ? `模式 ${detail.info.mode} · 共 ${detail.info.task_count} 个任务` +
-              (editing ? "(编辑中)" : "(每分组最多预览 20 条)")
+              (editing ? "(编辑中)" : "(每分组最多预览 20 条)") +
+              (isSample ? " · 内置样例为只读,可另存副本后编辑" : "")
             : undefined
         }
         actions={
           <div className="flex gap-2">
-            {detail && !editing && (
+            {detail && !editing && !isSample && (
               <button
                 className="btn-primary"
                 onClick={enterEdit}
@@ -124,12 +161,27 @@ export default function TaskSetDetailPage() {
                 {loadingEdit ? "加载全量任务…" : "编辑任务集"}
               </button>
             )}
+            {detail && isSample && (
+              <button
+                className="btn-primary"
+                onClick={saveCopy}
+                disabled={copying}
+                data-testid="taskset-save-copy"
+              >
+                {copying ? "复制中…" : "另存为我的任务集"}
+              </button>
+            )}
             <Link to="/tasksets" className="btn-ghost">返回任务集</Link>
           </div>
         }
       />
 
       {error && <ErrorBanner message={error} />}
+      {copyError && (
+        <div className="mb-4" data-testid="taskset-copy-error">
+          <ErrorBanner message={copyError} />
+        </div>
+      )}
       {savedAt && !editing && (
         <div className="mb-4 rounded border border-green/50 bg-green/10 px-3 py-2 text-sm text-green" data-testid="taskset-saved">
           已保存({savedAt})— 编辑将影响后续使用该任务集的评估/训练运行

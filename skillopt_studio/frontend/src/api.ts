@@ -33,6 +33,7 @@ export interface TaskSetInfo {
   counts_by_split: Record<string, number>;
   created_at: string;
   updated_at?: string | null;
+  sample?: boolean;
 }
 
 /** Task objects keep unknown ride-along fields so editor round-trips never drop data. */
@@ -280,6 +281,9 @@ export const api = {
     request<ArtifactEntry>(
       `/api/jobs/${encodeURIComponent(id)}/artifacts?path=${encodeURIComponent(path)}`,
     ),
+  // Plain URL (not a fetch): used as <a href> for the 下载 button — auth rides on the session cookie.
+  jobArtifactRawUrl: (id: string, path: string) =>
+    `/api/jobs/${encodeURIComponent(id)}/artifacts/raw?path=${encodeURIComponent(path)}`,
   dashboard: () => request<DashboardData>("/api/dashboard"),
 };
 

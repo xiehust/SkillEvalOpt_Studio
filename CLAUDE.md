@@ -44,7 +44,7 @@ Three top-level packages, deliberately decoupled:
 - **`skillopt/`** — the research framework (training loop).
 - **`skillopt_sleep/`** — SkillOpt-Sleep, a standalone nightly self-evolution tool for local coding agents. **Zero dependency on `skillopt/`** (the validation gate is vendored). Don't introduce cross-imports.
 - **`skillopt_webui/`** — optional Gradio dashboard.
-- **`skillopt_studio/`** — FastAPI + React localhost console for skilleval evaluation and training (wraps the CLIs as subprocesses; only imports `skillopt` for config parsing and task validation). Frontend lives in `skillopt_studio/frontend/` (Vite+React+TS+Tailwind); tests in `tests/test_studio_core.py` / `tests/test_studio_runners.py` (stub CLIs, no model calls).
+- **`skillopt_studio/`** — FastAPI + React localhost console for skilleval evaluation and training (wraps the CLIs as subprocesses; only imports `skillopt` for config parsing and task validation). Frontend lives in `skillopt_studio/frontend/` (Vite+React+TS+Tailwind); tests in `tests/test_studio_core.py` / `tests/test_studio_runners.py` (stub CLIs, no model calls). Built-in samples (`skillopt_studio/samples.py`) materialize ckpt/ + skilleval_demo skills and read-only sample tasksets at startup; `SKILLOPT_STUDIO_SAMPLES=0` disables (`StudioConfig(samples_enabled=...)` defaults False for tests).
 
 ### The training loop (skillopt/)
 

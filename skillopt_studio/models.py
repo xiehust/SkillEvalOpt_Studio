@@ -43,6 +43,7 @@ class TaskSetInfo(BaseModel):
     counts_by_split: dict[str, int] = Field(default_factory=dict)
     created_at: str
     updated_at: Optional[str] = None  # absent on task sets never edited
+    sample: bool = False  # built-in read-only sample (materialized at startup)
 
 
 class TaskSetItemsCreate(BaseModel):

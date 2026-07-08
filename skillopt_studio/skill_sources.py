@@ -9,6 +9,7 @@ appears a single time.
 from __future__ import annotations
 
 import io
+import json
 import re
 import shutil
 import zipfile
@@ -20,6 +21,12 @@ from skillopt_studio.config import StudioConfig
 from skillopt_studio.models import SkillDetail, SkillFile, SkillInfo
 
 UPLOAD_SOURCE = "uploaded"
+
+# Built-in samples materialized by skillopt_studio.samples.  The sidecar holds
+# display name/description so the sample's SKILL.md stays byte-identical to
+# its repository source; it is hidden from listings and the file API.
+SAMPLE_SOURCE = "sample"
+SAMPLE_SIDECAR = ".studio_sample.json"
 
 MAX_SKILL_FILE_BYTES = 512 * 1024
 
@@ -75,19 +82,33 @@ def _parse_name(skill_md_text: str, fallback: str) -> str:
     return fallback
 
 
+def _read_sidecar(skill_dir: Path) -> dict:
+    sidecar_path = skill_dir / SAMPLE_SIDECAR
+    if not sidecar_path.is_file():
+        return {}
+    try:
+        loaded = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
 def _build_skill_info(source: str, skill_dir: Path) -> SkillInfo:
     skill_md_path = skill_dir / "SKILL.md"
     try:
         skill_md_text = skill_md_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         skill_md_text = ""
-    files = [p for p in skill_dir.rglob("*") if p.is_file()]
+    files = [p for p in skill_dir.rglob("*") if p.is_file() and p.name != SAMPLE_SIDECAR]
+    sidecar = _read_sidecar(skill_dir)
+    name = sidecar.get("name") or _parse_name(skill_md_text, skill_dir.name)
+    description = sidecar.get("description") or _parse_description(skill_md_text)
     return SkillInfo(
         id=f"{source}--{slugify(skill_dir.name)}",
-        name=_parse_name(skill_md_text, skill_dir.name),
+        name=str(name),
         source=source,
         path=str(skill_dir),
-        description=_parse_description(skill_md_text),
+        description=str(description),
         files_count=len(files),
         has_support_files=len(files) > 1,
     )
@@ -106,7 +127,11 @@ def _candidate_dirs(source: str, root: Path) -> list[Path]:
 
 def scan_skills(config: StudioConfig) -> list[SkillInfo]:
     """Discover skills across all configured sources plus studio uploads."""
-    sources: dict[str, Path] = dict(config.skill_sources)
+    sources: dict[str, Path] = {}
+    if config.samples_enabled:
+        # first so a symlink-shared dir dedups in favor of the sample source
+        sources[SAMPLE_SOURCE] = config.samples_skills_dir
+    sources.update(config.skill_sources)
     sources[UPLOAD_SOURCE] = config.skills_dir
 
     skills: list[SkillInfo] = []
@@ -137,7 +162,11 @@ def get_skill_detail(config: StudioConfig, skill_id: str) -> SkillDetail | None:
         return None
     skill_dir = Path(skill.path)
     skill_md = (skill_dir / "SKILL.md").read_text(encoding="utf-8", errors="replace")
-    file_tree = sorted(str(p.relative_to(skill_dir)) for p in skill_dir.rglob("*") if p.is_file())
+    file_tree = sorted(
+        str(p.relative_to(skill_dir))
+        for p in skill_dir.rglob("*")
+        if p.is_file() and p.name != SAMPLE_SIDECAR
+    )
     return SkillDetail(**skill.model_dump(), skill_md=skill_md, file_tree=file_tree)
 
 
@@ -156,6 +185,8 @@ def skill_file_path(config: StudioConfig, skill_id: str, rel_path: str) -> Path 
     candidate = (root / rel).resolve()
     if candidate != root and root not in candidate.parents:
         raise ValueError(f"file path {rel!r} escapes the skill directory")
+    if candidate.name == SAMPLE_SIDECAR:
+        return None  # studio-internal metadata, never served
     if not candidate.is_file():
         return None
     return candidate

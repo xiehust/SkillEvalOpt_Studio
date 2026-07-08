@@ -5,7 +5,7 @@ import {
   Card, EmptyState, ErrorBanner, Mono, PageHeader, SourceTag, Spinner, truncate,
 } from "../components/ui";
 
-const SOURCE_ORDER = ["claude", "codex", "kiro", "agents", "uploaded"];
+const SOURCE_ORDER = ["sample", "claude", "codex", "kiro", "agents", "uploaded"];
 
 export default function Skills() {
   const [skills, setSkills] = useState<SkillInfo[] | null>(null);

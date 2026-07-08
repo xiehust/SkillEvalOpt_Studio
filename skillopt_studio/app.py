@@ -1,6 +1,7 @@
 """FastAPI application factory for SkillOpt Studio."""
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -12,12 +13,23 @@ from skillopt_studio.jobs import JobManager
 
 FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
 
+logger = logging.getLogger(__name__)
+
 
 def create_app(config: StudioConfig | None = None) -> FastAPI:
     config = config or StudioConfig.from_env()
     app = FastAPI(title="SkillOpt Studio", version="0.1.0")
     app.state.config = config
     app.state.jobs = JobManager(config)
+
+    from skillopt_studio import samples
+
+    try:
+        samples.materialize_samples(config)
+    except Exception:
+        # samples are a convenience — a broken materialization must not take
+        # the whole studio down
+        logger.warning("sample materialization failed", exc_info=True)
 
     @app.get("/api/health")
     def health() -> dict:

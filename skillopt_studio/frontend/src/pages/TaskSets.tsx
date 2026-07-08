@@ -4,7 +4,7 @@ import { api, ApiError, TaskItem, TaskSetInfo } from "../api";
 import GenerateTaskSetForm from "../components/GenerateTaskSetForm";
 import TaskItemsEditor, { emptyItem, validateItems } from "../components/TaskItemsEditor";
 import TaskSetFormatDoc from "../components/TaskSetFormatDoc";
-import { Card, EmptyState, ErrorBanner, Mono, PageHeader, Spinner, formatTime } from "../components/ui";
+import { Card, EmptyState, ErrorBanner, Mono, PageHeader, SampleTag, Spinner, formatTime } from "../components/ui";
 
 interface ImportState {
   importItems?: TaskItem[];
@@ -105,9 +105,12 @@ export default function TaskSets() {
                 {tasksets.map((taskset) => (
                   <tr key={taskset.id} className="hover:bg-panel2/40" data-taskset-id={taskset.id}>
                     <td className="td">
-                      <Link to={`/tasksets/${encodeURIComponent(taskset.id)}`} className="text-cyan hover:underline">
-                        {taskset.name}
-                      </Link>
+                      <span className="flex items-center gap-2">
+                        <Link to={`/tasksets/${encodeURIComponent(taskset.id)}`} className="text-cyan hover:underline">
+                          {taskset.name}
+                        </Link>
+                        {taskset.sample && <SampleTag />}
+                      </span>
                       <Mono className="block text-[11px] text-muted/70">{taskset.id}</Mono>
                     </td>
                     <td className="td">
@@ -126,9 +129,11 @@ export default function TaskSets() {
                       {taskset.updated_at ? formatTime(taskset.updated_at) : "—"}
                     </td>
                     <td className="td text-right">
-                      <button className="btn-danger !px-2 !py-1 text-xs" onClick={() => onDelete(taskset.id)}>
-                        删除
-                      </button>
+                      {!taskset.sample && (
+                        <button className="btn-danger !px-2 !py-1 text-xs" onClick={() => onDelete(taskset.id)}>
+                          删除
+                        </button>
+                      )}
                     </td>
                   </tr>
                 ))}

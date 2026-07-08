@@ -7,6 +7,9 @@ can relocate the data root without touching code):
 - ``SKILLOPT_STUDIO_ROOT`` — where uploads, tasksets and job records live.
 - ``SKILLOPT_STUDIO_SKILL_SOURCES`` — comma-separated ``name=path`` pairs that
   replace the default four scan sources entirely.
+- ``SKILLOPT_STUDIO_SAMPLES`` — built-in sample skills/tasksets; on by default
+  for real servers (``from_env``), off for directly constructed configs so
+  tests are never polluted.  ``0``/``false``/``off``/``no`` disables.
 """
 from __future__ import annotations
 
@@ -52,6 +55,7 @@ class StudioConfig:
     skill_sources: dict[str, Path] = field(default_factory=_default_skill_sources)
     max_concurrent_jobs: int = 1
     max_skill_zip_bytes: int = MAX_SKILL_ZIP_BYTES
+    samples_enabled: bool = False
 
     def __post_init__(self) -> None:
         self.studio_root = Path(self.studio_root).expanduser()
@@ -69,6 +73,10 @@ class StudioConfig:
     def jobs_dir(self) -> Path:
         return self.studio_root / "jobs"
 
+    @property
+    def samples_skills_dir(self) -> Path:
+        return self.studio_root / "samples" / "skills"
+
     @classmethod
     def from_env(cls, **overrides) -> "StudioConfig":
         """Build a config from environment variables, then apply overrides."""
@@ -79,5 +87,7 @@ class StudioConfig:
         sources_raw = os.environ.get("SKILLOPT_STUDIO_SKILL_SOURCES")
         if sources_raw:
             kwargs["skill_sources"] = _parse_sources_env(sources_raw)
+        samples_raw = os.environ.get("SKILLOPT_STUDIO_SAMPLES", "")
+        kwargs["samples_enabled"] = samples_raw.strip().lower() not in {"0", "false", "off", "no"}
         kwargs.update(overrides)
         return cls(**kwargs)

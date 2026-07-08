@@ -47,8 +47,21 @@ def _expected_files(mode: str, files: dict[str, bytes]) -> dict[str, bytes]:
     raise ValueError(f"mode must be 'single' or 'split', got {mode!r}")
 
 
-def save_taskset(config: StudioConfig, name: str, files: dict[str, bytes], mode: str) -> TaskSetInfo:
-    """Persist and validate a task set; raises ValueError on any invalid input."""
+def save_taskset(
+    config: StudioConfig,
+    name: str,
+    files: dict[str, bytes],
+    mode: str,
+    *,
+    display_name: str | None = None,
+    sample: bool = False,
+) -> TaskSetInfo:
+    """Persist and validate a task set; raises ValueError on any invalid input.
+
+    ``display_name`` decouples the shown name from the id-deriving ``name``
+    (used by sample materialization to pin ids like ``sample-searchqa`` while
+    showing a Chinese title).  ``sample`` marks the set read-only for users.
+    """
     slug = slugify(name)
     on_disk = _expected_files(mode, files)
     target_dir = config.tasksets_dir / slug
@@ -69,11 +82,12 @@ def save_taskset(config: StudioConfig, name: str, files: dict[str, bytes], mode:
 
     info = TaskSetInfo(
         id=slug,
-        name=name,
+        name=display_name or name,
         mode=mode,  # type: ignore[arg-type]
         task_count=sum(counts_by_split.values()),
         counts_by_split=counts_by_split,
         created_at=_now_iso(),
+        sample=sample,
     )
     (target_dir / _META_FILE).write_text(
         json.dumps(info.model_dump(), ensure_ascii=False, indent=2), encoding="utf-8"
@@ -86,7 +100,13 @@ def _serialize_tasks(items: list[dict]) -> bytes:
 
 
 def create_taskset_from_items(
-    config: StudioConfig, name: str, mode: str, tasks_by_split: dict[str, list[dict]]
+    config: StudioConfig,
+    name: str,
+    mode: str,
+    tasks_by_split: dict[str, list[dict]],
+    *,
+    display_name: str | None = None,
+    sample: bool = False,
 ) -> TaskSetInfo:
     """Create a task set from in-memory items (manual editor / AI import path).
 
@@ -95,7 +115,7 @@ def create_taskset_from_items(
     :func:`save_taskset`'s — a bad item leaves nothing on disk.
     """
     files = {split: _serialize_tasks(items) for split, items in tasks_by_split.items()}
-    return save_taskset(config, name, files, mode)
+    return save_taskset(config, name, files, mode, display_name=display_name, sample=sample)
 
 
 def update_taskset(
@@ -117,6 +137,7 @@ def update_taskset(
     info = get_taskset(config, taskset_id)
     if info is None:
         raise KeyError(taskset_id)
+    _reject_sample_write(info)
     directory = _taskset_dir(config, taskset_id)
     serialized = {split: _serialize_tasks(items) for split, items in tasks_by_split.items()}
     on_disk = _expected_files(info.mode, serialized)
@@ -156,7 +177,16 @@ def update_taskset(
     return updated
 
 
+def _reject_sample_write(info: TaskSetInfo) -> None:
+    if info.sample:
+        raise ValueError(
+            f"任务集 {info.id!r} 是内置样例，只读；请在详情页「另存为我的任务集」后编辑副本"
+        )
+
+
 def list_tasksets(config: StudioConfig) -> list[TaskSetInfo]:
+    """All task sets; sample entries are hidden while samples are disabled
+    (a stale materialization on disk must not resurface after the switch-off)."""
     tasksets: list[TaskSetInfo] = []
     root = config.tasksets_dir
     if not root.is_dir():
@@ -166,9 +196,12 @@ def list_tasksets(config: StudioConfig) -> list[TaskSetInfo]:
         if not meta_path.is_file():
             continue
         try:
-            tasksets.append(TaskSetInfo(**json.loads(meta_path.read_text(encoding="utf-8"))))
+            info = TaskSetInfo(**json.loads(meta_path.read_text(encoding="utf-8")))
         except (ValueError, TypeError):
             continue  # a corrupt meta.json hides that entry, never the whole list
+        if info.sample and not config.samples_enabled:
+            continue
+        tasksets.append(info)
     return tasksets
 
 
@@ -179,14 +212,21 @@ def _taskset_dir(config: StudioConfig, taskset_id: str) -> Path:
     return config.tasksets_dir / slug
 
 
-def get_taskset(config: StudioConfig, taskset_id: str) -> TaskSetInfo | None:
+def get_taskset(
+    config: StudioConfig, taskset_id: str, include_samples: bool = False
+) -> TaskSetInfo | None:
+    """One task set's meta; sample entries are hidden while samples are disabled
+    unless ``include_samples`` (the materializer needs to see stale ones)."""
     try:
         meta_path = _taskset_dir(config, taskset_id) / _META_FILE
     except ValueError:
         return None
     if not meta_path.is_file():
         return None
-    return TaskSetInfo(**json.loads(meta_path.read_text(encoding="utf-8")))
+    info = TaskSetInfo(**json.loads(meta_path.read_text(encoding="utf-8")))
+    if info.sample and not config.samples_enabled and not include_samples:
+        return None
+    return info
 
 
 def get_taskset_tasks(config: StudioConfig, taskset_id: str, preview: int = 0) -> dict[str, list[dict]]:
@@ -217,11 +257,10 @@ def taskset_file_paths(config: StudioConfig, taskset_id: str) -> dict[str, Path]
 
 
 def delete_taskset(config: StudioConfig, taskset_id: str) -> bool:
-    try:
-        directory = _taskset_dir(config, taskset_id)
-    except ValueError:
+    """Delete a user task set.  Sample task sets raise ValueError (read-only)."""
+    info = get_taskset(config, taskset_id)
+    if info is None:
         return False
-    if not (directory / _META_FILE).is_file():
-        return False
-    shutil.rmtree(directory)
+    _reject_sample_write(info)
+    shutil.rmtree(_taskset_dir(config, taskset_id))
     return True

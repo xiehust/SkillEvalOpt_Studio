@@ -105,6 +105,7 @@ export function ErrorBanner({ message, retryHint }: { message: string; retryHint
 }
 
 export const SOURCE_COLORS: Record<string, string> = {
+  sample: "text-cyan border-cyan/40 bg-cyan/10",
   claude: "text-green border-green/40 bg-green/10",
   codex: "text-cyan border-cyan/40 bg-cyan/10",
   kiro: "text-amber border-amber/40 bg-amber/10",
@@ -112,11 +113,24 @@ export const SOURCE_COLORS: Record<string, string> = {
   uploaded: "text-red border-red/40 bg-red/10",
 };
 
+const SOURCE_LABELS: Record<string, string> = {
+  sample: "内置样例",
+};
+
 export function SourceTag({ source }: { source: string }) {
   const color = SOURCE_COLORS[source] ?? "text-muted border-line bg-panel2";
   return (
     <span className={`inline-block px-2 py-0.5 rounded border text-xs font-mono ${color}`}>
-      {source}
+      {SOURCE_LABELS[source] ?? source}
+    </span>
+  );
+}
+
+/** 内置样例任务集徽标(与 SourceTag 视觉一致)。 */
+export function SampleTag() {
+  return (
+    <span className="inline-block px-2 py-0.5 rounded border text-xs font-mono text-cyan border-cyan/40 bg-cyan/10">
+      内置样例
     </span>
   );
 }
@@ -167,6 +181,12 @@ export function BackendSelect({
       <p className="text-xs text-muted mt-1.5">按技能来源自动推荐:codex 源技能默认用 Codex 执行。</p>
     </div>
   );
+}
+
+export function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 export function truncate(value: string, max = 80): string {
