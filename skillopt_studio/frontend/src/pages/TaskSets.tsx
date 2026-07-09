@@ -173,7 +173,7 @@ function CreateTaskSetForm({
 
   return (
     <Card title="新建任务集" className="mb-6">
-      <div className="space-y-4 max-w-3xl">
+      <div className="space-y-4">
         <div className="flex gap-2" data-testid="taskset-tabs">
           {CREATE_TABS.map((entry) => (
             <button

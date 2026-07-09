@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api, ApiError, BackendStatus, SkillInfo } from "../api";
 import { BackendSelect, ErrorBanner, Mono, SourceTag, Spinner } from "./ui";
@@ -14,6 +14,7 @@ export default function GenerateTaskSetForm() {
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const [skillId, setSkillId] = useState("");
+  const [skillQuery, setSkillQuery] = useState("");
   const [targetBackend, setTargetBackend] = useState("claude_code_exec");
   const [model, setModel] = useState("global.anthropic.claude-opus-4-8");
   const [count, setCount] = useState(5);
@@ -41,6 +42,14 @@ export default function GenerateTaskSetForm() {
     if (skill) applyBackend(skill.source === "codex" ? "codex_exec" : "claude_code_exec");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [skillId, skills]);
+
+  const filteredSkills = useMemo(() => {
+    const q = skillQuery.trim().toLowerCase();
+    if (!q) return skills ?? [];
+    return (skills ?? []).filter(
+      (skill) => skill.name.toLowerCase().includes(q) || skill.id.toLowerCase().includes(q),
+    );
+  }, [skills, skillQuery]);
 
   const backendAvailable =
     backends === null || backends.find((s) => s.backend === targetBackend)?.available !== false;
@@ -98,32 +107,44 @@ export default function GenerateTaskSetForm() {
             还没有技能——先到<Link to="/skills" className="text-cyan mx-1">技能库</Link>上传一个。
           </div>
         ) : (
-          <div className="grid gap-2 md:grid-cols-2 max-h-56 overflow-y-auto pr-1">
-            {skills.map((skill) => (
-              <label
-                key={skill.id}
-                data-skill-option={skill.id}
-                className={`flex items-start gap-2.5 p-2.5 rounded border cursor-pointer transition-colors ${
-                  skillId === skill.id ? "border-green bg-green/5" : "border-line bg-panel2 hover:border-muted"
-                }`}
-              >
-                <input
-                  type="radio"
-                  name="gen-skill"
-                  className="mt-1 accent-[#A6DB4C]"
-                  checked={skillId === skill.id}
-                  onChange={() => setSkillId(skill.id)}
-                />
-                <span className="min-w-0">
-                  <span className="flex items-center gap-2 text-sm font-medium">
-                    <span className="truncate">{skill.name}</span>
-                    <SourceTag source={skill.source} />
+          <>
+            <input
+              className="input max-w-sm mb-2"
+              placeholder="搜索技能…"
+              value={skillQuery}
+              onChange={(event) => setSkillQuery(event.target.value)}
+              data-testid="gen-skill-search"
+            />
+            <div className="grid gap-2 md:grid-cols-2 max-h-56 overflow-y-auto pr-1">
+              {filteredSkills.map((skill) => (
+                <label
+                  key={skill.id}
+                  data-skill-option={skill.id}
+                  className={`flex items-start gap-2.5 p-2.5 rounded border cursor-pointer transition-colors ${
+                    skillId === skill.id ? "border-green bg-green/5" : "border-line bg-panel2 hover:border-muted"
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="gen-skill"
+                    className="mt-1 accent-[#A6DB4C]"
+                    checked={skillId === skill.id}
+                    onChange={() => setSkillId(skill.id)}
+                  />
+                  <span className="min-w-0">
+                    <span className="flex items-center gap-2 text-sm font-medium">
+                      <span className="truncate">{skill.name}</span>
+                      <SourceTag source={skill.source} />
+                    </span>
+                    <Mono className="block text-[11px] text-muted/70 truncate mt-0.5">{skill.id}</Mono>
                   </span>
-                  <Mono className="block text-[11px] text-muted/70 truncate mt-0.5">{skill.id}</Mono>
-                </span>
-              </label>
-            ))}
-          </div>
+                </label>
+              ))}
+              {filteredSkills.length === 0 && (
+                <div className="text-sm text-muted col-span-full py-4">没有匹配的技能。</div>
+              )}
+            </div>
+          </>
         )}
       </div>
 
