@@ -144,7 +144,7 @@ export default function Train() {
       {(skills === null || tasksets === null) && !loadError && <Spinner />}
 
       {skills !== null && tasksets !== null && (
-        <form onSubmit={onSubmit} noValidate className="space-y-6 max-w-4xl" data-testid="train-form">
+        <form onSubmit={onSubmit} noValidate className="space-y-6" data-testid="train-form">
           <Card title="① 选择技能">
             <input
               className="input max-w-sm mb-3"
