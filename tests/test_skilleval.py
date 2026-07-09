@@ -195,6 +195,7 @@ class TestJudge:
             "hard": 1,
             "soft": 0.9,
             "judge_reason": "meets rubric",
+            "judge_usage": {"input": 0, "output": 0},
         }
 
     def test_prompt_contains_all_sections(self, monkeypatch) -> None:

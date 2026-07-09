@@ -64,14 +64,31 @@ export OPENAI_AUTH_MODE=openai_compatible
 
 | 页面 | 路径 | 作用 |
 |---|---|---|
-| 总览 | `/` | 状态统计、运行中任务卡(进度短语)、近 10 任务表、快捷发起按钮 |
+| 总览 | `/` | 资源计数(技能/任务集/累计任务)+ 状态统计、技能健康卡、训练收益卡、运行中任务卡(进度短语 + 已运行时长 + 直接取消)、最近失败卡(日志尾部)、Token 消耗统计、近 10 任务表、快捷发起按钮 |
 | 技能库 | `/skills` | 四源扫描分组(claude/codex/kiro/agents 色标)+ 上传 zip(uploaded 组);详情页渲染 SKILL.md 与文件树 |
 | 任务集 | `/tasksets` | single(单 tasks.json)/ split(train/val/test)两种模式;新建支持文件上传 / 手动逐条输入 / AI 自动生成三种方式(内嵌 JSON 格式说明);已有任务集可编辑;保存前 fail-fast 校验(缺 rubric 等直接 400 并指出条目) |
 | 发起评估 | `/evaluate` | 选技能 × 任务集 × 参数(执行后端 claude_code_exec / codex_exec、目标模型/判分模型/workers/timeout)→ 真实 eval job |
 | 发起训练 | `/train` | 额外支持 trainable_files 多选(与 SKILL.md 打包成 bundle 训练)、split 或 single+ratio、num_epochs/gate_metric/learning_rate/eval_test,同样可选执行后端 |
-| 任务管理 | `/jobs` | 全部任务 + 状态/类型筛选 + 取消;详情页四 tab:概览 / 日志(增量轮询)/ 结果(eval 表格或训练时间线 + val 曲线 + skill diff)/ 产物浏览(md 渲染、代码高亮、逐文件下载,与技能库文件预览一致) |
+| 任务管理 | `/jobs` | 全部任务 + 状态/类型筛选 + 分页 + 取消 + 每行 Token 消耗;详情页四 tab:概览 / 日志(增量轮询)/ 结果(eval 表格或训练时间线 + val 曲线 + skill diff)/ 产物浏览(md 渲染、代码高亮、逐文件下载,与技能库文件预览一致) |
 
 执行后端按技能来源自动推荐(codex 源技能默认 Codex 执行);`GET /api/environment` 检测 `claude` / `codex` CLI 是否安装,向导里未检测到会红字提醒,提交时后端同样 fail-fast 拒绝。目标模型留空 = 用所选后端的默认模型。
+
+### 总览页板块
+
+- **资源总览**:技能数 / 任务集数 / 累计任务数,点击跳对应页面。
+- **技能健康**:按技能聚合最近 50 个成功评估任务,显示最近一次通过率(≥80% 绿 / ≥50% 黄 / 其余红)、次数与迷你趋势线;点击预填该技能进入发起评估。
+- **训练收益**:最近 5 个完成训练的 baseline → best 分数与增量(百分点)、gate 接受/拒绝数,点击进任务详情。
+- **运行中**:进度短语 + 已运行时长,卡片上可直接取消(无需进任务管理页)。
+- **最近失败**:最近 5 个失败任务 + 日志尾部摘要,点击直达详情排查。
+- **Token 消耗**:已完成任务的今日/累计消耗,按 input / cache write / cache read / output 四项分列。
+
+### Token 消耗口径
+
+- **评估(eval)**:执行 agent(claude_code_exec 走 CLI `--output-format json` 的 usage,含缓存分解)+ LLM 判分(judge)两部分之和,按任务行记录在 `results.json` 的 `usage` / `judge_usage` 字段。
+- **训练(train)**:优化器侧 chat 调用(`summary.json` 的 `token_summary._total`,prompt→input、completion→output)+ 目标 agent rollout 消耗(递归扫描 `out/` 下各 step/eval 目录落盘的 exec raw 提取)两部分之和。
+- **任务生成(taskgen)**:生成 agent 的消耗,从落盘的 exec raw 提取。
+- **codex_exec**:CLI 只报总数,无四项分解(total 有值,四项为 0)。
+- **旧任务**(2026-07-09 之前的 claude text 模式产物)没有 usage 记录,列表显示 "—",不计入统计。
 
 ## 任务集:编辑 / 手动录入 / AI 自动生成
 

@@ -227,20 +227,30 @@ def judge(item: dict, response: str, artifacts_listing: str = "") -> dict:
 
     user_prompt = _build_judge_user_prompt(item, response, artifacts_listing)
     last_error = "no response"
+    judge_usage = {"input": 0, "output": 0}
+    judge_calls = 0
     for attempt in range(2):
         prompt = user_prompt if attempt == 0 else user_prompt + _RETRY_SUFFIX
         try:
-            reply, _usage = chat_optimizer(system=JUDGE_SYSTEM_PROMPT, user=prompt, stage="skilleval_judge")
+            reply, usage = chat_optimizer(system=JUDGE_SYSTEM_PROMPT, user=prompt, stage="skilleval_judge")
         except Exception as exc:  # noqa: BLE001 — judge must never crash the batch
             last_error = f"judge call failed: {type(exc).__name__}: {exc}"
             continue
+        judge_calls += 1
+        if isinstance(usage, dict):
+            judge_usage["input"] += int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+            judge_usage["output"] += int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
         verdict = _extract_verdict(reply)
         if verdict is not None:
             result["hard"] = int(verdict["pass"])
             result["soft"] = verdict["score"]
             result["judge_reason"] = verdict["reason"]
+            if judge_calls:
+                result["judge_usage"] = judge_usage
             return result
         last_error = f"unparseable judge reply: {reply[:200]!r}"
 
     result["judge_error"] = last_error
+    if judge_calls:
+        result["judge_usage"] = judge_usage
     return result

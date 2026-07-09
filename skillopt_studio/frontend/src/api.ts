@@ -53,6 +53,14 @@ export interface TaskSetDetail {
 
 export type JobStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 
+export interface TokenUsage {
+  input: number;
+  cache_write: number;
+  cache_read: number;
+  output: number;
+  total: number;
+}
+
 export interface JobInfo {
   id: string;
   type: string;
@@ -64,6 +72,7 @@ export interface JobInfo {
   out_root: string | null;
   exit_code: number | null;
   error: string | null;
+  tokens?: TokenUsage | null;
 }
 
 export interface DashboardJobRow extends JobInfo {
@@ -71,10 +80,42 @@ export interface DashboardJobRow extends JobInfo {
   pass_rate?: number | null;
 }
 
+export interface SkillHealthEntry {
+  skill_id: string;
+  last_pass_rate: number;
+  last_job_id: string;
+  last_run_at: string;
+  runs: number;
+  trend: number[];
+}
+
+export interface TrainGainEntry {
+  job_id: string;
+  skill_id: string | null;
+  baseline: number | null;
+  best: number | null;
+  accepts: number | null;
+  rejects: number | null;
+  finished_at: string | null;
+}
+
+export interface FailureEntry {
+  job_id: string;
+  type: string;
+  skill_id: string | null;
+  finished_at: string | null;
+  log_tail: string;
+}
+
 export interface DashboardData {
   running: DashboardJobRow[];
   recent: DashboardJobRow[];
   totals: { by_status: Record<string, number> };
+  resources: { skills: number; tasksets: number; jobs: number };
+  skill_health: SkillHealthEntry[];
+  train_gains: TrainGainEntry[];
+  failures: FailureEntry[];
+  token_stats: { today: TokenUsage; total: TokenUsage };
 }
 
 export interface LogChunk {

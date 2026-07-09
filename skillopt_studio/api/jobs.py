@@ -80,16 +80,27 @@ def create_job(
 
 
 @router.get("", response_model=list[JobInfo])
-def list_jobs(jobs: JobManager = Depends(get_job_manager)) -> list[JobInfo]:
-    return jobs.list_jobs()
+def list_jobs(
+    jobs: JobManager = Depends(get_job_manager),
+    config: StudioConfig = Depends(get_config),
+) -> list[JobInfo]:
+    # copy: tokens is a display aggregate; the manager's instances stay pristine
+    return [
+        job.model_copy(update={"tokens": artifacts.job_tokens(config, job)})
+        for job in jobs.list_jobs()
+    ]
 
 
 @router.get("/{job_id}", response_model=JobInfo)
-def get_job(job_id: str, jobs: JobManager = Depends(get_job_manager)) -> JobInfo:
+def get_job(
+    job_id: str,
+    jobs: JobManager = Depends(get_job_manager),
+    config: StudioConfig = Depends(get_config),
+) -> JobInfo:
     job = jobs.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"job {job_id!r} not found")
-    return job
+    return job.model_copy(update={"tokens": artifacts.job_tokens(config, job)})
 
 
 @router.post("/{job_id}/cancel", response_model=JobInfo)

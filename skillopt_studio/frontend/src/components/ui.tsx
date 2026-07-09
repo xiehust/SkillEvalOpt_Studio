@@ -1,6 +1,6 @@
 // Shared design-system primitives for the studio console.
 import { ReactNode, useState } from "react";
-import { BackendStatus, JobStatus } from "../api";
+import { BackendStatus, JobStatus, TokenUsage } from "../api";
 
 export function PageHeader({ title, sub, actions }: { title: ReactNode; sub?: string; actions?: ReactNode }) {
   return (
@@ -245,6 +245,38 @@ export function Pagination({
         </button>
       </div>
     </div>
+  );
+}
+
+export function formatTokens(n: number): string {
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`;
+  return `${(n / 1_000_000).toFixed(1)}M`;
+}
+
+const TOKEN_PARTS: { key: keyof TokenUsage; label: string; full: string }[] = [
+  { key: "input", label: "in", full: "input" },
+  { key: "cache_write", label: "cw", full: "cache write" },
+  { key: "cache_read", label: "cr", full: "cache read" },
+  { key: "output", label: "out", full: "output" },
+];
+
+/** 任务级 token 消耗四项分列(input / cache write / cache read / output)。 */
+export function TokenCell({ tokens }: { tokens?: TokenUsage | null }) {
+  if (!tokens) return <span className="text-muted">—</span>;
+  const title = TOKEN_PARTS
+    .map((part) => `${part.full} ${tokens[part.key].toLocaleString()}`)
+    .concat(`total ${tokens.total.toLocaleString()}`)
+    .join(" · ");
+  return (
+    <span className="inline-flex items-center gap-2 whitespace-nowrap" title={title}>
+      {TOKEN_PARTS.map((part) => (
+        <span key={part.key} className="inline-flex items-baseline gap-0.5">
+          <span className="text-[10px] text-muted">{part.label}</span>
+          <Mono className="text-xs">{formatTokens(tokens[part.key])}</Mono>
+        </span>
+      ))}
+    </span>
   );
 }
 

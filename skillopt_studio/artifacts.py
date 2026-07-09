@@ -9,6 +9,7 @@ from __future__ import annotations
 import difflib
 import json
 import re
+from collections import OrderedDict
 from pathlib import Path
 
 from skillopt_studio.config import StudioConfig
@@ -21,7 +22,14 @@ _STEP_FIELDS = (
     "current_score", "best_score", "best_step", "skill_len", "wall_time_s",
 )
 
-_ROW_FIELDS = ("id", "task_type", "hard", "soft", "judge_reason", "duration_s", "error", "judge_error")
+_ROW_FIELDS = (
+    "id", "task_type", "hard", "soft", "judge_reason", "duration_s", "error", "judge_error",
+    "usage", "judge_usage",
+)
+
+_USAGE_KEYS = ("input", "cache_write", "cache_read", "output", "total")
+
+_FINISHED_STATUSES = {"succeeded", "failed", "cancelled"}
 
 
 def job_out_root(config: StudioConfig, job: JobInfo) -> Path:
@@ -60,6 +68,31 @@ def _mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
+def _sum_usage(rows: list[dict]) -> dict | None:
+    """Sum exec ``usage`` + judge ``judge_usage`` over result rows.
+
+    judge_usage carries only input/output; they are folded into the same
+    four-way breakdown. Returns None when no row has any usage data.
+    """
+    totals = dict.fromkeys(_USAGE_KEYS, 0)
+    found = False
+    for row in rows:
+        usage = row.get("usage")
+        if isinstance(usage, dict):
+            found = True
+            for key in _USAGE_KEYS:
+                totals[key] += int(usage.get(key) or 0)
+        judge_usage = row.get("judge_usage")
+        if isinstance(judge_usage, dict):
+            found = True
+            input_t = int(judge_usage.get("input") or 0)
+            output_t = int(judge_usage.get("output") or 0)
+            totals["input"] += input_t
+            totals["output"] += output_t
+            totals["total"] += input_t + output_t
+    return totals if found else None
+
+
 def eval_results(config: StudioConfig, job: JobInfo) -> dict | None:
     """Summary + per-task rows from out/results.json (None until it exists)."""
     out = job_out_root(config, job)
@@ -73,6 +106,7 @@ def eval_results(config: StudioConfig, job: JobInfo) -> dict | None:
             "pass_rate": round(_mean([float(r.get("hard") or 0) for r in rows]), 4),
             "soft_mean": round(_mean([float(r.get("soft") or 0.0) for r in rows]), 4),
             "duration_s": round(sum(float(r.get("duration_s") or 0.0) for r in rows), 1),
+            "tokens": _sum_usage(rows),
         },
         "rows": rows,
     }
@@ -138,6 +172,98 @@ def train_summary(config: StudioConfig, job: JobInfo) -> dict | None:
         "token_totals": token_totals,
         "finished": bool(summary),
     }
+
+
+# Finished jobs' artifacts are immutable, so token aggregation is cached by
+# job id (bounded; oldest evicted). Running jobs are never cached.
+_TOKENS_CACHE: OrderedDict[str, dict | None] = OrderedDict()
+_TOKENS_CACHE_MAX = 256
+
+
+def _sum_exec_raw_usage(root: Path) -> dict | None:
+    """Sum exec usage over every persisted raw transcript under *root*.
+
+    Train jobs scatter rollouts across step/eval subdirectories, so this walks
+    recursively; taskgen has a single raw at the top level. Returns None when
+    no raw carries usage (e.g. pre-json-mode artifacts).
+    """
+    try:
+        from skillopt.model.codex_harness import extract_exec_usage
+    except ImportError:
+        return None
+    totals = dict.fromkeys(_USAGE_KEYS, 0)
+    found = False
+    for raw_name in ("claude_raw.txt", "codex_raw.txt"):
+        for path in sorted(root.rglob(raw_name)):
+            try:
+                usage = extract_exec_usage(path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+            if usage:
+                found = True
+                for key in _USAGE_KEYS:
+                    totals[key] += int(usage.get(key) or 0)
+    return totals if found else None
+
+
+def _job_tokens_uncached(config: StudioConfig, job: JobInfo) -> dict | None:
+    out = job_out_root(config, job)
+    if job.type == "eval":
+        results = _read_json(out / "results.json")
+        if not isinstance(results, list):
+            return None
+        return _sum_usage([r for r in results if isinstance(r, dict)])
+    if job.type == "taskgen":
+        # taskgen has no per-task usage; extract from the persisted exec raws.
+        return _sum_exec_raw_usage(out)
+    if job.type == "train":
+        # optimizer-side chat totals from summary.json …
+        summary = _read_json(out / "summary.json")
+        total = (summary.get("token_summary") or {}).get("_total") if isinstance(summary, dict) else None
+        optimizer = None
+        if total:
+            optimizer = {
+                "input": int(total.get("prompt_tokens") or 0),
+                "cache_write": 0,
+                "cache_read": 0,
+                "output": int(total.get("completion_tokens") or 0),
+                "total": int(total.get("total_tokens") or 0),
+            }
+        # … plus target exec rollouts persisted under steps/ and eval dirs
+        rollout = _sum_exec_raw_usage(out)
+        if optimizer is None and rollout is None:
+            return None
+        combined = dict.fromkeys(_USAGE_KEYS, 0)
+        for part in (optimizer, rollout):
+            if part:
+                for key in _USAGE_KEYS:
+                    combined[key] += part[key]
+        return combined
+    return None
+
+
+def job_tokens(config: StudioConfig, job: JobInfo) -> dict | None:
+    """Job-level token totals (four-way breakdown + total), None when unknown.
+
+    eval — sums exec usage + judge usage over results.json rows.
+    taskgen — extracts from persisted exec raw transcripts.
+    train — summary.json token_summary._total (optimizer-side chat) plus the
+    target exec rollout raws persisted under steps/ and eval directories.
+    Running/unknown-type jobs return None; presentation must never fail the API.
+    """
+    if job.status not in _FINISHED_STATUSES:
+        return None
+    if job.id in _TOKENS_CACHE:
+        _TOKENS_CACHE.move_to_end(job.id)
+        return _TOKENS_CACHE[job.id]
+    try:
+        tokens = _job_tokens_uncached(config, job)
+    except Exception:  # noqa: BLE001 — display feature; jobs API must stay up
+        tokens = None
+    _TOKENS_CACHE[job.id] = tokens
+    if len(_TOKENS_CACHE) > _TOKENS_CACHE_MAX:
+        _TOKENS_CACHE.popitem(last=False)
+    return tokens
 
 
 def skill_diff(config: StudioConfig, job: JobInfo) -> str:

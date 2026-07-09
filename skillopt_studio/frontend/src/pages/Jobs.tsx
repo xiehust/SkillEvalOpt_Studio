@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { api, JobInfo, JobStatus, usePolling } from "../api";
 import {
   Card, EmptyState, ErrorBanner, Mono, PageHeader, Pagination, Spinner, StatusPill,
-  formatTime, jobDuration, usePagination,
+  TokenCell, formatTime, jobDuration, usePagination,
 } from "../components/ui";
 
 const STATUS_FILTERS: { value: JobStatus | "all"; label: string }[] = [
@@ -106,6 +106,7 @@ export default function Jobs() {
                   <th className="th">技能 / 任务集</th>
                   <th className="th">状态</th>
                   <th className="th">耗时</th>
+                  <th className="th">Token 消耗</th>
                   <th className="th">创建时间</th>
                   <th className="th"></th>
                 </tr>
@@ -129,6 +130,7 @@ export default function Jobs() {
                     </td>
                     <td className="td"><StatusPill status={job.status} /></td>
                     <td className="td"><Mono>{jobDuration(job)}</Mono></td>
+                    <td className="td"><TokenCell tokens={job.tokens} /></td>
                     <td className="td text-muted text-xs">{formatTime(job.created_at)}</td>
                     <td className="td text-right">
                       {(job.status === "running" || job.status === "queued") && (

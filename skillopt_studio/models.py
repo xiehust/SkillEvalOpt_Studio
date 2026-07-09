@@ -74,6 +74,9 @@ class JobInfo(BaseModel):
     out_root: Optional[str] = None
     exit_code: Optional[int] = None
     error: Optional[str] = None
+    # token totals filled by the API layer from artifacts.job_tokens; never
+    # persisted into job.json (display aggregate, not job state).
+    tokens: Optional[dict] = None
 
 
 class JobCreateRequest(BaseModel):

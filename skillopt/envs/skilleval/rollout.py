@@ -16,7 +16,12 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 from skillopt.model.backend_config import get_target_backend
-from skillopt.model.codex_harness import prepare_workspace, run_claude_code_exec, run_codex_exec
+from skillopt.model.codex_harness import (
+    extract_exec_usage,
+    prepare_workspace,
+    run_claude_code_exec,
+    run_codex_exec,
+)
 
 GUIDE_PROMPT = (
     "Read `.agents/skills/skillopt-target/SKILL.md` first and follow it while "
@@ -97,14 +102,14 @@ def _rollout_one(
         # extend the read-only default tool set accordingly. codex_exec gets
         # the same freedom through its workspace-write sandbox default.
         if get_target_backend() == "codex_exec":
-            response, _raw = run_codex_exec(
+            response, raw = run_codex_exec(
                 work_dir=work_dir,
                 prompt=GUIDE_PROMPT,
                 model=model,
                 timeout=timeout,
             )
         else:
-            response, _raw = run_claude_code_exec(
+            response, raw = run_claude_code_exec(
                 work_dir=work_dir,
                 prompt=GUIDE_PROMPT,
                 model=model,
@@ -113,6 +118,9 @@ def _rollout_one(
                 allow_file_edits=True,
             )
         result["response"] = response
+        usage = extract_exec_usage(raw)
+        if usage is not None:
+            result["usage"] = usage
     except Exception as exc:  # noqa: BLE001 — isolate task failures
         result["error"] = f"{type(exc).__name__}: {exc}"
         result["error_traceback"] = traceback.format_exc(limit=5)

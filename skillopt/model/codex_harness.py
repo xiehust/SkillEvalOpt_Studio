@@ -649,6 +649,76 @@ def _run_claude_code_sdk_exec(
     return _run_async(asyncio.wait_for(_query(), timeout=timeout))
 
 
+def _parse_claude_cli_json(stdout: str) -> dict | None:
+    """Parse the claude CLI ``--output-format json`` result object from stdout.
+
+    Tries the whole stdout first, then line-by-line (warnings may precede the
+    JSON). Returns the result dict, or None when stdout is not CLI JSON —
+    callers fall back to the legacy text semantics.
+    """
+    candidates = [stdout.strip()]
+    candidates.extend(ln.strip() for ln in stdout.splitlines() if ln.strip().startswith("{"))
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("type") == "result":
+            return data
+    return None
+
+
+_CODEX_TOKENS_USED_RE = re.compile(r"^tokens used$", re.MULTILINE)
+
+
+def extract_exec_usage(raw: str) -> dict | None:
+    """Normalize token usage out of a persisted exec *raw* transcript.
+
+    Handles three sources, accumulating across attempt/turn segments:
+    - claude CLI/SDK JSON: ``"input_tokens" / "cache_creation_input_tokens" /
+      "cache_read_input_tokens" / "output_tokens"`` (per segment, the last
+      complete group wins — SDK raws repeat usage in nested messages).
+    - codex CLI: a ``tokens used`` line followed by a comma-grouped total.
+    Returns ``{"input", "cache_write", "cache_read", "output", "total"}`` or
+    None when no usage is present. Never raises.
+    """
+    if not (raw or "").strip():
+        return None
+    try:
+        totals = {"input": 0, "cache_write": 0, "cache_read": 0, "output": 0, "total": 0}
+        found = False
+        segments = re.split(r"===== .*? =====|\n===== TURN BREAK =====\n", raw)
+        group_re = re.compile(
+            r'"input_tokens"\s*:\s*(\d+).{0,400}?'
+            r'"cache_creation_input_tokens"\s*:\s*(\d+).{0,400}?'
+            r'"cache_read_input_tokens"\s*:\s*(\d+).{0,400}?'
+            r'"output_tokens"\s*:\s*(\d+)',
+            re.DOTALL,
+        )
+        for segment in segments:
+            groups = group_re.findall(segment)
+            if groups:
+                input_t, cache_write, cache_read, output_t = (int(v) for v in groups[-1])
+                totals["input"] += input_t
+                totals["cache_write"] += cache_write
+                totals["cache_read"] += cache_read
+                totals["output"] += output_t
+                totals["total"] += input_t + cache_write + cache_read + output_t
+                found = True
+                continue
+            match = _CODEX_TOKENS_USED_RE.search(segment)
+            if match:
+                after = segment[match.end():].lstrip("\n")
+                first_line = after.splitlines()[0].strip() if after.splitlines() else ""
+                digits = first_line.replace(",", "")
+                if digits.isdigit():
+                    totals["total"] += int(digits)
+                    found = True
+        return totals if found else None
+    except Exception:  # noqa: BLE001 — usage extraction must never break a rollout
+        return None
+
+
 def _run_claude_code_cli_exec(
     *,
     work_dir: str,
@@ -667,7 +737,7 @@ def _run_claude_code_cli_exec(
         str(config["path"]),
         "-p",
         "--output-format",
-        "text",
+        "json",
         "--permission-mode",
         permission_mode or "bypassPermissions",
         "--add-dir",
@@ -716,6 +786,15 @@ def _run_claude_code_cli_exec(
     raw = stdout
     if stderr:
         raw = f"{raw}\n[stderr]\n{stderr}" if raw else stderr
+    parsed = _parse_claude_cli_json(stdout)
+    if parsed is not None:
+        # API errors surface as is_error with the message in `result`; treat as
+        # an empty response so the caller's empty-response retry loop engages,
+        # matching the legacy text-mode behaviour (empty stdout on error).
+        if parsed.get("is_error"):
+            return "", raw
+        response = str(parsed.get("result") or "").strip()
+        return response, raw
     response = stdout.strip()
     if proc.returncode != 0 and not response:
         return "", raw
