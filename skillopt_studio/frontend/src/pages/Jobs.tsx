@@ -2,8 +2,8 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { api, JobInfo, JobStatus, usePolling } from "../api";
 import {
-  Card, EmptyState, ErrorBanner, Mono, PageHeader, Spinner, StatusPill,
-  formatTime, jobDuration,
+  Card, EmptyState, ErrorBanner, Mono, PageHeader, Pagination, Spinner, StatusPill,
+  formatTime, jobDuration, usePagination,
 } from "../components/ui";
 
 const STATUS_FILTERS: { value: JobStatus | "all"; label: string }[] = [
@@ -46,6 +46,7 @@ export default function Jobs() {
       (statusFilter === "all" || job.status === statusFilter) &&
       (typeFilter === "all" || job.type === typeFilter),
   );
+  const { page, setPage, pageSize, setPageSize, pageCount, pageItems, total } = usePagination(filtered);
 
   return (
     <div>
@@ -110,7 +111,7 @@ export default function Jobs() {
                 </tr>
               </thead>
               <tbody>
-                {filtered.map((job) => (
+                {pageItems.map((job) => (
                   <tr key={job.id} className="hover:bg-panel2/40" data-job-row={job.id}>
                     <td className="td">
                       <Link to={`/jobs/${job.id}`} className="text-cyan hover:underline">
@@ -146,6 +147,12 @@ export default function Jobs() {
             </table>
           </div>
         </Card>
+      )}
+      {filtered.length > 0 && (
+        <Pagination
+          page={page} pageCount={pageCount} pageSize={pageSize} total={total}
+          onPage={setPage} onPageSize={setPageSize}
+        />
       )}
     </div>
   );

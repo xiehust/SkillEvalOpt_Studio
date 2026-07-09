@@ -1,5 +1,5 @@
 // Shared design-system primitives for the studio console.
-import { ReactNode } from "react";
+import { ReactNode, useState } from "react";
 import { BackendStatus, JobStatus } from "../api";
 
 export function PageHeader({ title, sub, actions }: { title: ReactNode; sub?: string; actions?: ReactNode }) {
@@ -179,6 +179,71 @@ export function BackendSelect({
         </p>
       )}
       <p className="text-xs text-muted mt-1.5">按技能来源自动推荐:codex 源技能默认用 Codex 执行。</p>
+    </div>
+  );
+}
+
+export const PAGE_SIZES = [20, 40, 80, 120];
+
+/** 列表分页:page 越界时自动钳制,改每页条数时回到第 1 页。 */
+export function usePagination<T>(items: T[], defaultSize = PAGE_SIZES[0]) {
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSizeRaw] = useState(defaultSize);
+  const pageCount = Math.max(1, Math.ceil(items.length / pageSize));
+  const safePage = Math.min(page, pageCount);
+  const pageItems = items.slice((safePage - 1) * pageSize, safePage * pageSize);
+  const setPageSize = (size: number) => {
+    setPageSizeRaw(size);
+    setPage(1);
+  };
+  return { page: safePage, setPage, pageSize, setPageSize, pageCount, pageItems, total: items.length };
+}
+
+export function Pagination({
+  page, pageCount, pageSize, total, onPage, onPageSize,
+}: {
+  page: number;
+  pageCount: number;
+  pageSize: number;
+  total: number;
+  onPage: (page: number) => void;
+  onPageSize: (size: number) => void;
+}) {
+  if (total <= PAGE_SIZES[0]) return null;
+  return (
+    <div className="flex items-center justify-between gap-3 mt-4" data-testid="pagination">
+      <span className="text-xs text-muted">共 {total} 条</span>
+      <div className="flex items-center gap-2">
+        <select
+          className="input !w-auto !py-1 text-xs"
+          value={pageSize}
+          data-testid="page-size"
+          onChange={(event) => onPageSize(Number(event.target.value))}
+        >
+          {PAGE_SIZES.map((size) => (
+            <option key={size} value={size}>{size} 条/页</option>
+          ))}
+        </select>
+        <button
+          type="button"
+          className="btn-ghost !px-2.5 !py-1 text-xs disabled:opacity-40 disabled:cursor-not-allowed"
+          disabled={page <= 1}
+          data-testid="page-prev"
+          onClick={() => onPage(page - 1)}
+        >
+          上一页
+        </button>
+        <span className="text-xs text-muted whitespace-nowrap">第 {page} / {pageCount} 页</span>
+        <button
+          type="button"
+          className="btn-ghost !px-2.5 !py-1 text-xs disabled:opacity-40 disabled:cursor-not-allowed"
+          disabled={page >= pageCount}
+          data-testid="page-next"
+          onClick={() => onPage(page + 1)}
+        >
+          下一页
+        </button>
+      </div>
     </div>
   );
 }

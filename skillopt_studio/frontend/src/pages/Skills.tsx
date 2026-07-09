@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, ApiError, SkillInfo } from "../api";
 import {
-  Card, EmptyState, ErrorBanner, Mono, PageHeader, SourceTag, Spinner, truncate,
+  Card, EmptyState, ErrorBanner, Mono, PageHeader, Pagination, SourceTag, Spinner,
+  truncate, usePagination,
 } from "../components/ui";
 
 const SOURCE_ORDER = ["sample", "claude", "codex", "kiro", "agents", "uploaded"];
@@ -61,11 +62,18 @@ export default function Skills() {
       skill.description.toLowerCase().includes(q)
     );
   });
+  // 分页作用于按来源排序后的扁平列表,再对当前页条目分组,保证翻页顺序与展示顺序一致。
+  const ordered = [...filtered].sort((a, b) => {
+    const ai = SOURCE_ORDER.indexOf(a.source);
+    const bi = SOURCE_ORDER.indexOf(b.source);
+    return (ai === -1 ? SOURCE_ORDER.length : ai) - (bi === -1 ? SOURCE_ORDER.length : bi);
+  });
+  const { page, setPage, pageSize, setPageSize, pageCount, pageItems, total } = usePagination(ordered);
   const grouped = SOURCE_ORDER.map((source) => ({
     source,
-    items: filtered.filter((skill) => skill.source === source),
+    items: pageItems.filter((skill) => skill.source === source),
   })).filter((group) => group.items.length > 0);
-  const otherItems = filtered.filter((skill) => !SOURCE_ORDER.includes(skill.source));
+  const otherItems = pageItems.filter((skill) => !SOURCE_ORDER.includes(skill.source));
   if (otherItems.length > 0) grouped.push({ source: "other", items: otherItems });
 
   return (
@@ -172,6 +180,12 @@ export default function Skills() {
           </Card>
         ))}
       </div>
+      {filtered.length > 0 && (
+        <Pagination
+          page={page} pageCount={pageCount} pageSize={pageSize} total={total}
+          onPage={setPage} onPageSize={setPageSize}
+        />
+      )}
     </div>
   );
 }
