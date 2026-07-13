@@ -1,10 +1,16 @@
-"""Skill discovery (four local agent sources + studio uploads) and zip upload.
+"""Skill discovery (local agent sources + studio uploads) and zip upload.
 
 A "skill" is any directory that directly contains a ``SKILL.md``.  Scan roots
 are the configured sources plus ``studio_root/skills`` (source ``uploaded``).
 Symlinked directories are resolved and included once — the first source that
 reaches a physical directory wins, so a skill symlinked into two agent homes
 appears a single time.
+
+A source root holding an ``installed_plugins.json`` is a Claude Code plugins
+root (default ``~/.claude/plugins``): instead of listing its subdirectories,
+the manifest's installed plugins are read and each plugin's ``installPath`` is
+searched for skills.  This deliberately mirrors what Claude Code itself loads —
+uninstalled marketplace clones and stale cached versions stay hidden.
 """
 from __future__ import annotations
 
@@ -29,6 +35,11 @@ SAMPLE_SOURCE = "sample"
 SAMPLE_SIDECAR = ".studio_sample.json"
 
 MAX_SKILL_FILE_BYTES = 512 * 1024
+
+# Marks a source root as a Claude Code plugins root (~/.claude/plugins).
+PLUGINS_MANIFEST = "installed_plugins.json"
+PLUGIN_SKIP_DIRS = {"node_modules", "__pycache__"}
+PLUGIN_SCAN_DEPTH = 4
 
 # \w covers CJK and other unicode word chars — Chinese names are first-class here
 _SLUG_RE = re.compile(r"[^\w.-]+", re.UNICODE)
@@ -93,7 +104,7 @@ def _read_sidecar(skill_dir: Path) -> dict:
     return loaded if isinstance(loaded, dict) else {}
 
 
-def _build_skill_info(source: str, skill_dir: Path) -> SkillInfo:
+def _build_skill_info(source: str, skill_dir: Path, slug_base: str | None = None) -> SkillInfo:
     skill_md_path = skill_dir / "SKILL.md"
     try:
         skill_md_text = skill_md_path.read_text(encoding="utf-8", errors="replace")
@@ -104,7 +115,7 @@ def _build_skill_info(source: str, skill_dir: Path) -> SkillInfo:
     name = sidecar.get("name") or _parse_name(skill_md_text, skill_dir.name)
     description = sidecar.get("description") or _parse_description(skill_md_text)
     return SkillInfo(
-        id=f"{source}--{slugify(skill_dir.name)}",
+        id=f"{source}--{slugify(slug_base or skill_dir.name)}",
         name=str(name),
         source=source,
         path=str(skill_dir),
@@ -114,14 +125,82 @@ def _build_skill_info(source: str, skill_dir: Path) -> SkillInfo:
     )
 
 
-def _candidate_dirs(source: str, root: Path) -> list[Path]:
+def _topmost_skill_dirs(root: Path, depth: int = PLUGIN_SCAN_DEPTH) -> list[Path]:
+    """Topmost dirs under root holding a SKILL.md; found skills are not descended into."""
+    if (root / "SKILL.md").is_file():
+        return [root]
+    if depth <= 0:
+        return []
+    found: list[Path] = []
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if entry.is_dir() and not entry.name.startswith(".") and entry.name not in PLUGIN_SKIP_DIRS:
+            found.extend(_topmost_skill_dirs(entry, depth - 1))
+    return found
+
+
+def _plugin_candidates(root: Path) -> list[tuple[Path, str | None]]:
+    """(skill_dir, slug_base) for every skill of every installed Claude Code plugin.
+
+    Reads ``installed_plugins.json`` (``{"plugins": {"name@marketplace": [{"scope",
+    "installPath", ...}]}}``) rather than walking cache/marketplaces directories, so
+    only what Claude Code actually has installed shows up.  User-scope installs are
+    preferred when a plugin is installed at several scopes/versions (id dedup in
+    scan_skills drops the rest).
+    """
+    try:
+        manifest = json.loads((root / PLUGINS_MANIFEST).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    plugins = manifest.get("plugins") if isinstance(manifest, dict) else None
+    if not isinstance(plugins, dict):
+        return []
+    candidates: list[tuple[Path, str | None]] = []
+    seen_installs: set[Path] = set()
+    for key in sorted(plugins):
+        installs = plugins[key]
+        if isinstance(installs, dict):  # tolerate a single-entry (non-list) shape
+            installs = [installs]
+        if not isinstance(installs, list):
+            continue
+        plugin_name = key.partition("@")[0] or key
+        entries = sorted(
+            (e for e in installs if isinstance(e, dict)),
+            key=lambda e: (e.get("scope") != "user", str(e.get("installPath", ""))),
+        )
+        for entry in entries:
+            install_path = entry.get("installPath")
+            if not isinstance(install_path, str) or not install_path:
+                continue
+            install_dir = Path(install_path).expanduser()
+            if install_dir in seen_installs or not install_dir.is_dir():
+                continue
+            seen_installs.add(install_dir)
+            for skill_dir in _topmost_skill_dirs(install_dir):
+                candidates.append((skill_dir, f"{plugin_name}-{skill_dir.name}"))
+    return candidates
+
+
+def _candidate_dirs(source: str, root: Path) -> list[tuple[Path, str | None]]:
+    """(dir, id slug base) pairs to probe for SKILL.md under one source root.
+
+    A None slug base means "use the resolved directory name" (plain sources);
+    plugin candidates carry an explicit ``<plugin>-<skill>`` base instead.
+    """
+    if (root / PLUGINS_MANIFEST).is_file():
+        return _plugin_candidates(root)
     if not root.is_dir():
         return []
-    candidates = [entry for entry in sorted(root.iterdir()) if entry.is_dir()]
+    candidates: list[tuple[Path, str | None]] = [
+        (entry, None) for entry in sorted(root.iterdir()) if entry.is_dir()
+    ]
     if source == "codex":
         system_layer = root / ".system"
         if system_layer.is_dir():
-            candidates.extend(entry for entry in sorted(system_layer.iterdir()) if entry.is_dir())
+            candidates.extend((entry, None) for entry in sorted(system_layer.iterdir()) if entry.is_dir())
     return candidates
 
 
@@ -136,16 +215,21 @@ def scan_skills(config: StudioConfig) -> list[SkillInfo]:
 
     skills: list[SkillInfo] = []
     seen_resolved: set[Path] = set()
+    seen_ids: set[str] = set()
     for source, root in sources.items():
-        for entry in _candidate_dirs(source, root.expanduser()):
+        for entry, slug_base in _candidate_dirs(source, root.expanduser()):
             try:
                 resolved = entry.resolve()
             except OSError:
                 continue
             if resolved in seen_resolved or not (resolved / "SKILL.md").is_file():
                 continue
+            info = _build_skill_info(source, resolved, slug_base)
+            if info.id in seen_ids:  # same plugin at another scope/version, or a name clash
+                continue
             seen_resolved.add(resolved)
-            skills.append(_build_skill_info(source, resolved))
+            seen_ids.add(info.id)
+            skills.append(info)
     return skills
 
 

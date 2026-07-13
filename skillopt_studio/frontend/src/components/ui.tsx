@@ -107,6 +107,7 @@ export function ErrorBanner({ message, retryHint }: { message: string; retryHint
 export const SOURCE_COLORS: Record<string, string> = {
   sample: "text-cyan border-cyan/40 bg-cyan/10",
   claude: "text-green border-green/40 bg-green/10",
+  "claude-plugins": "text-green border-green/40 bg-green/5",
   codex: "text-cyan border-cyan/40 bg-cyan/10",
   kiro: "text-amber border-amber/40 bg-amber/10",
   agents: "text-purple border-purple/40 bg-purple/10",
@@ -115,6 +116,7 @@ export const SOURCE_COLORS: Record<string, string> = {
 
 const SOURCE_LABELS: Record<string, string> = {
   sample: "内置样例",
+  "claude-plugins": "claude 插件",
 };
 
 export function SourceTag({ source }: { source: string }) {

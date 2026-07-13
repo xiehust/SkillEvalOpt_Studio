@@ -6,7 +6,7 @@ import {
   truncate, usePagination,
 } from "../components/ui";
 
-const SOURCE_ORDER = ["sample", "claude", "codex", "kiro", "agents", "uploaded"];
+const SOURCE_ORDER = ["sample", "claude", "claude-plugins", "codex", "kiro", "agents", "uploaded"];
 
 export default function Skills() {
   const [skills, setSkills] = useState<SkillInfo[] | null>(null);

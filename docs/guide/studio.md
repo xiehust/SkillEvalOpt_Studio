@@ -9,8 +9,8 @@ SkillOpt Studio 是一个 **localhost 可视化操作台**(FastAPI 后端 + Reac
 ```text
 skillopt_studio/
 ├── app.py            # FastAPI 工厂:/api 路由 + 托管 frontend/dist(SPA 回退)
-├── config.py         # StudioConfig:studio_root(默认 outputs/studio/)、四技能源
-├── skill_sources.py  # 四源扫描(claude/codex/kiro/agents)+ zip 上传(zip-slip 守卫)
+├── config.py         # StudioConfig:studio_root(默认 outputs/studio/)、技能源
+├── skill_sources.py  # 技能扫描(claude/codex/kiro/agents + Claude Code 插件)+ zip 上传(zip-slip 守卫)
 ├── tasksets.py       # 任务集存储,校验复用 skillopt.envs.skilleval.dataloader
 ├── jobs.py           # JobManager:FIFO 队列 + subprocess(start_new_session/killpg)
 ├── runners.py        # eval argv / train config.yaml 生成(load_config 解析后覆写)
@@ -65,13 +65,15 @@ export OPENAI_AUTH_MODE=openai_compatible
 | 页面 | 路径 | 作用 |
 |---|---|---|
 | 总览 | `/` | 资源计数(技能/任务集/累计任务)+ 状态统计、技能健康卡、训练收益卡、运行中任务卡(进度短语 + 已运行时长 + 直接取消)、最近失败卡(日志尾部)、Token 消耗统计、近 10 任务表、快捷发起按钮 |
-| 技能库 | `/skills` | 四源扫描分组(claude/codex/kiro/agents 色标)+ 上传 zip(uploaded 组);详情页渲染 SKILL.md 与文件树 |
+| 技能库 | `/skills` | 多源扫描分组(claude/claude-plugins/codex/kiro/agents 色标)+ 上传 zip(uploaded 组);详情页渲染 SKILL.md 与文件树 |
 | 任务集 | `/tasksets` | single(单 tasks.json)/ split(train/val/test)两种模式;新建支持文件上传 / 手动逐条输入 / AI 自动生成三种方式(内嵌 JSON 格式说明);已有任务集可编辑;保存前 fail-fast 校验(缺 rubric 等直接 400 并指出条目) |
 | 发起评估 | `/evaluate` | 选技能 × 任务集 × 参数(执行后端 claude_code_exec / codex_exec、目标模型/判分模型/workers/timeout)→ 真实 eval job |
 | 发起训练 | `/train` | 额外支持 trainable_files 多选(与 SKILL.md 打包成 bundle 训练)、split 或 single+ratio、num_epochs/gate_metric/learning_rate/eval_test,同样可选执行后端 |
 | 任务管理 | `/jobs` | 全部任务 + 状态/类型筛选 + 分页 + 取消 + 每行 Token 消耗;详情页四 tab:概览 / 日志(增量轮询)/ 结果(eval 表格或训练时间线 + val 曲线 + skill diff)/ 产物浏览(md 渲染、代码高亮、逐文件下载,与技能库文件预览一致) |
 
 执行后端按技能来源自动推荐(codex 源技能默认 Codex 执行);`GET /api/environment` 检测 `claude` / `codex` CLI 是否安装,向导里未检测到会红字提醒,提交时后端同样 fail-fast 拒绝。目标模型留空 = 用所选后端的默认模型。
+
+技能源中 `claude-plugins` 指向 `~/.claude/plugins`:不做目录盲扫,而是读 Claude Code 的安装清单 `installed_plugins.json`,只列出**已安装插件**的技能(`cache/<marketplace>/<plugin>/<version>/` 与 `marketplaces/<marketplace>/` 两种安装布局都覆盖);未安装的市场克隆和旧版本缓存不会出现,同一插件多 scope/多版本时 user scope 优先。`SKILLOPT_STUDIO_SKILL_SOURCES`(`name=path` 逗号分隔)仍可整体替换扫描源。
 
 ### 总览页板块
 

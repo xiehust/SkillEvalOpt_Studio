@@ -26,6 +26,9 @@ def _default_skill_sources() -> dict[str, Path]:
     home = Path.home()
     return {
         "claude": home / ".claude" / "skills",
+        # Claude Code plugin installs; discovered via installed_plugins.json,
+        # not a directory walk (see skill_sources._plugin_candidates).
+        "claude-plugins": home / ".claude" / "plugins",
         "codex": home / ".codex" / "skills",
         "kiro": home / ".kiro" / "skills",
         "agents": home / ".agents" / "skills",

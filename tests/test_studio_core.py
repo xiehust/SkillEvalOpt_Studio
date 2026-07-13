@@ -167,6 +167,96 @@ class TestScanSkills:
         assert skill.has_support_files is True
 
 
+def make_plugins_root(tmp_path: Path, plugins: dict) -> Path:
+    """A fake ~/.claude/plugins with an installed_plugins.json manifest (shape not enforced)."""
+    root = tmp_path / "claude-plugins"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "installed_plugins.json").write_text(
+        json.dumps({"version": 2, "plugins": plugins}), encoding="utf-8"
+    )
+    return root
+
+
+class TestScanClaudePlugins:
+    """A source root holding installed_plugins.json is a Claude Code plugins root."""
+
+    def config_for(self, tmp_path: Path, root: Path) -> StudioConfig:
+        return StudioConfig(
+            studio_root=tmp_path / "studio", skill_sources={"claude-plugins": root}
+        )
+
+    def test_installed_plugin_skills_discovered(self, tmp_path):
+        root = make_plugins_root(tmp_path, {})
+        install = root / "cache" / "mkt" / "doc-skills" / "1.0.0"
+        make_skill(install / "skills", "docx", "---\nname: docx\ndescription: Word docs\n---\n# d\n")
+        make_skill(install / "skills", "pdf")
+        make_plugins_root(tmp_path, {
+            "doc-skills@mkt": [{"scope": "user", "installPath": str(install)}],
+        })
+
+        skills = scan_skills(self.config_for(tmp_path, root))
+        assert sorted(s.id for s in skills) == [
+            "claude-plugins--doc-skills-docx",
+            "claude-plugins--doc-skills-pdf",
+        ]
+        assert all(s.source == "claude-plugins" for s in skills)
+        docx = next(s for s in skills if s.name == "docx")
+        assert docx.description == "Word docs"
+
+    def test_marketplace_clone_install_path(self, tmp_path):
+        # newer Claude Code layouts install path-source plugins straight into the
+        # marketplace clone, with skills nested more than one level deep
+        root = make_plugins_root(tmp_path, {})
+        install = root / "marketplaces" / "anthropic-agent-skills"
+        make_skill(install / "skills" / "document-skills", "docx")
+        make_plugins_root(tmp_path, {
+            "document-skills@anthropic-agent-skills": [
+                {"scope": "user", "installPath": str(install)}
+            ],
+        })
+
+        (skill,) = scan_skills(self.config_for(tmp_path, root))
+        assert skill.id == "claude-plugins--document-skills-docx"
+
+    def test_skill_dirs_not_descended_and_hidden_skipped(self, tmp_path):
+        root = make_plugins_root(tmp_path, {})
+        install = root / "cache" / "m" / "p" / "1.0.0"
+        outer = make_skill(install / "skills", "outer")
+        make_skill(outer / "examples", "inner")  # inside a skill — not a separate skill
+        make_skill(install / ".git", "ghost")  # hidden dirs are never scanned
+        make_plugins_root(tmp_path, {"p@m": [{"scope": "user", "installPath": str(install)}]})
+
+        skills = scan_skills(self.config_for(tmp_path, root))
+        assert [s.id for s in skills] == ["claude-plugins--p-outer"]
+
+    def test_user_scope_wins_over_other_scopes(self, tmp_path):
+        root = make_plugins_root(tmp_path, {})
+        proj = make_skill(root / "cache" / "m" / "wiki" / "0.12.0" / "skills", "wiki-manager")
+        user = make_skill(root / "cache" / "m" / "wiki" / "0.16.0" / "skills", "wiki-manager")
+        make_plugins_root(tmp_path, {
+            "wiki@m": [
+                {"scope": "project", "installPath": str(proj.parents[1])},
+                {"scope": "user", "installPath": str(user.parents[1])},
+            ],
+        })
+
+        (skill,) = scan_skills(self.config_for(tmp_path, root))
+        assert skill.path == str(user)
+
+    def test_bad_manifest_and_missing_install_paths_ignored(self, tmp_path):
+        root = make_plugins_root(tmp_path, {})
+        gone = root / "cache" / "m" / "gone" / "1.0.0"
+        make_plugins_root(tmp_path, {
+            "gone@m": [{"scope": "user", "installPath": str(gone)}],
+            "weird@m": [{"scope": "user"}, "not-a-dict"],
+            "also-weird@m": "not-a-list",
+        })
+        assert scan_skills(self.config_for(tmp_path, root)) == []
+
+        (root / "installed_plugins.json").write_text("{corrupt", encoding="utf-8")
+        assert scan_skills(self.config_for(tmp_path, root)) == []
+
+
 class TestUploadSkillZip:
     def test_valid_zip_root_level(self, studio_config):
         data = make_zip({"SKILL.md": "---\ndescription: uploaded skill\n---\n# Up\n"})
