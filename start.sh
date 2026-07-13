@@ -13,6 +13,8 @@
 # Model-gateway env vars must be in this shell (or in .env, which is sourced).
 set -euo pipefail
 cd "$(dirname "$0")"
+# use project venv when present
+[[ -d .venv/bin ]] && export PATH="$PWD/.venv/bin:$PATH"
 
 MODE="dev"
 [[ "${1:-}" == "--prod" ]] && MODE="prod"
