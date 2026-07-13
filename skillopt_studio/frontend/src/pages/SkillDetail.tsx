@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Link, useParams } from "react-router-dom";
 import ReactMarkdown, { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -9,6 +10,7 @@ import {
 import { Card, ErrorBanner, Mono, PageHeader, SourceTag, Spinner, formatSize } from "../components/ui";
 
 export default function SkillDetailPage() {
+  const { t } = useTranslation("skills");
   const { id = "" } = useParams();
   const [detail, setDetail] = useState<SkillDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -73,7 +75,7 @@ export default function SkillDetailPage() {
   return (
     <div>
       <PageHeader
-        title={detail?.name ?? "技能详情"}
+        title={detail?.name ?? t("detail.titleFallback")}
         sub={detail ? detail.path : undefined}
         actions={
           <>
@@ -82,10 +84,18 @@ export default function SkillDetailPage() {
                 to={`/evaluate?skill=${encodeURIComponent(detail.id)}`}
                 className="btn-primary"
               >
-                评估此技能
+                {t("detail.evaluate")}
               </Link>
             )}
-            <Link to="/skills" className="btn-ghost">返回技能库</Link>
+            {detail && (
+              <Link
+                to={`/train?skill=${encodeURIComponent(detail.id)}`}
+                className="btn-ghost"
+              >
+                {t("detail.train")}
+              </Link>
+            )}
+            <Link to="/skills" className="btn-ghost">{t("detail.back")}</Link>
           </>
         }
       />
@@ -106,7 +116,7 @@ export default function SkillDetailPage() {
               <span className="flex items-center gap-2">
                 {activeFile && (
                   <button className="btn-ghost" onClick={() => setActiveFile(null)}>
-                    返回 SKILL.md
+                    {t("detail.backToSkillMd")}
                   </button>
                 )}
                 <a
@@ -115,7 +125,7 @@ export default function SkillDetailPage() {
                   download
                   data-testid="download-file"
                 >
-                  下载
+                  {t("common:actions.download")}
                 </a>
               </span>
             }
@@ -130,7 +140,7 @@ export default function SkillDetailPage() {
               <Spinner />
             ) : file.kind === "binary" ? (
               <p className="text-sm text-muted py-6 text-center">
-                二进制文件({formatSize(file.size)}),无法预览 —— 请使用右上角「下载」。
+                {t("detail.binary", { size: formatSize(file.size) })}
               </p>
             ) : (
               <div data-testid="skill-file">
@@ -147,22 +157,22 @@ export default function SkillDetailPage() {
                 )}
                 {file.truncated && (
                   <p className="text-xs text-amber mt-3">
-                    文件过大,预览已截断({formatSize(file.size)})—— 完整内容请下载。
+                    {t("detail.truncated", { size: formatSize(file.size) })}
                   </p>
                 )}
               </div>
             )}
           </Card>
-          <Card title={`文件树(${detail.file_tree.length})`}>
+          <Card title={t("detail.fileTree", { n: detail.file_tree.length })}>
             <ul className="space-y-1" data-testid="file-tree">
               {detail.file_tree.map((path) => (
                 <li key={path} className="text-xs">
                   <button
                     className="text-left hover:underline"
                     onClick={() => openFile(path)}
-                    title="点击预览"
+                    title={t("detail.previewTitle")}
                   >
-                    <Mono className={path === currentPath ? "text-green" : "text-text/80"}>
+                    <Mono className={path === currentPath ? "text-amber" : "text-text/80"}>
                       {path}
                     </Mono>
                   </button>

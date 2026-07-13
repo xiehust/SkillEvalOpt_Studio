@@ -1,0 +1,113 @@
+{
+  "title": "Jobs",
+  "subtitle": "All eval / train jobs; running jobs auto-refresh every 2s.",
+  "autoRetrying": "Retrying automatically",
+  "filters": {
+    "allStatus": "All statuses",
+    "allType": "All types"
+  },
+  "empty": {
+    "noJobs": "No jobs yet",
+    "noJobsHint": "Once you start an eval or training run, jobs will appear here.",
+    "noMatch": "No jobs match the filters",
+    "noMatchHint": "Adjust the filters above."
+  },
+  "table": {
+    "id": "Job ID",
+    "type": "Type",
+    "skillTaskset": "Skill / Taskset",
+    "status": "Status",
+    "duration": "Duration",
+    "tokens": "Token usage",
+    "created": "Created"
+  },
+  "detail": {
+    "subtitle": "{{type}} · created {{time}}",
+    "backToJobs": "Back to jobs"
+  },
+  "tabs": {
+    "overview": "Overview",
+    "log": "Log",
+    "results": "Results",
+    "artifacts": "Artifacts"
+  },
+  "overview": {
+    "failed": "Job failed",
+    "unknownError": "Unknown error",
+    "status": "Status",
+    "duration": "Duration",
+    "exitCode": "Exit code",
+    "params": "Parameters",
+    "startEnd": "Start / End",
+    "cancelJob": "Cancel job"
+  },
+  "log": {
+    "title": "Log",
+    "titleLive": "Log (live polling)",
+    "autoScroll": "Auto-scroll: {{state}}",
+    "on": "on",
+    "off": "off",
+    "waiting": "Waiting for log output…",
+    "empty": "(no log)"
+  },
+  "results": {
+    "noEchoView": "Echo jobs have no results view.",
+    "pendingActive": "Job running; results will appear once produced (auto-checked every 5s).",
+    "noResultFile": "This job produced no result file."
+  },
+  "taskgen": {
+    "defaultBase": "taskset",
+    "autoGenSuffix": "autogen",
+    "generatedCount": "Generated tasks",
+    "requestedCount": "Requested",
+    "backend": "Backend",
+    "model": "Model",
+    "cliDefault": "CLI default",
+    "attempts": "Attempts",
+    "duration": "Duration",
+    "reviewTitle": "Generated tasks (review, then import)",
+    "importAsNew": "Import as new taskset",
+    "table": {
+      "type": "Type",
+      "question": "Question",
+      "rubric": "Rubric"
+    }
+  },
+  "eval": {
+    "tasks": "Tasks",
+    "passRate": "Pass rate",
+    "softMean": "Soft mean",
+    "totalDuration": "Total duration",
+    "perTaskTitle": "Per-task results",
+    "toggleHint": "Click to expand / collapse",
+    "runError": "[run error] {{error}}",
+    "table": {
+      "type": "Type",
+      "pass": "Pass",
+      "soft": "Soft",
+      "judgeReason": "Judge reason",
+      "duration": "Duration"
+    }
+  },
+  "train": {
+    "steps": "Steps",
+    "accepts": "Accepts",
+    "rejects": "Rejects",
+    "bestStepScore": "Best step / score",
+    "testBaselineBest": "test baseline→best",
+    "inProgress": "Training still in progress; below is a live view of completed steps.",
+    "valCurveTitle": "Validation score curve",
+    "legendValSoft": "Val soft score",
+    "legendBest": "All-time best",
+    "timelineTitle": "Step timeline",
+    "noSteps": "No completed steps yet.",
+    "skillDiffTitle": "Skill diff (seed → best)",
+    "noDiff": "No diff yet (best_skill.md not produced, or identical to seed)."
+  },
+  "artifacts": {
+    "directory": "Directory",
+    "empty": "Directory is empty (the job may not have produced files yet).",
+    "binaryNotice": "Binary file ({{size}}), cannot preview — use “Download” at the top right.",
+    "truncatedNotice": "File too large, preview truncated ({{size}}) — download for full content."
+  }
+}

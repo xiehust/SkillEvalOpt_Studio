@@ -1,0 +1,113 @@
+{
+  "title": "任务管理",
+  "subtitle": "全部评估 / 训练任务;运行中任务每 2 秒自动刷新",
+  "autoRetrying": "自动重试中",
+  "filters": {
+    "allStatus": "全部状态",
+    "allType": "全部类型"
+  },
+  "empty": {
+    "noJobs": "还没有任务",
+    "noJobsHint": "发起一次评估或训练后,任务会出现在这里。",
+    "noMatch": "没有符合筛选条件的任务",
+    "noMatchHint": "调整上方筛选条件。"
+  },
+  "table": {
+    "id": "任务 ID",
+    "type": "类型",
+    "skillTaskset": "技能 / 任务集",
+    "status": "状态",
+    "duration": "耗时",
+    "tokens": "Token 消耗",
+    "created": "创建时间"
+  },
+  "detail": {
+    "subtitle": "{{type}} · 创建于 {{time}}",
+    "backToJobs": "返回任务列表"
+  },
+  "tabs": {
+    "overview": "概览",
+    "log": "日志",
+    "results": "结果",
+    "artifacts": "产物"
+  },
+  "overview": {
+    "failed": "任务失败",
+    "unknownError": "未知错误",
+    "status": "状态",
+    "duration": "耗时",
+    "exitCode": "退出码",
+    "params": "参数",
+    "startEnd": "开始 / 结束",
+    "cancelJob": "取消任务"
+  },
+  "log": {
+    "title": "日志",
+    "titleLive": "日志(实时轮询中)",
+    "autoScroll": "自动滚动:{{state}}",
+    "on": "开",
+    "off": "关",
+    "waiting": "等待日志输出…",
+    "empty": "(无日志)"
+  },
+  "results": {
+    "noEchoView": "测试类任务没有结果视图。",
+    "pendingActive": "任务运行中,结果将在产出后出现(每 5 秒自动检查)。",
+    "noResultFile": "该任务没有产出结果文件。"
+  },
+  "taskgen": {
+    "defaultBase": "任务集",
+    "autoGenSuffix": "自动生成",
+    "generatedCount": "生成任务数",
+    "requestedCount": "请求数量",
+    "backend": "后端",
+    "model": "模型",
+    "cliDefault": "CLI 默认",
+    "attempts": "尝试次数",
+    "duration": "耗时",
+    "reviewTitle": "生成的任务(审阅后导入)",
+    "importAsNew": "导入为新任务集",
+    "table": {
+      "type": "类型",
+      "question": "问题",
+      "rubric": "评分标准(rubric)"
+    }
+  },
+  "eval": {
+    "tasks": "任务数",
+    "passRate": "通过率",
+    "softMean": "软分均值",
+    "totalDuration": "总耗时",
+    "perTaskTitle": "逐任务结果",
+    "toggleHint": "点击展开 / 收起",
+    "runError": "[运行错误] {{error}}",
+    "table": {
+      "type": "类型",
+      "pass": "通过",
+      "soft": "软分",
+      "judgeReason": "判分理由",
+      "duration": "耗时"
+    }
+  },
+  "train": {
+    "steps": "步数",
+    "accepts": "接受",
+    "rejects": "拒绝",
+    "bestStepScore": "最优步 / 分数",
+    "testBaselineBest": "test 基线→最优",
+    "inProgress": "训练仍在进行,以下为已完成步骤的实时视图。",
+    "valCurveTitle": "验证分数曲线",
+    "legendValSoft": "验证软分",
+    "legendBest": "历史最优",
+    "timelineTitle": "步骤时间线",
+    "noSteps": "还没有完成的步骤。",
+    "skillDiffTitle": "技能变化(seed → best)",
+    "noDiff": "暂无差异(best_skill.md 尚未产出或与种子一致)。"
+  },
+  "artifacts": {
+    "directory": "目录",
+    "empty": "目录为空(任务可能尚未产出文件)。",
+    "binaryNotice": "二进制文件({{size}}),无法预览 —— 请使用右上角「下载」。",
+    "truncatedNotice": "文件过大,预览已截断({{size}})—— 完整内容请下载。"
+  }
+}

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 import ReactMarkdown, { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -17,22 +18,16 @@ import {
   formatDuration, formatSize, formatTime, jobDuration, truncate,
 } from "../components/ui";
 
-const TABS = [
-  { key: "overview", label: "概览" },
-  { key: "log", label: "日志" },
-  { key: "results", label: "结果" },
-  { key: "artifacts", label: "产物" },
-] as const;
+const TABS = ["overview", "log", "results", "artifacts"] as const;
 
-type TabKey = (typeof TABS)[number]["key"];
-
-const TYPE_LABELS: Record<string, string> = { eval: "评估", train: "训练", taskgen: "任务生成", echo: "测试" };
+type TabKey = (typeof TABS)[number];
 
 function isActive(job: JobInfo | null): boolean {
   return job?.status === "running" || job?.status === "queued";
 }
 
 export default function JobDetailPage() {
+  const { t } = useTranslation("jobs");
   const { id = "" } = useParams();
   const [tab, setTab] = useState<TabKey>("overview");
   const { data: job, error } = usePolling(() => api.job(id), 2500, [id]);
@@ -46,8 +41,11 @@ export default function JobDetailPage() {
             {job && <StatusPill status={job.status} />}
           </span>
         }
-        sub={job ? `${TYPE_LABELS[job.type] ?? job.type} · 创建于 ${formatTime(job.created_at)}` : undefined}
-        actions={<Link to="/jobs" className="btn-ghost">返回任务列表</Link>}
+        sub={job ? t("detail.subtitle", {
+          type: t(`common:jobType.${job.type}`, { defaultValue: job.type }),
+          time: formatTime(job.created_at),
+        }) : undefined}
+        actions={<Link to="/jobs" className="btn-ghost">{t("detail.backToJobs")}</Link>}
       />
 
       {error && !job && <ErrorBanner message={error.message} />}
@@ -56,18 +54,18 @@ export default function JobDetailPage() {
       {job && (
         <>
           <div className="flex gap-1 border-b border-line mb-6">
-            {TABS.map((item) => (
+            {TABS.map((key) => (
               <button
-                key={item.key}
-                data-testid={`tab-${item.key}`}
+                key={key}
+                data-testid={`tab-${key}`}
                 className={`px-4 py-2 text-sm border-b-2 -mb-px transition-colors ${
-                  tab === item.key
-                    ? "border-green text-text font-medium"
+                  tab === key
+                    ? "border-amber text-amber font-medium"
                     : "border-transparent text-muted hover:text-text"
                 }`}
-                onClick={() => setTab(item.key)}
+                onClick={() => setTab(key)}
               >
-                {item.label}
+                {t(`tabs.${key}`)}
               </button>
             ))}
           </div>
@@ -84,6 +82,7 @@ export default function JobDetailPage() {
 // ── Overview ─────────────────────────────────────────────────────────────
 
 function OverviewTab({ job }: { job: JobInfo }) {
+  const { t } = useTranslation("jobs");
   const [cancelError, setCancelError] = useState<string | null>(null);
   const [logTail, setLogTail] = useState("");
 
@@ -96,7 +95,7 @@ function OverviewTab({ job }: { job: JobInfo }) {
   }, [job.id, job.status]);
 
   const onCancel = async () => {
-    if (!window.confirm(`确定取消任务 ${job.id} 吗?`)) return;
+    if (!window.confirm(t("common:confirmCancelJob", { id: job.id }))) return;
     setCancelError(null);
     try {
       await api.cancelJob(job.id);
@@ -108,11 +107,11 @@ function OverviewTab({ job }: { job: JobInfo }) {
   return (
     <div className="space-y-6 max-w-4xl">
       {job.status === "failed" && (
-        <div className="card border-red/50 bg-red/5 p-4" data-testid="failed-card">
-          <div className="text-red font-semibold text-sm mb-1">任务失败</div>
-          <Mono className="text-sm text-red/90 block">{job.error ?? "未知错误"}</Mono>
+        <div className="card border-crit/50 border-l-[3px] border-l-crit p-4" data-testid="failed-card">
+          <div className="text-critText font-semibold text-sm mb-1">{t("overview.failed")}</div>
+          <Mono className="text-sm text-critText/90 block">{job.error ?? t("overview.unknownError")}</Mono>
           {logTail && (
-            <pre className="mt-3 bg-bg border border-line rounded p-3 text-xs font-mono text-muted overflow-x-auto max-h-48 overflow-y-auto">
+            <pre className="mt-3 bg-codebg border border-grid p-3 text-xs font-mono text-muted overflow-x-auto max-h-48 overflow-y-auto">
               {logTail}
             </pre>
           )}
@@ -121,14 +120,14 @@ function OverviewTab({ job }: { job: JobInfo }) {
       {cancelError && <ErrorBanner message={cancelError} />}
 
       <div className="flex flex-wrap gap-3">
-        <StatBadge label="状态" value={<StatusPill status={job.status} />} />
-        <StatBadge label="耗时" value={jobDuration(job)} tone="cyan" />
+        <StatBadge label={t("overview.status")} value={<StatusPill status={job.status} />} />
+        <StatBadge label={t("overview.duration")} value={jobDuration(job)} tone="s2" />
         {job.exit_code !== null && (
-          <StatBadge label="退出码" value={job.exit_code} tone={job.exit_code === 0 ? "green" : "red"} />
+          <StatBadge label={t("overview.exitCode")} value={job.exit_code} tone={job.exit_code === 0 ? "good" : "critText"} />
         )}
       </div>
 
-      <Card title="参数">
+      <Card title={t("overview.params")}>
         <table className="w-full max-w-2xl">
           <tbody>
             {Object.entries(job.params ?? {}).map(([key, value]) => (
@@ -138,7 +137,7 @@ function OverviewTab({ job }: { job: JobInfo }) {
               </tr>
             ))}
             <tr>
-              <td className="td w-48 text-muted"><Mono className="text-xs">开始 / 结束</Mono></td>
+              <td className="td w-48 text-muted"><Mono className="text-xs">{t("overview.startEnd")}</Mono></td>
               <td className="td text-xs text-muted">
                 {formatTime(job.started_at)} → {formatTime(job.finished_at)}
               </td>
@@ -149,7 +148,7 @@ function OverviewTab({ job }: { job: JobInfo }) {
 
       {isActive(job) && (
         <button className="btn-danger" data-testid="cancel-job" onClick={onCancel}>
-          ✕ 取消任务
+          ✕ {t("overview.cancelJob")}
         </button>
       )}
     </div>
@@ -159,6 +158,7 @@ function OverviewTab({ job }: { job: JobInfo }) {
 // ── Log ──────────────────────────────────────────────────────────────────
 
 function LogTab({ job }: { job: JobInfo }) {
+  const { t } = useTranslation("jobs");
   const [content, setContent] = useState("");
   const [autoScroll, setAutoScroll] = useState(true);
   const offsetRef = useRef(0);
@@ -200,24 +200,24 @@ function LogTab({ job }: { job: JobInfo }) {
 
   return (
     <Card
-      title={active ? "日志(实时轮询中)" : "日志"}
+      title={active ? t("log.titleLive") : t("log.title")}
       actions={
         <button
           className="btn-ghost !px-2 !py-1 text-xs"
           data-testid="autoscroll-toggle"
           onClick={() => setAutoScroll((value) => !value)}
         >
-          自动滚动:{autoScroll ? "开" : "关"}
+          {t("log.autoScroll", { state: autoScroll ? t("log.on") : t("log.off") })}
         </button>
       }
     >
       <pre
         ref={preRef}
         data-testid="log-view"
-        className="bg-bg border border-line rounded-md p-4 text-xs font-mono leading-relaxed
+        className="bg-codebg border border-grid p-4 text-xs font-mono leading-relaxed
           text-text/85 overflow-auto h-[32rem] whitespace-pre-wrap"
       >
-        {content || (active ? "等待日志输出…" : "(无日志)")}
+        {content || (active ? t("log.waiting") : t("log.empty"))}
       </pre>
     </Card>
   );
@@ -226,6 +226,7 @@ function LogTab({ job }: { job: JobInfo }) {
 // ── Results ──────────────────────────────────────────────────────────────
 
 function ResultsTab({ job }: { job: JobInfo }) {
+  const { t } = useTranslation("jobs");
   const [results, setResults] = useState<JobResults | null>(null);
   const [notReady, setNotReady] = useState(false);
   const active = isActive(job);
@@ -253,17 +254,17 @@ function ResultsTab({ job }: { job: JobInfo }) {
   }, [job.id, active]);
 
   if (job.type === "echo") {
-    return <Card><p className="text-sm text-muted">测试类任务没有结果视图。</p></Card>;
+    return <Card><p className="text-sm text-muted">{t("results.noEchoView")}</p></Card>;
   }
   if (!results) {
     return (
       <Card>
         <p className="text-sm text-muted" data-testid="results-pending">
           {notReady && active
-            ? "任务运行中,结果将在产出后出现(每 5 秒自动检查)。"
+            ? t("results.pendingActive")
             : notReady
-              ? "该任务没有产出结果文件。"
-              : "加载中…"}
+              ? t("results.noResultFile")
+              : t("common:loading")}
         </p>
       </Card>
     );
@@ -274,13 +275,14 @@ function ResultsTab({ job }: { job: JobInfo }) {
 }
 
 function TaskgenResultsView({ results, job }: { results: TaskgenResults; job: JobInfo }) {
+  const { t } = useTranslation("jobs");
   const navigate = useNavigate();
   const { tasks, summary } = results;
 
   const suggestedName = () => {
     const skillId = String(job.params.skill_id ?? "");
     const base = skillId.includes("--") ? skillId.split("--").slice(1).join("--") : skillId;
-    return `${base || "任务集"}-自动生成`;
+    return `${base || t("taskgen.defaultBase")}-${t("taskgen.autoGenSuffix")}`;
   };
 
   const importTasks = () => {
@@ -292,21 +294,21 @@ function TaskgenResultsView({ results, job }: { results: TaskgenResults; job: Jo
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap gap-3">
-        <StatBadge label="生成任务数" value={tasks.length} tone="green" />
-        {summary.requested_count != null && <StatBadge label="请求数量" value={summary.requested_count} />}
-        {summary.backend && <StatBadge label="后端" value={summary.backend} tone="cyan" />}
-        {summary.model != null && <StatBadge label="模型" value={summary.model || "CLI 默认"} tone="muted" />}
-        {summary.attempts != null && <StatBadge label="尝试次数" value={summary.attempts} tone="muted" />}
+        <StatBadge label={t("taskgen.generatedCount")} value={tasks.length} tone="good" />
+        {summary.requested_count != null && <StatBadge label={t("taskgen.requestedCount")} value={summary.requested_count} />}
+        {summary.backend && <StatBadge label={t("taskgen.backend")} value={summary.backend} tone="s2" />}
+        {summary.model != null && <StatBadge label={t("taskgen.model")} value={summary.model || t("taskgen.cliDefault")} tone="muted" />}
+        {summary.attempts != null && <StatBadge label={t("taskgen.attempts")} value={summary.attempts} tone="muted" />}
         {summary.duration_s != null && (
-          <StatBadge label="耗时" value={formatDuration(summary.duration_s)} tone="muted" />
+          <StatBadge label={t("taskgen.duration")} value={formatDuration(summary.duration_s)} tone="muted" />
         )}
       </div>
 
       <Card
-        title="生成的任务(审阅后导入)"
+        title={t("taskgen.reviewTitle")}
         actions={
           <button className="btn-primary" onClick={importTasks} data-testid="taskgen-import">
-            导入为新任务集
+            {t("taskgen.importAsNew")}
           </button>
         }
       >
@@ -315,15 +317,15 @@ function TaskgenResultsView({ results, job }: { results: TaskgenResults; job: Jo
             <thead>
               <tr>
                 <th className="th">ID</th>
-                <th className="th">类型</th>
-                <th className="th">问题</th>
-                <th className="th">评分标准(rubric)</th>
+                <th className="th">{t("taskgen.table.type")}</th>
+                <th className="th">{t("taskgen.table.question")}</th>
+                <th className="th">{t("taskgen.table.rubric")}</th>
               </tr>
             </thead>
             <tbody>
               {tasks.map((task) => (
                 <tr key={task.id} className="hover:bg-panel2/40">
-                  <td className="td"><Mono className="text-cyan">{task.id}</Mono></td>
+                  <td className="td"><Mono className="text-s1">{task.id}</Mono></td>
                   <td className="td"><Mono className="text-xs text-muted">{task.task_type ?? "default"}</Mono></td>
                   <td className="td text-sm max-w-md">{truncate(task.question, 120)}</td>
                   <td className="td text-sm text-muted max-w-md">{truncate(task.rubric, 120)}</td>
@@ -338,47 +340,48 @@ function TaskgenResultsView({ results, job }: { results: TaskgenResults; job: Jo
 }
 
 function EvalResultsView({ results }: { results: EvalResults }) {
+  const { t } = useTranslation("jobs");
   const [expanded, setExpanded] = useState<string | null>(null);
   const { summary, rows } = results;
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap gap-3">
-        <StatBadge label="任务数" value={summary.tasks} />
-        <StatBadge label="通过率" value={`${(summary.pass_rate * 100).toFixed(0)}%`} tone="green" />
-        <StatBadge label="软分均值" value={summary.soft_mean.toFixed(3)} tone="cyan" />
-        <StatBadge label="总耗时" value={formatDuration(summary.duration_s)} tone="muted" />
+        <StatBadge label={t("eval.tasks")} value={summary.tasks} />
+        <StatBadge label={t("eval.passRate")} value={`${(summary.pass_rate * 100).toFixed(0)}%`} tone="good" />
+        <StatBadge label={t("eval.softMean")} value={summary.soft_mean.toFixed(3)} tone="s2" />
+        <StatBadge label={t("eval.totalDuration")} value={formatDuration(summary.duration_s)} tone="muted" />
       </div>
-      <Card title="逐任务结果">
+      <Card title={t("eval.perTaskTitle")}>
         <div className="overflow-x-auto -m-4">
           <table className="w-full" data-testid="eval-results-table">
             <thead>
               <tr>
                 <th className="th">ID</th>
-                <th className="th">类型</th>
-                <th className="th">通过</th>
-                <th className="th">软分</th>
-                <th className="th">判分理由</th>
-                <th className="th">耗时</th>
+                <th className="th">{t("eval.table.type")}</th>
+                <th className="th">{t("eval.table.pass")}</th>
+                <th className="th">{t("eval.table.soft")}</th>
+                <th className="th">{t("eval.table.judgeReason")}</th>
+                <th className="th">{t("eval.table.duration")}</th>
               </tr>
             </thead>
             <tbody>
               {rows.map((row) => (
                 <tr key={row.id} className="hover:bg-panel2/40">
-                  <td className="td"><Mono className="text-cyan">{row.id}</Mono></td>
+                  <td className="td"><Mono className="text-s1">{row.id}</Mono></td>
                   <td className="td"><Mono className="text-xs text-muted">{row.task_type ?? "default"}</Mono></td>
                   <td className="td">
-                    <span className={row.hard ? "text-green font-semibold" : "text-red font-semibold"}>
+                    <span className={row.hard ? "text-good font-semibold" : "text-critText font-semibold"}>
                       {row.hard ? "✓" : "✗"}
                     </span>
                   </td>
                   <td className="td"><Mono>{(row.soft ?? 0).toFixed(2)}</Mono></td>
                   <td
                     className="td max-w-lg cursor-pointer"
-                    title="点击展开 / 收起"
+                    title={t("eval.toggleHint")}
                     onClick={() => setExpanded(expanded === row.id ? null : row.id)}
                   >
                     <span className={`text-xs text-text/80 ${expanded === row.id ? "" : "line-clamp-2"}`}>
-                      {row.error ? `[运行错误] ${row.error}` : row.judge_reason ?? "—"}
+                      {row.error ? t("eval.runError", { error: row.error }) : row.judge_reason ?? "—"}
                     </span>
                   </td>
                   <td className="td"><Mono className="text-xs">{formatDuration(row.duration_s)}</Mono></td>
@@ -393,12 +396,13 @@ function EvalResultsView({ results }: { results: EvalResults }) {
 }
 
 const ACTION_STYLES: Record<string, string> = {
-  accept: "border-green/50 text-green",
-  accept_new_best: "border-green/50 text-green",
-  reject: "border-red/50 text-red",
+  accept: "border-good/50 text-good",
+  accept_new_best: "border-good/50 text-good",
+  reject: "border-crit/50 text-critText",
 };
 
 function TrainResultsView({ results }: { results: TrainResults }) {
+  const { t } = useTranslation("jobs");
   const { summary, skill_diff } = results;
   const chartData = summary.steps.map((step) => ({
     step: step.step,
@@ -408,53 +412,53 @@ function TrainResultsView({ results }: { results: TrainResults }) {
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap gap-3">
-        <StatBadge label="步数" value={summary.totals.steps} />
-        <StatBadge label="接受" value={summary.totals.accepts ?? "—"} tone="green" />
-        <StatBadge label="拒绝" value={summary.totals.rejects ?? "—"} tone="red" />
+        <StatBadge label={t("train.steps")} value={summary.totals.steps} />
+        <StatBadge label={t("train.accepts")} value={summary.totals.accepts ?? "—"} tone="good" />
+        <StatBadge label={t("train.rejects")} value={summary.totals.rejects ?? "—"} tone="critText" />
         <StatBadge
-          label="最优步 / 分数"
+          label={t("train.bestStepScore")}
           value={`#${summary.best_step ?? "—"} / ${summary.best_score?.toFixed(3) ?? "—"}`}
-          tone="cyan"
+          tone="s2"
         />
         {summary.test_scores.best != null && (
           <StatBadge
-            label="test 基线→最优"
+            label={t("train.testBaselineBest")}
             value={`${summary.test_scores.baseline?.toFixed(2) ?? "—"} → ${summary.test_scores.best.toFixed(2)}`}
-            tone="purple"
+            tone="s5"
           />
         )}
       </div>
 
       {!summary.finished && (
-        <p className="text-xs text-amber">训练仍在进行,以下为已完成步骤的实时视图。</p>
+        <p className="text-xs text-amber">{t("train.inProgress")}</p>
       )}
 
-      <Card title="验证分数曲线">
+      <Card title={t("train.valCurveTitle")}>
         <div className="h-64" data-testid="val-chart">
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={chartData} margin={{ top: 8, right: 16, bottom: 4, left: 0 }}>
-              <CartesianGrid stroke="#2A3647" strokeDasharray="3 3" />
-              <XAxis dataKey="step" stroke="#94A3B7" fontSize={12} />
-              <YAxis stroke="#94A3B7" fontSize={12} domain={[0, 1]} />
+              <CartesianGrid stroke="#212823" strokeDasharray="3 3" />
+              <XAxis dataKey="step" stroke="#69736C" fontSize={11} />
+              <YAxis stroke="#69736C" fontSize={11} domain={[0, 1]} />
               <Tooltip
-                contentStyle={{ background: "#18212F", border: "1px solid #2A3647", borderRadius: 6 }}
-                labelStyle={{ color: "#EAF0F7" }}
+                contentStyle={{ background: "#0E1211", border: "1px solid #2E3833", borderRadius: 0, fontFamily: '"IBM Plex Mono", monospace', fontSize: 11 }}
+                labelStyle={{ color: "#E9EDEA" }}
               />
               <Legend />
-              <Line type="monotone" dataKey="sel_soft" name="验证软分" stroke="#56C7D6" dot strokeWidth={2} />
-              <Line type="monotone" dataKey="best" name="历史最优" stroke="#A6DB4C" dot strokeWidth={2} />
+              <Line type="monotone" dataKey="sel_soft" name={t("train.legendValSoft")} stroke="#3987E5" dot strokeWidth={2} />
+              <Line type="monotone" dataKey="best" name={t("train.legendBest")} stroke="#199E70" dot strokeWidth={2} />
             </LineChart>
           </ResponsiveContainer>
         </div>
       </Card>
 
-      <Card title="步骤时间线">
+      <Card title={t("train.timelineTitle")}>
         <div className="space-y-2" data-testid="train-timeline">
           {summary.steps.map((step) => (
             <div
               key={step.step}
               data-step-action={step.action}
-              className={`flex flex-wrap items-center gap-x-5 gap-y-1 border-l-2 rounded-r bg-panel2 px-4 py-2.5 ${
+              className={`flex flex-wrap items-center gap-x-5 gap-y-1 border-l-2 bg-panel2 px-4 py-2.5 ${
                 ACTION_STYLES[step.action] ?? "border-line text-muted"
               }`}
             >
@@ -468,14 +472,14 @@ function TrainResultsView({ results }: { results: TrainResults }) {
               <Mono className="text-xs text-muted">{formatDuration(step.wall_time_s)}</Mono>
             </div>
           ))}
-          {summary.steps.length === 0 && <p className="text-sm text-muted">还没有完成的步骤。</p>}
+          {summary.steps.length === 0 && <p className="text-sm text-muted">{t("train.noSteps")}</p>}
         </div>
       </Card>
 
-      <Card title="技能变化(seed → best)">
+      <Card title={t("train.skillDiffTitle")}>
         {skill_diff ? (
           <pre
-            className="bg-bg border border-line rounded-md p-4 text-xs font-mono leading-relaxed overflow-auto max-h-[28rem]"
+            className="bg-codebg border border-grid p-4 text-xs font-mono leading-relaxed overflow-auto max-h-[28rem]"
             data-testid="skill-diff"
           >
             {skill_diff.split("\n").map((line, index) => (
@@ -485,11 +489,11 @@ function TrainResultsView({ results }: { results: TrainResults }) {
                   line.startsWith("+++") || line.startsWith("---")
                     ? "text-muted"
                     : line.startsWith("+")
-                      ? "text-green bg-green/5"
+                      ? "text-good bg-good/5"
                       : line.startsWith("-")
-                        ? "text-red bg-red/5"
+                        ? "text-critText bg-crit/5"
                         : line.startsWith("@@")
-                          ? "text-cyan"
+                          ? "text-s1"
                           : "text-text/70"
                 }
               >
@@ -498,7 +502,7 @@ function TrainResultsView({ results }: { results: TrainResults }) {
             ))}
           </pre>
         ) : (
-          <p className="text-sm text-muted">暂无差异(best_skill.md 尚未产出或与种子一致)。</p>
+          <p className="text-sm text-muted">{t("train.noDiff")}</p>
         )}
       </Card>
     </div>
@@ -508,6 +512,7 @@ function TrainResultsView({ results }: { results: TrainResults }) {
 // ── Artifacts ────────────────────────────────────────────────────────────
 
 function ArtifactsTab({ job }: { job: JobInfo }) {
+  const { t } = useTranslation("jobs");
   const [path, setPath] = useState("");
   const [listing, setListing] = useState<ArtifactDir | null>(null);
   const [file, setFile] = useState<ArtifactFile | null>(null);
@@ -530,12 +535,12 @@ function ArtifactsTab({ job }: { job: JobInfo }) {
   return (
     <div className="space-y-4">
       <div className="flex items-center gap-1 text-sm flex-wrap" data-testid="artifact-breadcrumbs">
-        <button className="text-cyan hover:underline" onClick={() => setPath("")}>out</button>
+        <button className="text-s1 hover:underline" onClick={() => setPath("")}>out</button>
         {crumbs.map((part, index) => (
           <span key={index} className="flex items-center gap-1">
             <span className="text-muted">/</span>
             <button
-              className="text-cyan hover:underline"
+              className="text-s1 hover:underline"
               onClick={() => setPath(crumbs.slice(0, index + 1).join("/"))}
             >
               {part}
@@ -549,12 +554,12 @@ function ArtifactsTab({ job }: { job: JobInfo }) {
       {file ? (
         <ArtifactFileView jobId={job.id} file={file} onOpen={setPath} />
       ) : listing ? (
-        <Card title="目录">
+        <Card title={t("artifacts.directory")}>
           <ul className="divide-y divide-line/60" data-testid="artifact-listing">
             {listing.dirs.map((dir) => (
               <li key={dir}>
                 <button
-                  className="w-full text-left px-2 py-2 hover:bg-panel2/60 rounded flex items-center gap-2"
+                  className="w-full text-left px-2 py-2 hover:bg-panel2/60 flex items-center gap-2"
                   onClick={() => setPath(path ? `${path}/${dir}` : dir)}
                 >
                   <span className="text-amber">▸</span>
@@ -565,16 +570,16 @@ function ArtifactsTab({ job }: { job: JobInfo }) {
             {listing.files.map((entry) => (
               <li key={entry.name}>
                 <button
-                  className="w-full text-left px-2 py-2 hover:bg-panel2/60 rounded flex items-center justify-between gap-2"
+                  className="w-full text-left px-2 py-2 hover:bg-panel2/60 flex items-center justify-between gap-2"
                   onClick={() => setPath(path ? `${path}/${entry.name}` : entry.name)}
                 >
-                  <Mono className="text-sm text-cyan">{entry.name}</Mono>
+                  <Mono className="text-sm text-s1">{entry.name}</Mono>
                   <Mono className="text-xs text-muted">{entry.size} B</Mono>
                 </button>
               </li>
             ))}
             {listing.dirs.length === 0 && listing.files.length === 0 && (
-              <li className="text-sm text-muted py-3 px-2">目录为空(任务可能尚未产出文件)。</li>
+              <li className="text-sm text-muted py-3 px-2">{t("artifacts.empty")}</li>
             )}
           </ul>
         </Card>
@@ -590,6 +595,7 @@ function ArtifactsTab({ job }: { job: JobInfo }) {
 function ArtifactFileView({
   jobId, file, onOpen,
 }: { jobId: string; file: ArtifactFile; onOpen: (path: string) => void }) {
+  const { t } = useTranslation("jobs");
   const isMarkdown = /\.(md|markdown)$/i.test(file.path);
 
   // Relative links in the markdown open the referenced artifact in this
@@ -631,13 +637,13 @@ function ArtifactFileView({
           download
           data-testid="artifact-download"
         >
-          下载
+          {t("common:actions.download")}
         </a>
       }
     >
       {file.kind === "binary" ? (
         <p className="text-sm text-muted py-6 text-center">
-          二进制文件({formatSize(file.size)}),无法预览 —— 请使用右上角「下载」。
+          {t("artifacts.binaryNotice", { size: formatSize(file.size) })}
         </p>
       ) : (
         <div data-testid="artifact-content">
@@ -656,7 +662,7 @@ function ArtifactFileView({
           )}
           {file.truncated && (
             <p className="text-xs text-amber mt-3">
-              文件过大,预览已截断({formatSize(file.size)})—— 完整内容请下载。
+              {t("artifacts.truncatedNotice", { size: formatSize(file.size) })}
             </p>
           )}
         </div>

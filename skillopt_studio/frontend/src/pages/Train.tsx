@@ -1,9 +1,11 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 import { api, ApiError, BackendStatus, SkillInfo, TaskSetInfo } from "../api";
 import { BackendSelect, Card, ErrorBanner, Mono, PageHeader, SourceTag, Spinner } from "../components/ui";
 
 export default function Train() {
+  const { t } = useTranslation("wizards");
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const [skills, setSkills] = useState<SkillInfo[] | null>(null);
@@ -86,27 +88,27 @@ export default function Train() {
   const onSubmit = async (event: FormEvent) => {
     event.preventDefault();
     if (!skillId || !tasksetId) {
-      setFormError("请先选择技能和任务集,再发起训练。");
+      setFormError(t("train.errNoSkillTaskset"));
       return;
     }
     if (numEpochs < 1 || numEpochs > 10) {
-      setFormError("训练轮数需在 1-10 之间。");
+      setFormError(t("train.errEpochsRange", { min: 1, max: 10 }));
       return;
     }
     if (learningRate < 1 || learningRate > 16) {
-      setFormError("学习率需在 1-16 之间。");
+      setFormError(t("train.errLearningRateRange", { min: 1, max: 16 }));
       return;
     }
     if (workers < 1 || workers > 8) {
-      setFormError("并发 workers 需在 1-8 之间。");
+      setFormError(t("picker.workersRangeError", { min: 1, max: 8 }));
       return;
     }
     if (timeout_ < 60 || timeout_ > 3600) {
-      setFormError("单任务超时需在 60-3600 秒之间。");
+      setFormError(t("picker.timeoutRangeError", { min: 60, max: 3600 }));
       return;
     }
     if (selectedTaskset?.mode === "single" && !/^[1-9]\d*:[1-9]\d*:[1-9]\d*$/.test(splitRatio)) {
-      setFormError("分割比例格式应为 train:val:test,例如 4:3:3。");
+      setFormError(t("train.errSplitRatio"));
       return;
     }
     setFormError(null);
@@ -137,18 +139,18 @@ export default function Train() {
   return (
     <div>
       <PageHeader
-        title="发起训练"
-        sub="以任务集为训练数据迭代优化技能文档,闸门通过才接受编辑,产出 best_skill.md"
+        title={t("train.title")}
+        sub={t("train.subtitle")}
       />
       {loadError && <ErrorBanner message={loadError} />}
       {(skills === null || tasksets === null) && !loadError && <Spinner />}
 
       {skills !== null && tasksets !== null && (
         <form onSubmit={onSubmit} noValidate className="space-y-6" data-testid="train-form">
-          <Card title="① 选择技能">
+          <Card title={t("picker.selectSkillTitle")}>
             <input
               className="input max-w-sm mb-3"
-              placeholder="搜索技能…"
+              placeholder={t("picker.searchSkillPlaceholder")}
               value={skillQuery}
               onChange={(event) => setSkillQuery(event.target.value)}
             />
@@ -157,16 +159,16 @@ export default function Train() {
                 <label
                   key={skill.id}
                   data-skill-option={skill.id}
-                  className={`flex items-start gap-2.5 p-3 rounded border cursor-pointer transition-colors ${
+                  className={`flex items-start gap-2.5 p-3 border cursor-pointer transition-colors ${
                     skillId === skill.id
-                      ? "border-green bg-green/5"
+                      ? "border-amber bg-amber/[.13]"
                       : "border-line bg-panel2 hover:border-muted"
                   }`}
                 >
                   <input
                     type="radio"
                     name="skill"
-                    className="mt-1 accent-[#A6DB4C]"
+                    className="mt-1 accent-amber"
                     checked={skillId === skill.id}
                     onChange={() => setSkillId(skill.id)}
                   />
@@ -182,29 +184,29 @@ export default function Train() {
             </div>
           </Card>
 
-          <Card title="② 可训练文件(可选)">
-            {!skillId && <p className="text-sm text-muted">先选择技能。</p>}
+          <Card title={t("train.trainableFilesTitle")}>
+            {!skillId && <p className="text-sm text-muted">{t("train.selectSkillFirst")}</p>}
             {skillId && mdFiles.length === 0 && (
               <p className="text-sm text-muted" data-testid="no-trainable-hint">
                 {selectedSkill?.has_support_files
-                  ? "该技能没有可训练的支撑 .md 文件,将只训练 SKILL.md。"
-                  : "单文件技能——没有支撑文件,将只训练 SKILL.md。"}
+                  ? t("train.noTrainableSupport")
+                  : t("train.singleFileSkill")}
               </p>
             )}
             {skillId && mdFiles.length > 0 && (
               <div data-testid="trainable-files">
                 <p className="text-xs text-muted mb-3">
-                  SKILL.md 恒为可训练主文档(不在下方列表);勾选的支撑文档会与它打包成一个 bundle 一起训练。
+                  {t("train.trainableHint")}
                 </p>
                 <div className="grid gap-2 md:grid-cols-2">
                   {mdFiles.map((file) => (
                     <label
                       key={file}
-                      className="flex items-center gap-2.5 p-2.5 rounded border border-line bg-panel2 cursor-pointer hover:border-muted"
+                      className="flex items-center gap-2.5 p-2.5 border border-line bg-panel2 cursor-pointer hover:border-faint"
                     >
                       <input
                         type="checkbox"
-                        className="accent-[#A6DB4C]"
+                        className="accent-amber"
                         checked={trainableFiles.includes(file)}
                         onChange={() => toggleTrainable(file)}
                       />
@@ -216,12 +218,12 @@ export default function Train() {
             )}
           </Card>
 
-          <Card title="③ 任务集">
+          <Card title={t("train.tasksetTitle")}>
             {tasksets.length === 0 ? (
               <div className="text-sm text-muted">
-                还没有任务集,先到
-                <Link to="/tasksets" className="text-cyan mx-1">任务集页</Link>
-                创建。
+                {t("train.noTasksetPre")}
+                <Link to="/tasksets" className="text-s1 mx-1">{t("picker.tasksetPageLink")}</Link>
+                {t("train.noTasksetPost")}
               </div>
             ) : (
               <div className="grid gap-2 md:grid-cols-2">
@@ -229,16 +231,16 @@ export default function Train() {
                   <label
                     key={taskset.id}
                     data-taskset-option={taskset.id}
-                    className={`flex items-start gap-2.5 p-3 rounded border cursor-pointer transition-colors ${
+                    className={`flex items-start gap-2.5 p-3 border cursor-pointer transition-colors ${
                       tasksetId === taskset.id
-                        ? "border-green bg-green/5"
+                        ? "border-amber bg-amber/[.13]"
                         : "border-line bg-panel2 hover:border-muted"
                     }`}
                   >
                     <input
                       type="radio"
                       name="taskset"
-                      className="mt-1 accent-[#A6DB4C]"
+                      className="mt-1 accent-amber"
                       checked={tasksetId === taskset.id}
                       onChange={() => setTasksetId(taskset.id)}
                     />
@@ -246,7 +248,7 @@ export default function Train() {
                       <span className="text-sm font-medium">{taskset.name}</span>
                       <span className="block text-xs text-muted mt-0.5">
                         {taskset.mode === "single"
-                          ? `single · ${taskset.task_count} 个任务(训练时按比例自动分割)`
+                          ? t("train.tasksetSingle", { n: taskset.task_count })
                           : `split · ${Object.entries(taskset.counts_by_split)
                               .map(([split, count]) => `${split}:${count}`)
                               .join(" ")}`}
@@ -258,58 +260,58 @@ export default function Train() {
             )}
             {selectedTaskset?.mode === "single" && (
               <div className="mt-4 max-w-xs" data-testid="split-ratio-field">
-                <label className="label">分割比例 train:val:test</label>
+                <label className="label">{t("train.splitRatioLabel")}</label>
                 <input
                   className="input font-mono"
                   value={splitRatio}
                   onChange={(event) => setSplitRatio(event.target.value)}
                 />
                 <p className="text-xs text-muted mt-1.5">
-                  single 任务集会按此比例确定性分割为训练 / 验证 / 测试三组。
+                  {t("train.splitRatioNote")}
                 </p>
               </div>
             )}
           </Card>
 
-          <Card title="④ 训练参数">
+          <Card title={t("train.trainParamsTitle")}>
             <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
               <div>
-                <label className="label">训练轮数 num_epochs</label>
+                <label className="label">{t("train.numEpochsLabel")}</label>
                 <input
                   type="number" min={1} max={10} className="input font-mono"
                   value={numEpochs} onChange={(e) => setNumEpochs(Number(e.target.value))}
                 />
-                <p className="text-xs text-muted mt-1.5">每轮完整过一遍训练集。</p>
+                <p className="text-xs text-muted mt-1.5">{t("train.numEpochsHint")}</p>
               </div>
               <div>
-                <label className="label">闸门指标 gate_metric</label>
+                <label className="label">{t("train.gateMetricLabel")}</label>
                 <select className="input" value={gateMetric} onChange={(e) => setGateMetric(e.target.value)}>
-                  <option value="hard">hard — 严格通过率</option>
-                  <option value="soft">soft — 部分得分均值</option>
-                  <option value="mixed">mixed — 两者加权</option>
+                  <option value="hard">{t("train.gateHard")}</option>
+                  <option value="soft">{t("train.gateSoft")}</option>
+                  <option value="mixed">{t("train.gateMixed")}</option>
                 </select>
                 <p className="text-xs text-muted mt-1.5">
-                  编辑只有让验证集该指标严格提升才被接受;任务含多条精确规范时建议 soft。
+                  {t("train.gateMetricHint")}
                 </p>
               </div>
               <div>
-                <label className="label">学习率 learning_rate</label>
+                <label className="label">{t("train.learningRateLabel")}</label>
                 <input
                   type="number" min={1} max={16} className="input font-mono"
                   value={learningRate} onChange={(e) => setLearningRate(Number(e.target.value))}
                 />
-                <p className="text-xs text-muted mt-1.5">每步最多接受的编辑条数上限。</p>
+                <p className="text-xs text-muted mt-1.5">{t("train.learningRateHint")}</p>
               </div>
               <BackendSelect value={targetBackend} onChange={applyBackend} statuses={backends} />
               <div>
-                <label className="label">目标模型(执行任务)</label>
+                <label className="label">{t("picker.targetModelLabel")}</label>
                 <input
-                  className="input font-mono" value={targetModel} placeholder="留空 = 后端默认模型"
+                  className="input font-mono" value={targetModel} placeholder={t("picker.targetModelPlaceholder")}
                   onChange={(e) => setTargetModel(e.target.value)}
                 />
               </div>
               <div>
-                <label className="label">优化器 / 判分模型</label>
+                <label className="label">{t("train.optimizerModelLabel")}</label>
                 <input
                   className="input font-mono"
                   value={optimizerModel}
@@ -317,14 +319,14 @@ export default function Train() {
                 />
               </div>
               <div>
-                <label className="label">并发 workers(1-8)</label>
+                <label className="label">{t("picker.workersLabel", { min: 1, max: 8 })}</label>
                 <input
                   type="number" min={1} max={8} className="input font-mono"
                   value={workers} onChange={(e) => setWorkers(Number(e.target.value))}
                 />
               </div>
               <div>
-                <label className="label">单任务超时(60-3600 秒)</label>
+                <label className="label">{t("picker.timeoutLabel", { min: 60, max: 3600 })}</label>
                 <input
                   type="number" min={60} max={3600} className="input font-mono"
                   value={timeout_} onChange={(e) => setTimeout_(Number(e.target.value))}
@@ -334,13 +336,13 @@ export default function Train() {
                 <input
                   id="eval-test"
                   type="checkbox"
-                  className="accent-[#A6DB4C]"
+                  className="accent-amber"
                   checked={evalTest}
                   onChange={(e) => setEvalTest(e.target.checked)}
                 />
                 <label htmlFor="eval-test" className="text-sm">
-                  训练结束后跑 test 分组
-                  <span className="block text-xs text-muted">开启会多花一轮模型调用,冒烟建议关。</span>
+                  {t("train.evalTestLabel")}
+                  <span className="block text-xs text-muted">{t("train.evalTestHint")}</span>
                 </label>
               </div>
             </div>
@@ -353,7 +355,7 @@ export default function Train() {
           )}
 
           <button type="submit" className="btn-primary" disabled={submitting} data-testid="train-submit">
-            {submitting ? "创建任务中…" : "↻ 发起训练"}
+            {submitting ? t("picker.creatingJob") : `↻ ${t("common:actions.train")}`}
           </button>
         </form>
       )}

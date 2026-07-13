@@ -1,4 +1,6 @@
+import { useTranslation } from "react-i18next";
 import { TaskItem } from "../api";
+import i18n from "../i18n";
 
 const UNSAFE_ID = /[/\\]|\.\./;
 
@@ -24,22 +26,24 @@ export function rowErrors(items: TaskItem[]): Map<number, string[]> {
   const firstIndexOfId = new Map<string, number>();
   items.forEach((item, index) => {
     const id = (item.id ?? "").trim();
-    if (!id) push(index, "id 不能为空");
-    else if (UNSAFE_ID.test(id)) push(index, "id 不能包含 /、\\ 或 ..(将用作目录名)");
-    else if (firstIndexOfId.has(id)) push(index, `id "${id}" 与第 ${firstIndexOfId.get(id)! + 1} 行重复`);
+    if (!id) push(index, i18n.t("tasksets:editor.errors.idEmpty"));
+    else if (UNSAFE_ID.test(id)) push(index, i18n.t("tasksets:editor.errors.idUnsafe"));
+    else if (firstIndexOfId.has(id))
+      push(index, i18n.t("tasksets:editor.errors.idDuplicate", { id, line: firstIndexOfId.get(id)! + 1 }));
     else firstIndexOfId.set(id, index);
-    if (!(item.question ?? "").trim()) push(index, "question 不能为空");
-    if (!(item.rubric ?? "").trim()) push(index, "rubric 不能为空");
+    if (!(item.question ?? "").trim()) push(index, i18n.t("tasksets:editor.errors.questionEmpty"));
+    if (!(item.rubric ?? "").trim()) push(index, i18n.t("tasksets:editor.errors.rubricEmpty"));
   });
   return errors;
 }
 
 /** Flat error list for submit-time checks (empty array = valid). */
 export function validateItems(items: TaskItem[]): string[] {
-  if (items.length === 0) return ["至少需要 1 个任务"];
+  if (items.length === 0) return [i18n.t("tasksets:editor.errors.atLeastOne")];
   const messages: string[] = [];
   for (const [index, rowMessages] of rowErrors(items)) {
-    for (const message of rowMessages) messages.push(`第 ${index + 1} 行:${message}`);
+    for (const message of rowMessages)
+      messages.push(i18n.t("tasksets:editor.errors.rowPrefix", { line: index + 1, message }));
   }
   return messages;
 }
@@ -56,6 +60,7 @@ export default function TaskItemsEditor({
   items: TaskItem[];
   onChange: (items: TaskItem[]) => void;
 }) {
+  const { t } = useTranslation("tasksets");
   const errors = rowErrors(items);
 
   const patchRow = (index: number, patch: Partial<TaskItem>) => {
@@ -73,21 +78,21 @@ export default function TaskItemsEditor({
         return (
           <div
             key={index}
-            className={`rounded border p-3 space-y-2 ${rowErrs.length > 0 ? "border-red/70" : "border-line"} bg-panel2/30`}
+            className={`border p-3 space-y-2 ${rowErrs.length > 0 ? "border-crit/70" : "border-line"} bg-panel2/30`}
             data-testid="taskitem-row"
           >
             <div className="flex items-center gap-3">
               <span className="text-xs text-muted w-10 shrink-0">#{index + 1}</span>
               <input
                 className="input !py-1 text-sm font-mono flex-1"
-                placeholder="id(如 task_001)"
+                placeholder={t("editor.idPlaceholder")}
                 value={item.id}
                 onChange={(event) => patchRow(index, { id: event.target.value })}
                 data-testid="taskitem-id"
               />
               <input
                 className="input !py-1 text-sm font-mono w-40"
-                placeholder="task_type(可选)"
+                placeholder={t("editor.typePlaceholder")}
                 value={item.task_type ?? ""}
                 onChange={(event) =>
                   patchRow(index, { task_type: event.target.value || undefined })
@@ -99,7 +104,7 @@ export default function TaskItemsEditor({
                   className="font-mono text-[11px] text-amber shrink-0"
                   title={fileNames.join("\n")}
                 >
-                  附带 {fileNames.length} 个文件
+                  {t("editor.filesBadge", { count: fileNames.length })}
                 </span>
               )}
               <button
@@ -108,25 +113,25 @@ export default function TaskItemsEditor({
                 onClick={() => removeRow(index)}
                 data-testid="taskitem-remove"
               >
-                删除
+                {t("common:actions.delete")}
               </button>
             </div>
             <textarea
               className="input text-sm min-h-[56px]"
-              placeholder="question — 给被评估 agent 的任务文本"
+              placeholder={t("editor.questionPlaceholder")}
               value={item.question}
               onChange={(event) => patchRow(index, { question: event.target.value })}
               data-testid="taskitem-question"
             />
             <textarea
               className="input text-sm min-h-[56px]"
-              placeholder="rubric — 客观可判定的验收标准(判分依据)"
+              placeholder={t("editor.rubricPlaceholder")}
               value={item.rubric}
               onChange={(event) => patchRow(index, { rubric: event.target.value })}
               data-testid="taskitem-rubric"
             />
             {rowErrs.length > 0 && (
-              <div className="text-xs text-red" data-testid="taskitem-errors">
+              <div className="text-xs text-critText" data-testid="taskitem-errors">
                 {rowErrs.join(";")}
               </div>
             )}
@@ -139,7 +144,7 @@ export default function TaskItemsEditor({
         onClick={() => onChange([...items, emptyItem(items)])}
         data-testid="taskitem-add"
       >
-        + 添加任务
+        {t("editor.addTask")}
       </button>
     </div>
   );

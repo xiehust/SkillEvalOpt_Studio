@@ -1,38 +1,25 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 import { api, JobInfo, JobStatus, usePolling } from "../api";
 import {
   Card, EmptyState, ErrorBanner, Mono, PageHeader, Pagination, Spinner, StatusPill,
   TokenCell, formatTime, jobDuration, usePagination,
 } from "../components/ui";
 
-const STATUS_FILTERS: { value: JobStatus | "all"; label: string }[] = [
-  { value: "all", label: "全部状态" },
-  { value: "running", label: "运行中" },
-  { value: "queued", label: "排队中" },
-  { value: "succeeded", label: "成功" },
-  { value: "failed", label: "失败" },
-  { value: "cancelled", label: "已取消" },
-];
+const STATUS_FILTERS: (JobStatus | "all")[] = ["all", "running", "queued", "succeeded", "failed", "cancelled"];
 
-const TYPE_FILTERS = [
-  { value: "all", label: "全部类型" },
-  { value: "eval", label: "评估" },
-  { value: "train", label: "训练" },
-  { value: "taskgen", label: "任务生成" },
-  { value: "echo", label: "测试" },
-];
-
-const TYPE_LABELS: Record<string, string> = { eval: "评估", train: "训练", taskgen: "任务生成", echo: "测试" };
+const TYPE_FILTERS = ["all", "eval", "train", "taskgen", "echo"];
 
 export default function Jobs() {
+  const { t } = useTranslation("jobs");
   const { data: jobs, error, loading } = usePolling(() => api.jobs(), 2000);
   const [statusFilter, setStatusFilter] = useState<JobStatus | "all">("all");
   const [typeFilter, setTypeFilter] = useState("all");
   const [cancelError, setCancelError] = useState<string | null>(null);
 
   const onCancel = async (job: JobInfo) => {
-    if (!window.confirm(`确定取消任务 ${job.id} 吗?`)) return;
+    if (!window.confirm(t("common:confirmCancelJob", { id: job.id }))) return;
     setCancelError(null);
     try {
       await api.cancelJob(job.id);
@@ -51,17 +38,17 @@ export default function Jobs() {
   return (
     <div>
       <PageHeader
-        title="任务管理"
-        sub="全部评估 / 训练任务;运行中任务每 2 秒自动刷新"
+        title={t("title")}
+        sub={t("subtitle")}
         actions={
           <>
-            <Link to="/evaluate" className="btn-primary">发起评估</Link>
-            <Link to="/train" className="btn-ghost">发起训练</Link>
+            <Link to="/evaluate" className="btn-primary">{t("common:actions.evaluate")}</Link>
+            <Link to="/train" className="btn-ghost">{t("common:actions.train")}</Link>
           </>
         }
       />
 
-      {error && <ErrorBanner message={error.message} retryHint="自动重试中" />}
+      {error && <ErrorBanner message={error.message} retryHint={t("autoRetrying")} />}
       {cancelError && <div className="mb-4"><ErrorBanner message={cancelError} /></div>}
 
       <div className="flex gap-3 mb-4">
@@ -71,8 +58,10 @@ export default function Jobs() {
           data-testid="filter-status"
           onChange={(event) => setStatusFilter(event.target.value as JobStatus | "all")}
         >
-          {STATUS_FILTERS.map((option) => (
-            <option key={option.value} value={option.value}>{option.label}</option>
+          {STATUS_FILTERS.map((value) => (
+            <option key={value} value={value}>
+              {value === "all" ? t("filters.allStatus") : t(`common:status.${value}`)}
+            </option>
           ))}
         </select>
         <select
@@ -81,8 +70,10 @@ export default function Jobs() {
           data-testid="filter-type"
           onChange={(event) => setTypeFilter(event.target.value)}
         >
-          {TYPE_FILTERS.map((option) => (
-            <option key={option.value} value={option.value}>{option.label}</option>
+          {TYPE_FILTERS.map((value) => (
+            <option key={value} value={value}>
+              {value === "all" ? t("filters.allType") : t(`common:jobType.${value}`)}
+            </option>
           ))}
         </select>
       </div>
@@ -90,8 +81,8 @@ export default function Jobs() {
       {loading && !jobs && <Spinner />}
       {jobs && filtered.length === 0 && (
         <EmptyState
-          title={jobs.length === 0 ? "还没有任务" : "没有符合筛选条件的任务"}
-          hint={jobs.length === 0 ? "发起一次评估或训练后,任务会出现在这里。" : "调整上方筛选条件。"}
+          title={jobs.length === 0 ? t("empty.noJobs") : t("empty.noMatch")}
+          hint={jobs.length === 0 ? t("empty.noJobsHint") : t("empty.noMatchHint")}
         />
       )}
 
@@ -101,13 +92,13 @@ export default function Jobs() {
             <table className="w-full" data-testid="jobs-table">
               <thead>
                 <tr>
-                  <th className="th">任务 ID</th>
-                  <th className="th">类型</th>
-                  <th className="th">技能 / 任务集</th>
-                  <th className="th">状态</th>
-                  <th className="th">耗时</th>
-                  <th className="th">Token 消耗</th>
-                  <th className="th">创建时间</th>
+                  <th className="th">{t("table.id")}</th>
+                  <th className="th">{t("table.type")}</th>
+                  <th className="th">{t("table.skillTaskset")}</th>
+                  <th className="th">{t("table.status")}</th>
+                  <th className="th">{t("table.duration")}</th>
+                  <th className="th">{t("table.tokens")}</th>
+                  <th className="th">{t("table.created")}</th>
                   <th className="th"></th>
                 </tr>
               </thead>
@@ -115,11 +106,11 @@ export default function Jobs() {
                 {pageItems.map((job) => (
                   <tr key={job.id} className="hover:bg-panel2/40" data-job-row={job.id}>
                     <td className="td">
-                      <Link to={`/jobs/${job.id}`} className="text-cyan hover:underline">
+                      <Link to={`/jobs/${job.id}`} className="text-s1 hover:underline">
                         <Mono>{job.id}</Mono>
                       </Link>
                     </td>
-                    <td className="td">{TYPE_LABELS[job.type] ?? job.type}</td>
+                    <td className="td">{t(`common:jobType.${job.type}`, { defaultValue: job.type })}</td>
                     <td className="td">
                       <Mono className="text-xs text-muted block">
                         {String(job.params?.skill_id ?? "—")}
@@ -139,7 +130,7 @@ export default function Jobs() {
                           data-testid={`cancel-${job.id}`}
                           onClick={() => onCancel(job)}
                         >
-                          取消
+                          {t("common:actions.cancel")}
                         </button>
                       )}
                     </td>

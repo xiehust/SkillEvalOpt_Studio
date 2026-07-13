@@ -1,0 +1,37 @@
+{
+  "header": {
+    "title": "Skill Library",
+    "sub": "Scans the local claude / codex / kiro / agents skill sources, plus skills uploaded to Studio"
+  },
+  "upload": {
+    "button": "Upload skill zip",
+    "uploading": "Uploading…",
+    "tooLarge": "The zip is {{size}}MB, over the 50MB limit.",
+    "success": "Uploaded skill {{name}}"
+  },
+  "search": {
+    "placeholder": "Search skill name / ID / description…"
+  },
+  "empty": {
+    "noMatchTitle": "No matching skills",
+    "noMatchHint": "Try a different keyword.",
+    "noSkillsTitle": "No skills found",
+    "noSkillsHint": "None of the four local skill sources contain a directory with a SKILL.md — upload a skill zip to get started."
+  },
+  "card": {
+    "count": "{{n}} skills",
+    "filesChip": "{{n}} files",
+    "noDescription": "(no description)"
+  },
+  "detail": {
+    "titleFallback": "Skill Detail",
+    "evaluate": "Evaluate this skill",
+    "train": "Train this skill",
+    "back": "Back to Skill Library",
+    "backToSkillMd": "Back to SKILL.md",
+    "binary": "Binary file ({{size}}) — cannot preview; use “Download” at the top right.",
+    "truncated": "File too large; preview truncated ({{size}}) — download for the full content.",
+    "fileTree": "File tree ({{n}})",
+    "previewTitle": "Click to preview"
+  }
+}

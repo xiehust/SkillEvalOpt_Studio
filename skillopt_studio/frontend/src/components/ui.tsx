@@ -1,13 +1,20 @@
 // Shared design-system primitives for the studio console.
 import { ReactNode, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { BackendStatus, JobStatus, TokenUsage } from "../api";
+import { dateLocale } from "../i18n";
 
-export function PageHeader({ title, sub, actions }: { title: ReactNode; sub?: string; actions?: ReactNode }) {
+export function PageHeader({
+  title, sub, actions, kicker = "SKILLEVAL&OPT STUDIO",
+}: { title: ReactNode; sub?: string; actions?: ReactNode; kicker?: string }) {
   return (
-    <div className="flex items-start justify-between mb-6 gap-4">
+    <div className="flex items-end justify-between mb-5 gap-4 flex-wrap">
       <div>
-        <h1 className="text-xl font-semibold tracking-wide">{title}</h1>
-        {sub && <p className="text-sm text-muted mt-1">{sub}</p>}
+        <div className="font-mono text-[10px] tracking-[0.24em] text-amber uppercase mb-1.5">
+          {"// "}{kicker}
+        </div>
+        <h1 className="text-[26px] leading-tight font-extrabold [font-stretch:118%] tracking-[0.01em]">{title}</h1>
+        {sub && <p className="text-[12.5px] text-muted mt-1">{sub}</p>}
       </div>
       {actions && <div className="flex items-center gap-2 shrink-0">{actions}</div>}
     </div>
@@ -31,41 +38,48 @@ export function Card({
 }
 
 const STATUS_META: Record<JobStatus, { label: string; className: string; dot: string }> = {
-  queued: { label: "排队中", className: "text-muted border-muted/40 bg-muted/10", dot: "bg-muted" },
-  running: { label: "运行中", className: "text-amber border-amber/40 bg-amber/10", dot: "bg-amber pulse-dot" },
-  succeeded: { label: "成功", className: "text-green border-green/40 bg-green/10", dot: "bg-green" },
-  failed: { label: "失败", className: "text-red border-red/40 bg-red/10", dot: "bg-red" },
-  cancelled: { label: "已取消", className: "text-purple border-purple/40 bg-purple/10", dot: "bg-purple" },
+  queued: { label: "status.queued", className: "text-muted border-line2", dot: "bg-muted" },
+  running: { label: "status.running", className: "text-warn border-warn/[.35]", dot: "bg-warn pulse-dot" },
+  succeeded: { label: "status.succeeded", className: "text-good border-good/40", dot: "bg-good" },
+  failed: { label: "status.failed", className: "text-critText border-crit/45", dot: "bg-crit" },
+  cancelled: { label: "status.cancelled", className: "text-s5 border-s5/40", dot: "bg-s5" },
 };
 
 export function StatusPill({ status }: { status: JobStatus }) {
+  const { t } = useTranslation("common");
   const meta = STATUS_META[status] ?? STATUS_META.queued;
   return (
     <span
       data-status={status}
-      className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full border text-xs font-medium ${meta.className}`}
+      className={`inline-flex items-center gap-1.5 px-2 py-[3px] border font-mono text-[10px] tracking-[0.05em] whitespace-nowrap ${meta.className}`}
     >
       <span className={`w-1.5 h-1.5 rounded-full ${meta.dot}`} />
-      {meta.label}
+      {t(meta.label)}
     </span>
   );
 }
 
 const TONE_CLASSES: Record<string, string> = {
   text: "text-text",
-  green: "text-green",
-  cyan: "text-cyan",
+  good: "text-good",
+  s1: "text-s1",
+  s2: "text-s2",
   amber: "text-amber",
-  red: "text-red",
-  purple: "text-purple",
+  critText: "text-critText",
+  s5: "text-s5",
   muted: "text-muted",
+  // legacy tone keys — map to semantic tokens so old call sites stay correct
+  green: "text-good",
+  cyan: "text-s2",
+  red: "text-critText",
+  purple: "text-s5",
 };
 
 export function StatBadge({ label, value, tone = "text" }: { label: string; value: ReactNode; tone?: string }) {
   return (
-    <div className="card px-4 py-3 min-w-[7.5rem]">
-      <div className="text-[11px] uppercase tracking-widest text-muted">{label}</div>
-      <div className={`text-2xl font-mono font-semibold mt-1 ${TONE_CLASSES[tone] ?? "text-text"}`}>{value}</div>
+    <div className="card px-4 py-3.5 min-w-[7.5rem]">
+      <div className="font-mono text-[9.5px] uppercase tracking-[0.2em] text-faint">{label}</div>
+      <div className={`text-[28px] leading-none font-extrabold [font-stretch:115%] tracking-[0.01em] mt-2.5 ${TONE_CLASSES[tone] ?? "text-text"}`}>{value}</div>
     </div>
   );
 }
@@ -75,29 +89,31 @@ export function EmptyState({
 }: { title: string; hint?: string; action?: ReactNode }) {
   return (
     <div className="flex flex-col items-center justify-center py-14 text-center">
-      <div className="w-10 h-10 rounded border border-dashed border-line flex items-center justify-center mb-3">
-        <span className="text-muted text-lg">∅</span>
+      <div className="w-10 h-10 border border-dashed border-line2 flex items-center justify-center mb-3">
+        <span className="text-faint text-lg font-mono">∅</span>
       </div>
-      <div className="text-sm text-text/80 font-medium">{title}</div>
-      {hint && <div className="text-xs text-muted mt-1 max-w-sm">{hint}</div>}
+      <div className="font-mono text-[11px] tracking-[0.08em] text-muted">{title}</div>
+      {hint && <div className="text-xs text-faint mt-1.5 max-w-sm">{hint}</div>}
       {action && <div className="mt-4">{action}</div>}
     </div>
   );
 }
 
-export function Spinner({ label = "加载中…" }: { label?: string }) {
+export function Spinner({ label }: { label?: string }) {
+  const { t } = useTranslation("common");
   return (
-    <div className="flex items-center gap-2 text-muted text-sm py-8 justify-center">
-      <span className="w-4 h-4 rounded-full border-2 border-line border-t-cyan animate-spin" />
-      {label}
+    <div className="flex items-center gap-2.5 font-mono text-[11px] tracking-[0.12em] text-faint py-8 justify-center">
+      <span className="w-4 h-4 rounded-full border-2 border-line2 border-t-amber animate-spin" />
+      {label ?? t("loading")}
     </div>
   );
 }
 
 export function ErrorBanner({ message, retryHint }: { message: string; retryHint?: string }) {
+  const { t } = useTranslation("common");
   return (
-    <div className="card border-red/40 bg-red/5 px-4 py-3 text-sm text-red" role="alert">
-      <span className="font-semibold mr-2">出错了:</span>
+    <div className="card border-crit/45 border-l-[3px] border-l-crit px-4 py-3 text-sm text-critText" role="alert">
+      <span className="font-mono font-semibold mr-2 tracking-[0.05em]">{t("errorPrefix")}</span>
       {message}
       {retryHint && <span className="text-muted ml-2">{retryHint}</span>}
     </div>
@@ -105,34 +121,37 @@ export function ErrorBanner({ message, retryHint }: { message: string; retryHint
 }
 
 export const SOURCE_COLORS: Record<string, string> = {
-  sample: "text-cyan border-cyan/40 bg-cyan/10",
-  claude: "text-green border-green/40 bg-green/10",
-  "claude-plugins": "text-green border-green/40 bg-green/5",
-  codex: "text-cyan border-cyan/40 bg-cyan/10",
-  kiro: "text-amber border-amber/40 bg-amber/10",
-  agents: "text-purple border-purple/40 bg-purple/10",
-  uploaded: "text-red border-red/40 bg-red/10",
+  sample: "text-s2 border-s2/40",
+  claude: "text-amber border-amber/40",
+  "claude-plugins": "text-amber border-amber/40",
+  codex: "text-s1 border-s1/40",
+  kiro: "text-s3 border-s3/45",
+  agents: "text-s5 border-s5/40",
+  uploaded: "text-serious border-serious/40",
 };
 
-const SOURCE_LABELS: Record<string, string> = {
-  sample: "内置样例",
-  "claude-plugins": "claude 插件",
+const SOURCE_LABEL_KEYS: Record<string, string> = {
+  sample: "source.sample",
+  "claude-plugins": "source.claudePlugins",
 };
 
 export function SourceTag({ source }: { source: string }) {
-  const color = SOURCE_COLORS[source] ?? "text-muted border-line bg-panel2";
+  const { t } = useTranslation("common");
+  const color = SOURCE_COLORS[source] ?? "text-muted border-line2";
+  const labelKey = SOURCE_LABEL_KEYS[source];
   return (
-    <span className={`inline-block px-2 py-0.5 rounded border text-xs font-mono ${color}`}>
-      {SOURCE_LABELS[source] ?? source}
+    <span className={`inline-block px-2 py-[3px] border font-mono text-[10px] tracking-[0.05em] ${color}`}>
+      {labelKey ? t(labelKey) : source}
     </span>
   );
 }
 
 /** 内置样例任务集徽标(与 SourceTag 视觉一致)。 */
 export function SampleTag() {
+  const { t } = useTranslation("common");
   return (
-    <span className="inline-block px-2 py-0.5 rounded border text-xs font-mono text-cyan border-cyan/40 bg-cyan/10">
-      内置样例
+    <span className="inline-block px-2 py-[3px] border font-mono text-[10px] tracking-[0.05em] text-s2 border-s2/40">
+      {t("source.sample")}
     </span>
   );
 }
@@ -150,10 +169,11 @@ export const EXEC_BACKEND_OPTIONS = [
 export function BackendSelect({
   value, onChange, statuses,
 }: { value: string; onChange: (backend: string) => void; statuses: BackendStatus[] | null }) {
+  const { t } = useTranslation("common");
   const current = statuses?.find((status) => status.backend === value);
   return (
     <div>
-      <label className="label">执行后端</label>
+      <label className="label">{t("backendSelect.label")}</label>
       <select
         className="input"
         data-testid="backend-select"
@@ -162,7 +182,7 @@ export function BackendSelect({
       >
         {EXEC_BACKEND_OPTIONS.map((option) => {
           const status = statuses?.find((s) => s.backend === option.value);
-          const suffix = status && !status.available ? "(未检测到 CLI)" : "";
+          const suffix = status && !status.available ? t("backendSelect.notDetectedSuffix") : "";
           return (
             <option key={option.value} value={option.value}>
               {option.label}{suffix}
@@ -171,16 +191,16 @@ export function BackendSelect({
         })}
       </select>
       {current && current.available && (
-        <p className="text-xs text-green mt-1.5">
-          ✓ 已检测到 {current.cli} CLI:<Mono>{current.path}</Mono>
+        <p className="text-xs text-good mt-1.5">
+          {t("backendSelect.detected", { cli: current.cli })}<Mono>{current.path}</Mono>
         </p>
       )}
       {current && !current.available && (
-        <p className="text-xs text-red mt-1.5" data-testid="backend-warning">
-          ✗ 未检测到 {current.cli} CLI —— 请先安装并完成登录,否则提交会被拒绝。
+        <p className="text-xs text-critText mt-1.5" data-testid="backend-warning">
+          {t("backendSelect.notDetected", { cli: current.cli })}
         </p>
       )}
-      <p className="text-xs text-muted mt-1.5">按技能来源自动推荐:codex 源技能默认用 Codex 执行。</p>
+      <p className="text-xs text-muted mt-1.5">{t("backendSelect.hint")}</p>
     </div>
   );
 }
@@ -211,10 +231,11 @@ export function Pagination({
   onPage: (page: number) => void;
   onPageSize: (size: number) => void;
 }) {
+  const { t } = useTranslation("common");
   if (total <= PAGE_SIZES[0]) return null;
   return (
     <div className="flex items-center justify-between gap-3 mt-4" data-testid="pagination">
-      <span className="text-xs text-muted">共 {total} 条</span>
+      <span className="font-mono text-[10.5px] text-faint tracking-[0.05em]">{t("pagination.total", { total })}</span>
       <div className="flex items-center gap-2">
         <select
           className="input !w-auto !py-1 text-xs"
@@ -223,7 +244,7 @@ export function Pagination({
           onChange={(event) => onPageSize(Number(event.target.value))}
         >
           {PAGE_SIZES.map((size) => (
-            <option key={size} value={size}>{size} 条/页</option>
+            <option key={size} value={size}>{t("pagination.perPage", { size })}</option>
           ))}
         </select>
         <button
@@ -233,9 +254,9 @@ export function Pagination({
           data-testid="page-prev"
           onClick={() => onPage(page - 1)}
         >
-          上一页
+          {t("pagination.prev")}
         </button>
-        <span className="text-xs text-muted whitespace-nowrap">第 {page} / {pageCount} 页</span>
+        <span className="font-mono text-[10.5px] text-faint whitespace-nowrap">{t("pagination.pageOf", { page, pageCount })}</span>
         <button
           type="button"
           className="btn-ghost !px-2.5 !py-1 text-xs disabled:opacity-40 disabled:cursor-not-allowed"
@@ -243,7 +264,7 @@ export function Pagination({
           data-testid="page-next"
           onClick={() => onPage(page + 1)}
         >
-          下一页
+          {t("pagination.next")}
         </button>
       </div>
     </div>
@@ -303,7 +324,7 @@ export function formatDuration(seconds: number | null | undefined): string {
 export function formatTime(iso: string | null | undefined): string {
   if (!iso) return "—";
   const date = new Date(iso);
-  return isNaN(date.getTime()) ? iso : date.toLocaleString("zh-CN", { hour12: false });
+  return isNaN(date.getTime()) ? iso : date.toLocaleString(dateLocale(), { hour12: false });
 }
 
 export function jobDuration(job: { started_at: string | null; finished_at: string | null }): string {

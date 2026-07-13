@@ -1,0 +1,24 @@
+{
+  "nav": {
+    "dashboard": "Overview",
+    "skills": "Skills",
+    "tasksets": "Task Sets",
+    "evaluate": "Evaluate",
+    "train": "Train",
+    "jobs": "Jobs"
+  },
+  "syschip": {
+    "ok": "SYSTEMS GO",
+    "offline": "BACKEND OFFLINE"
+  },
+  "login": {
+    "notice": "Access control is enabled on this instance. Please sign in to continue.",
+    "username": "Username",
+    "password": "Password",
+    "submit": "Sign in",
+    "submitting": "Signing in…",
+    "missing": "Enter a username and password",
+    "badCredentials": "Invalid username or password",
+    "logout": "Sign out"
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "title": "Overview",
+  "sub": "SkillEval&Opt Studio — skill evaluation & training console",
+  "autoRetry": "Auto-retrying every 3s",
+  "firstEval": "Run your first evaluation",
+  "resources": {
+    "skills": "Skills",
+    "tasksets": "Task sets",
+    "jobs": "Total jobs"
+  },
+  "running": {
+    "elapsed": "running for {{duration}}"
+  },
+  "skillHealth": {
+    "title": "Skill health",
+    "empty": {
+      "title": "No evaluations yet",
+      "hint": "Once you run an evaluation, each skill's pass rate and trend show up here."
+    },
+    "runsSummary": "{{runs}} evals · last {{time}}"
+  },
+  "trainGains": {
+    "title": "Training gains",
+    "empty": {
+      "title": "No completed training yet",
+      "hint": "Once training completes, the baseline → best score gain shows up here."
+    },
+    "summary": "accepted {{accepts}} · rejected {{rejects}} · {{time}}"
+  },
+  "tokens": {
+    "title": "Token usage (completed jobs)",
+    "today": "Today",
+    "total": "Total",
+    "note": "Scope: eval = executor agent + LLM judge; train = optimizer + rollout executor agent; older jobs with no recorded tokens are excluded."
+  },
+  "failures": {
+    "title": "Recent failures"
+  },
+  "recent": {
+    "title": "Recent jobs",
+    "empty": {
+      "title": "No jobs yet",
+      "hint": "Pick a skill from the library, then run an evaluation or training — jobs will appear here."
+    },
+    "cols": {
+      "id": "Job ID",
+      "type": "Type",
+      "skill": "Skill",
+      "status": "Status",
+      "passRate": "Pass rate",
+      "duration": "Duration",
+      "tokens": "Token usage",
+      "createdAt": "Created"
+    }
+  }
+}

@@ -1,5 +1,6 @@
 // Typed client for the SkillOpt Studio backend (mirrors skillopt_studio/models.py).
 import { useEffect, useRef, useState } from "react";
+import i18n from "./i18n";
 
 export interface SkillInfo {
   id: string;
@@ -229,7 +230,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   try {
     response = await fetch(path, init);
   } catch {
-    throw new ApiError(0, "无法连接后端服务");
+    throw new ApiError(0, i18n.t("common:networkError"));
   }
   if (!response.ok) {
     // Session expired / not logged in — flip the app back to the login gate

@@ -54,10 +54,11 @@ export function languageForFile(path: string): string {
 // Studio theme tokens (tailwind.config.js) — oneDark's own bg clashes with the palette.
 const CODE_STYLE = {
   margin: 0,
-  background: "#0E1524",
-  border: "1px solid #2A3647",
-  borderRadius: "0.375rem",
-  fontSize: "0.75rem",
+  background: "#0A0D0C",
+  border: "1px solid #212823",
+  borderRadius: 0,
+  fontSize: "0.72rem",
+  lineHeight: 1.7,
   fontFamily: '"IBM Plex Mono", ui-monospace, "Noto Sans Mono CJK SC", monospace',
 };
 

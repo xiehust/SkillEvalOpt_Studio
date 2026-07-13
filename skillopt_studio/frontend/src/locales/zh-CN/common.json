@@ -1,0 +1,47 @@
+{
+  "status": {
+    "queued": "排队中",
+    "running": "运行中",
+    "succeeded": "成功",
+    "failed": "失败",
+    "cancelled": "已取消"
+  },
+  "jobType": {
+    "eval": "评估",
+    "train": "训练",
+    "taskgen": "任务生成",
+    "echo": "测试"
+  },
+  "source": {
+    "sample": "内置样例",
+    "claudePlugins": "claude 插件"
+  },
+  "loading": "加载中…",
+  "errorPrefix": "出错了:",
+  "emptyGlyph": "∅",
+  "actions": {
+    "cancel": "取消",
+    "delete": "删除",
+    "download": "下载",
+    "back": "返回",
+    "save": "保存",
+    "evaluate": "发起评估",
+    "train": "发起训练"
+  },
+  "confirmCancelJob": "确定取消任务 {{id}} 吗?",
+  "backendSelect": {
+    "label": "执行后端",
+    "detected": "✓ 已检测到 {{cli}} CLI:",
+    "notDetected": "✗ 未检测到 {{cli}} CLI —— 请先安装并完成登录,否则提交会被拒绝。",
+    "notDetectedSuffix": "(未检测到 CLI)",
+    "hint": "按技能来源自动推荐:codex 源技能默认用 Codex 执行。"
+  },
+  "pagination": {
+    "total": "共 {{total}} 条",
+    "perPage": "{{size}} 条/页",
+    "prev": "上一页",
+    "next": "下一页",
+    "pageOf": "第 {{page}} / {{pageCount}} 页"
+  },
+  "networkError": "无法连接后端服务"
+}

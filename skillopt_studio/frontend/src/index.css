@@ -8,16 +8,30 @@
 
 body {
   @apply bg-bg text-text font-sans antialiased;
-  /* faint blueprint grid — gives the console depth without noise */
+  font-size: 14px;
+  line-height: 1.45;
+  overflow-x: hidden;
+  /* mission-control backdrop — amber glow + 56px hairline grid (launchpad app.css) */
   background-image:
-    radial-gradient(ellipse 80% 50% at 50% -10%, rgba(86, 199, 214, 0.06), transparent),
-    linear-gradient(rgba(42, 54, 71, 0.22) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(42, 54, 71, 0.22) 1px, transparent 1px);
-  background-size: 100% 100%, 32px 32px, 32px 32px;
+    radial-gradient(1100px 500px at 75% -10%, rgba(255, 176, 0, 0.045), transparent 60%),
+    repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.014) 0 1px, transparent 1px 56px),
+    repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.014) 0 1px, transparent 1px 56px);
+}
+
+/* film grain */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.05;
+  z-index: 99;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='.6'/%3E%3C/svg%3E");
 }
 
 ::selection {
-  background: rgba(166, 219, 76, 0.3);
+  background: #ffb000;
+  color: #141210;
 }
 
 *::-webkit-scrollbar {
@@ -28,67 +42,124 @@ body {
   background: transparent;
 }
 *::-webkit-scrollbar-thumb {
-  background: #2a3647;
+  background: #2e3833;
   border-radius: 5px;
-  border: 2px solid #0e1524;
+  border: 2px solid #0b0e0d;
+}
+
+/* universal press feedback — a registered click is always visible */
+button {
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease,
+    opacity 0.15s ease, transform 0.06s ease;
+}
+button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+button:disabled {
+  cursor: not-allowed;
+}
+
+/* keyboard focus — amber outline everywhere */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid #ffb000;
+  outline-offset: 2px;
 }
 
 @layer components {
   .card {
-    @apply bg-panel border border-line rounded-md shadow-card;
+    @apply bg-panel border border-line;
+  }
+  /* amber bracket corners — the page's ONE hero panel (launchpad .panel.brk) */
+  .card-brk {
+    @apply relative;
+  }
+  .card-brk::before,
+  .card-brk::after {
+    content: "";
+    position: absolute;
+    width: 11px;
+    height: 11px;
+    pointer-events: none;
+  }
+  .card-brk::before {
+    top: -1px;
+    left: -1px;
+    border-top: 2px solid #ffb000;
+    border-left: 2px solid #ffb000;
+  }
+  .card-brk::after {
+    bottom: -1px;
+    right: -1px;
+    border-bottom: 2px solid #ffb000;
+    border-right: 2px solid #ffb000;
   }
   .btn {
-    @apply inline-flex items-center gap-2 px-4 py-2 rounded font-medium text-sm
-      transition-colors duration-150 cursor-pointer select-none
-      disabled:opacity-40 disabled:cursor-not-allowed;
+    @apply inline-flex items-center gap-2 px-4 py-2 font-mono text-[11px] tracking-[0.08em]
+      border border-line2 text-text bg-transparent cursor-pointer select-none
+      hover:border-faint disabled:opacity-45 disabled:cursor-not-allowed;
   }
   .btn-primary {
-    @apply btn bg-green text-bg hover:bg-[#b8ec5e] shadow-glow;
+    @apply btn bg-amber border-amber text-[#161207] font-semibold
+      hover:bg-[#ffc23d] hover:border-[#ffc23d] active:bg-[#d99600];
   }
   .btn-ghost {
-    @apply btn bg-panel2 text-text border border-line hover:border-muted;
+    @apply btn;
   }
   .btn-danger {
-    @apply btn bg-transparent text-red border border-red/50 hover:bg-red/10;
+    @apply btn text-critText border-crit/50 hover:bg-crit/10 hover:border-crit/50;
   }
   .input {
-    @apply bg-bg border border-line rounded px-3 py-2 text-sm text-text w-full
-      placeholder:text-muted/60 focus:outline-none focus:border-cyan;
+    @apply bg-well border border-line2 px-3 py-2 text-[13px] text-text w-full
+      placeholder:text-faint focus:outline-none focus:border-amber;
   }
   .label {
-    @apply block text-xs uppercase tracking-widest text-muted mb-1.5;
+    @apply block font-mono text-[9.5px] uppercase tracking-[0.18em] text-faint mb-1.5;
   }
   .section-title {
-    @apply text-xs uppercase tracking-[0.2em] text-muted font-semibold;
+    @apply text-xs font-bold tracking-[0.09em] [font-stretch:112%] text-text uppercase;
   }
   .th {
-    @apply text-left text-xs uppercase tracking-wider text-muted font-medium
-      px-4 py-2.5 border-b border-line whitespace-nowrap;
+    @apply text-left font-mono text-[9.5px] uppercase tracking-[0.16em] text-faint font-medium
+      px-3.5 py-2 border-b border-line whitespace-nowrap;
   }
   .td {
-    @apply px-4 py-2.5 border-b border-line/60 text-sm align-top;
+    @apply px-3.5 py-2.5 border-b border-grid text-[12.5px] text-muted align-top;
+  }
+  tr:hover > .td {
+    background: rgba(255, 255, 255, 0.018);
   }
   .prose-dark h1, .prose-dark h2, .prose-dark h3, .prose-dark h4 {
-    @apply text-text font-semibold mt-5 mb-2;
+    @apply text-text font-bold mt-5 mb-2;
   }
   .prose-dark h1 { @apply text-xl border-b border-line pb-2; }
-  .prose-dark h2 { @apply text-lg; }
+  .prose-dark h2 { @apply text-lg border-b border-line pb-1; }
   .prose-dark h3 { @apply text-base; }
   .prose-dark p { @apply my-2 leading-relaxed text-sm text-text/90; }
   .prose-dark ul, .prose-dark ol { @apply my-2 pl-5 text-sm space-y-1; }
   .prose-dark ul { @apply list-disc; }
   .prose-dark ol { @apply list-decimal; }
+  .prose-dark strong { @apply text-amber font-bold; }
   .prose-dark code {
-    @apply font-mono text-[0.85em] bg-panel2 border border-line rounded px-1 py-0.5 text-cyan;
+    @apply font-mono text-[0.85em] bg-codebg border border-grid px-1 py-0.5 text-text;
   }
   .prose-dark pre {
-    @apply bg-bg border border-line rounded-md p-3 my-3 overflow-x-auto;
+    @apply bg-codebg border border-grid p-3 my-3 overflow-x-auto;
   }
-  .prose-dark pre code { @apply bg-transparent border-0 p-0 text-text/90; }
-  .prose-dark a { @apply text-cyan underline decoration-cyan/40; }
-  .prose-dark blockquote { @apply border-l-2 border-green/60 pl-3 my-2 text-muted; }
+  .prose-dark pre code { @apply bg-transparent border-0 p-0 text-muted; }
+  .prose-dark a { @apply text-s1 underline underline-offset-2 decoration-s1/40; }
+  .prose-dark blockquote { @apply border-l-2 border-amber pl-3 my-2 text-muted; }
   .prose-dark table { @apply my-3 w-full text-sm; }
-  .prose-dark th, .prose-dark td { @apply border border-line px-2 py-1 text-left; }
+  .prose-dark th {
+    @apply border border-line px-2 py-1 text-left font-mono text-[10px] uppercase
+      tracking-[0.1em] text-faint bg-panel2 font-medium;
+  }
+  .prose-dark td { @apply border border-line px-2 py-1 text-left; }
+  .prose-dark input[type="checkbox"] { accent-color: #ffb000; }
 }
 
 @keyframes pulse-dot {
@@ -97,4 +168,18 @@ body {
 }
 .pulse-dot {
   animation: pulse-dot 1.4s ease-in-out infinite;
+}
+
+/* panel entrance (launchpad .view rise) */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: none; }
+}
+.card {
+  animation: rise 0.5s cubic-bezier(0.22, 0.9, 0.3, 1) both;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
 }

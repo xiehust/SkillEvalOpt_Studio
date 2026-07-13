@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 import { api, ApiError, BackendStatus, SkillInfo } from "../api";
 import { BackendSelect, ErrorBanner, Mono, SourceTag, Spinner } from "./ui";
 
@@ -8,6 +9,7 @@ import { BackendSelect, ErrorBanner, Mono, SourceTag, Spinner } from "./ui";
  * 生成结果不直接落库——作业完成后在详情页审阅,再导入手动编辑器保存。
  */
 export default function GenerateTaskSetForm() {
+  const { t } = useTranslation("wizards");
   const navigate = useNavigate();
   const [skills, setSkills] = useState<SkillInfo[] | null>(null);
   const [backends, setBackends] = useState<BackendStatus[] | null>(null);
@@ -57,19 +59,19 @@ export default function GenerateTaskSetForm() {
   const onSubmit = async (event: FormEvent) => {
     event.preventDefault();
     if (!skillId) {
-      setFormError("请先选择要生成任务的技能。");
+      setFormError(t("taskgen.errNoSkill"));
       return;
     }
     if (count < 1 || count > 30) {
-      setFormError("生成数量需在 1-30 之间。");
+      setFormError(t("taskgen.errCountRange", { min: 1, max: 30 }));
       return;
     }
     if (timeout_ < 60 || timeout_ > 3600) {
-      setFormError("超时需在 60-3600 秒之间。");
+      setFormError(t("taskgen.errTimeoutRange", { min: 60, max: 3600 }));
       return;
     }
     if (!backendAvailable) {
-      setFormError("所选执行后端的 CLI 未安装,无法提交。");
+      setFormError(t("taskgen.errBackendUnavailable"));
       return;
     }
     setFormError(null);
@@ -96,21 +98,20 @@ export default function GenerateTaskSetForm() {
   return (
     <form onSubmit={onSubmit} noValidate className="space-y-4" data-testid="taskset-generate-form">
       <p className="text-xs text-muted">
-        由 AI agent 阅读所选技能后自动撰写评估任务。生成结果<b>不会直接保存</b>:作业完成后在详情页审阅,
-        点击“导入为新任务集”进入手动编辑器确认再保存。
+        {t("taskgen.introPre")}<b>{t("taskgen.introBold")}</b>{t("taskgen.introPost")}
       </p>
 
       <div>
-        <label className="label">待评估技能</label>
+        <label className="label">{t("taskgen.skillLabel")}</label>
         {skills.length === 0 ? (
           <div className="text-sm text-muted">
-            还没有技能——先到<Link to="/skills" className="text-cyan mx-1">技能库</Link>上传一个。
+            {t("taskgen.noSkillPre")}<Link to="/skills" className="text-s1 mx-1">{t("picker.skillLibraryLink")}</Link>{t("taskgen.noSkillPost")}
           </div>
         ) : (
           <>
             <input
               className="input max-w-sm mb-2"
-              placeholder="搜索技能…"
+              placeholder={t("picker.searchSkillPlaceholder")}
               value={skillQuery}
               onChange={(event) => setSkillQuery(event.target.value)}
               data-testid="gen-skill-search"
@@ -120,14 +121,14 @@ export default function GenerateTaskSetForm() {
                 <label
                   key={skill.id}
                   data-skill-option={skill.id}
-                  className={`flex items-start gap-2.5 p-2.5 rounded border cursor-pointer transition-colors ${
-                    skillId === skill.id ? "border-green bg-green/5" : "border-line bg-panel2 hover:border-muted"
+                  className={`flex items-start gap-2.5 p-2.5 border cursor-pointer transition-colors ${
+                    skillId === skill.id ? "border-amber bg-amber/[.13]" : "border-line bg-panel2 hover:border-faint"
                   }`}
                 >
                   <input
                     type="radio"
                     name="gen-skill"
-                    className="mt-1 accent-[#A6DB4C]"
+                    className="mt-1 accent-amber"
                     checked={skillId === skill.id}
                     onChange={() => setSkillId(skill.id)}
                   />
@@ -141,7 +142,7 @@ export default function GenerateTaskSetForm() {
                 </label>
               ))}
               {filteredSkills.length === 0 && (
-                <div className="text-sm text-muted col-span-full py-4">没有匹配的技能。</div>
+                <div className="text-sm text-muted col-span-full py-4">{t("picker.noSkillMatch")}</div>
               )}
             </div>
           </>
@@ -151,11 +152,11 @@ export default function GenerateTaskSetForm() {
       <div className="grid gap-4 md:grid-cols-2">
         <BackendSelect value={targetBackend} onChange={applyBackend} statuses={backends} />
         <div>
-          <label className="label">模型(可选)</label>
+          <label className="label">{t("taskgen.modelLabel")}</label>
           <input
             className="input"
             value={model}
-            placeholder={targetBackend === "codex_exec" ? "留空 = codex CLI 配置的默认模型" : "模型 ID"}
+            placeholder={targetBackend === "codex_exec" ? t("taskgen.modelPlaceholderCodex") : t("taskgen.modelPlaceholderDefault")}
             onChange={(event) => setModel(event.target.value)}
             data-testid="gen-model"
           />
@@ -164,7 +165,7 @@ export default function GenerateTaskSetForm() {
 
       <div className="grid gap-4 md:grid-cols-2">
         <div>
-          <label className="label">生成数量(1-30)</label>
+          <label className="label">{t("taskgen.countLabel", { min: 1, max: 30 })}</label>
           <input
             type="number"
             className="input"
@@ -174,7 +175,7 @@ export default function GenerateTaskSetForm() {
           />
         </div>
         <div>
-          <label className="label">超时(秒,60-3600)</label>
+          <label className="label">{t("taskgen.timeoutLabel", { min: 60, max: 3600 })}</label>
           <input
             type="number"
             className="input"
@@ -186,11 +187,11 @@ export default function GenerateTaskSetForm() {
       </div>
 
       <div>
-        <label className="label">生成指引(可选)</label>
+        <label className="label">{t("taskgen.guidanceLabel")}</label>
         <textarea
           className="input text-sm min-h-[64px]"
           value={guidance}
-          placeholder="例如:侧重边界场景;任务需要读取输入文件;难度递进"
+          placeholder={t("taskgen.guidancePlaceholder")}
           onChange={(event) => setGuidance(event.target.value)}
           data-testid="gen-guidance"
         />
@@ -203,7 +204,7 @@ export default function GenerateTaskSetForm() {
       )}
 
       <button type="submit" className="btn-primary" disabled={submitting} data-testid="taskset-generate-submit">
-        {submitting ? "提交中…" : "开始生成"}
+        {submitting ? t("taskgen.submitting") : t("taskgen.submit")}
       </button>
     </form>
   );

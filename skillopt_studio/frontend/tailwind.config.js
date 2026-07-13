@@ -4,32 +4,42 @@ export default {
   theme: {
     extend: {
       colors: {
-        // SkillOpt PPT palette — single source of truth for the studio theme
-        bg: "#0E1524",
-        panel: "#18212F",
-        panel2: "#1E2938",
-        line: "#2A3647",
-        green: "#A6DB4C",
-        cyan: "#56C7D6",
-        amber: "#F0B43C",
-        red: "#E86A50",
-        purple: "#A98BE0",
-        text: "#EAF0F7",
-        muted: "#94A3B7",
+        // Launchpad palette — mirrors agentcore_launchpad tokens.css 1:1.
+        bg: "#0B0E0D", // page plane
+        panel: "#141816", // card / panel surface (palette validated against this)
+        panel2: "#191E1B", // raised surface
+        line: "#232B27", // hairline
+        line2: "#2E3833", // stronger borders (buttons, inputs)
+        grid: "#212823", // table row hairlines
+        well: "#0E1210", // input / search / code-well bg
+        codebg: "#0A0D0C", // code blocks
+        text: "#E9EDEA", // primary ink
+        muted: "#A3ACA6", // secondary ink
+        faint: "#69736C", // muted ink — labels/meta only, not body text
+        amber: "#FFB000", // brand signal — chrome only, never a data series
+        s1: "#3987E5", // series 1 blue / links / info
+        s2: "#199E70", // series 2 aqua
+        s3: "#C98500", // series 3 yellow
+        s5: "#9085E9", // series 5 violet
+        good: "#0CA30C",
+        warn: "#FAB219",
+        serious: "#EC835A",
+        crit: "#D03B3B", // error fills/borders only
+        critText: "#DD5252", // error TEXT on panel: 4.61:1 (AA)
       },
       fontFamily: {
         mono: [
           '"IBM Plex Mono"', "ui-monospace", "SFMono-Regular", "Menlo",
-          '"Cascadia Mono"', '"Noto Sans Mono CJK SC"', "monospace",
+          '"Noto Sans Mono CJK SC"', "monospace",
         ],
         sans: [
-          '"Avenir Next"', "Seravek", '"Gill Sans"', "ui-sans-serif",
+          '"Archivo Variable"', '"Archivo"', "system-ui",
           '"PingFang SC"', '"Noto Sans CJK SC"', '"Microsoft YaHei"', "sans-serif",
         ],
       },
       boxShadow: {
-        glow: "0 0 12px rgba(166, 219, 76, 0.25)",
-        card: "0 1px 0 rgba(255,255,255,0.03) inset, 0 8px 24px rgba(0,0,0,0.35)",
+        glow: "0 0 0 1px #FFB000, 0 12px 40px -18px rgba(255, 176, 0, 0.35)",
+        card: "none",
       },
     },
   },

@@ -1,0 +1,56 @@
+{
+  "title": "总览",
+  "sub": "SkillEval&Opt Studio — 技能评估与训练操作台",
+  "autoRetry": "每 3 秒自动重试",
+  "firstEval": "发起第一次评估",
+  "resources": {
+    "skills": "技能",
+    "tasksets": "任务集",
+    "jobs": "累计任务"
+  },
+  "running": {
+    "elapsed": "已运行 {{duration}}"
+  },
+  "skillHealth": {
+    "title": "技能健康",
+    "empty": {
+      "title": "还没有评估记录",
+      "hint": "发起一次评估后,每个技能的通过率和趋势会显示在这里。"
+    },
+    "runsSummary": "{{runs}} 次评估 · 最近 {{time}}"
+  },
+  "trainGains": {
+    "title": "训练收益",
+    "empty": {
+      "title": "还没有完成的训练",
+      "hint": "训练完成后,baseline → best 的分数提升会显示在这里。"
+    },
+    "summary": "接受 {{accepts}} · 拒绝 {{rejects}} · {{time}}"
+  },
+  "tokens": {
+    "title": "Token 消耗(已完成任务)",
+    "today": "今日",
+    "total": "累计",
+    "note": "口径:评估 = 执行 agent + LLM 判分;训练 = 优化器 + rollout 执行 agent;旧任务未记录 token 的不计入。"
+  },
+  "failures": {
+    "title": "最近失败"
+  },
+  "recent": {
+    "title": "近期任务",
+    "empty": {
+      "title": "还没有任务",
+      "hint": "从技能库选择一个技能,再发起评估或训练,任务会出现在这里。"
+    },
+    "cols": {
+      "id": "任务 ID",
+      "type": "类型",
+      "skill": "技能",
+      "status": "状态",
+      "passRate": "通过率",
+      "duration": "耗时",
+      "tokens": "Token 消耗",
+      "createdAt": "创建时间"
+    }
+  }
+}

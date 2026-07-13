@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 
 export const EXAMPLE_JSON = `[
   {
@@ -15,16 +16,17 @@ export const EXAMPLE_JSON = `[
   }
 ]`;
 
-const FIELDS: { name: string; required: string; desc: string }[] = [
-  { name: "id", required: "必填", desc: "唯一且文件系统安全(不能包含 / \\ ..),将用作任务工作目录名,建议 task_001 风格" },
-  { name: "question", required: "必填", desc: "给被评估 agent 的任务文本(agent 看得到技能与该文本,看不到 rubric)" },
-  { name: "rubric", required: "必填", desc: "LLM 判分的验收标准,必须客观可判定(如具体数值、文件名、必须包含的内容),避免“质量好”类模糊描述" },
-  { name: "files", required: "可选", desc: "{相对路径: 文本内容},会预置到 agent 的工作目录(任务需要输入数据时用它内联提供)" },
-  { name: "task_type", required: "可选", desc: "分组键,用于结果按类型汇总,默认 default" },
+const FIELDS: { name: string; required: "yes" | "no"; descKey: string }[] = [
+  { name: "id", required: "yes", descKey: "id" },
+  { name: "question", required: "yes", descKey: "question" },
+  { name: "rubric", required: "yes", descKey: "rubric" },
+  { name: "files", required: "no", descKey: "files" },
+  { name: "task_type", required: "no", descKey: "task_type" },
 ];
 
 /** Collapsible JSON schema documentation for skilleval task files. */
 export default function TaskSetFormatDoc() {
+  const { t } = useTranslation("tasksets");
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
 
@@ -39,42 +41,41 @@ export default function TaskSetFormatDoc() {
   };
 
   return (
-    <div className="rounded border border-line bg-panel2/40" data-testid="format-doc">
+    <div className="border border-line bg-panel2/40" data-testid="format-doc">
       <button
         type="button"
-        className="w-full px-3 py-2 text-left text-sm text-cyan hover:text-text flex items-center gap-2"
+        className="w-full px-3 py-2 text-left text-sm text-amber hover:text-text flex items-center gap-2"
         onClick={() => setOpen((v) => !v)}
         data-testid="format-doc-toggle"
       >
         <span className="text-xs">{open ? "▾" : "▸"}</span>
-        查看 JSON 格式说明
+        {t("formatDoc.toggle")}
       </button>
       {open && (
         <div className="px-3 pb-3 space-y-3" data-testid="format-doc-body">
           <p className="text-xs text-muted">
-            任务文件是一个 JSON 数组(上传时也接受每行一个对象的 JSONL),每个元素是一个任务。
-            split 模式则是 train / val / test 三个相同 schema 的文件。
+            {t("formatDoc.intro")}
           </p>
           <table className="w-full text-xs">
             <thead>
               <tr>
-                <th className="th !py-1">字段</th>
-                <th className="th !py-1">必填</th>
-                <th className="th !py-1">说明</th>
+                <th className="th !py-1">{t("formatDoc.table.field")}</th>
+                <th className="th !py-1">{t("formatDoc.table.required")}</th>
+                <th className="th !py-1">{t("formatDoc.table.desc")}</th>
               </tr>
             </thead>
             <tbody>
               {FIELDS.map((field) => (
                 <tr key={field.name}>
-                  <td className="td !py-1 font-mono text-green">{field.name}</td>
-                  <td className="td !py-1">{field.required}</td>
-                  <td className="td !py-1 text-muted">{field.desc}</td>
+                  <td className="td !py-1 font-mono text-s2">{field.name}</td>
+                  <td className="td !py-1">{t(`formatDoc.required.${field.required}`)}</td>
+                  <td className="td !py-1 text-muted">{t(`formatDoc.fields.${field.descKey}`)}</td>
                 </tr>
               ))}
             </tbody>
           </table>
           <div className="relative">
-            <pre className="rounded bg-bg/80 border border-line p-3 text-[11px] leading-relaxed overflow-x-auto font-mono text-text/90">
+            <pre className="bg-codebg border border-grid p-3 text-[11px] leading-relaxed overflow-x-auto font-mono text-text/90">
               {EXAMPLE_JSON}
             </pre>
             <button
@@ -83,7 +84,7 @@ export default function TaskSetFormatDoc() {
               onClick={copyExample}
               data-testid="format-doc-copy"
             >
-              {copied ? "已复制 ✓" : "复制示例"}
+              {copied ? t("formatDoc.copied") : t("formatDoc.copy")}
             </button>
           </div>
         </div>

@@ -1,0 +1,37 @@
+{
+  "header": {
+    "title": "技能库",
+    "sub": "扫描本机 claude / codex / kiro / agents 四个技能源,以及 Studio 上传的技能"
+  },
+  "upload": {
+    "button": "上传技能 zip",
+    "uploading": "上传中…",
+    "tooLarge": "zip 为 {{size}}MB,超过 50MB 上限。",
+    "success": "已上传技能 {{name}}"
+  },
+  "search": {
+    "placeholder": "搜索技能名称 / ID / 描述…"
+  },
+  "empty": {
+    "noMatchTitle": "没有匹配的技能",
+    "noMatchHint": "换个关键词试试。",
+    "noSkillsTitle": "没有发现技能",
+    "noSkillsHint": "四个本机技能源中都没有含 SKILL.md 的目录,可以先上传一个技能 zip。"
+  },
+  "card": {
+    "count": "{{n}} 个技能",
+    "filesChip": "{{n}} 文件",
+    "noDescription": "(无描述)"
+  },
+  "detail": {
+    "titleFallback": "技能详情",
+    "evaluate": "评估此技能",
+    "train": "训练此技能",
+    "back": "返回技能库",
+    "backToSkillMd": "返回 SKILL.md",
+    "binary": "二进制文件({{size}}),无法预览 —— 请使用右上角「下载」。",
+    "truncated": "文件过大,预览已截断({{size}})—— 完整内容请下载。",
+    "fileTree": "文件树({{n}})",
+    "previewTitle": "点击预览"
+  }
+}

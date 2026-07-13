@@ -1,0 +1,47 @@
+{
+  "status": {
+    "queued": "Queued",
+    "running": "Running",
+    "succeeded": "Succeeded",
+    "failed": "Failed",
+    "cancelled": "Cancelled"
+  },
+  "jobType": {
+    "eval": "Eval",
+    "train": "Train",
+    "taskgen": "Task Gen",
+    "echo": "Echo"
+  },
+  "source": {
+    "sample": "built-in sample",
+    "claudePlugins": "claude plugin"
+  },
+  "loading": "Loading…",
+  "errorPrefix": "Error:",
+  "emptyGlyph": "∅",
+  "actions": {
+    "cancel": "Cancel",
+    "delete": "Delete",
+    "download": "Download",
+    "back": "Back",
+    "save": "Save",
+    "evaluate": "Evaluate",
+    "train": "Train"
+  },
+  "confirmCancelJob": "Cancel job {{id}}?",
+  "backendSelect": {
+    "label": "Execution backend",
+    "detected": "✓ Detected {{cli}} CLI: ",
+    "notDetected": "✗ {{cli}} CLI not detected — install and log in first, or the submission will be rejected.",
+    "notDetectedSuffix": " (CLI not detected)",
+    "hint": "Auto-recommended by skill source: codex-sourced skills default to the Codex backend."
+  },
+  "pagination": {
+    "total": "{{total}} total",
+    "perPage": "{{size}} / page",
+    "prev": "Prev",
+    "next": "Next",
+    "pageOf": "Page {{page}} / {{pageCount}}"
+  },
+  "networkError": "Cannot reach the backend service"
+}

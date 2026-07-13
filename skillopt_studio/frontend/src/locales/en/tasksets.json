@@ -1,0 +1,121 @@
+{
+  "list": {
+    "title": "Task Sets",
+    "subtitle": "skilleval task files (each task carries its own rubric); strict validation runs before saving",
+    "newTaskset": "New Task Set",
+    "hideForm": "Hide Form",
+    "empty": {
+      "title": "No task sets yet",
+      "hint": "Upload a tasks.json, or enter tasks one by one under \"New Task Set\" (each with id / question / rubric)."
+    },
+    "table": {
+      "name": "Name",
+      "mode": "Mode",
+      "count": "Tasks",
+      "distribution": "Distribution",
+      "created": "Created",
+      "updated": "Updated"
+    },
+    "modeCell": {
+      "single": "single (single file)",
+      "split": "split (pre-split)"
+    },
+    "createTabs": {
+      "upload": "Upload JSON File",
+      "manual": "Enter Manually",
+      "generate": "AI Generate"
+    },
+    "form": {
+      "name": "Name",
+      "namePlaceholder": "e.g. Report-generation regression set",
+      "nameRequired": "Please enter a task set name"
+    },
+    "upload": {
+      "mode": "Mode",
+      "modeSingle": "single — one tasks.json (auto-split by ratio during training)",
+      "modeSplit": "split — pre-split train / val / test",
+      "optionalSuffix": " (optional)",
+      "missingFiles": "Missing files: {{files}}"
+    },
+    "manual": {
+      "hint": "Manual entry creates a single-mode task set (auto-split by ratio during training); for pre-split train / val / test, use file upload instead."
+    },
+    "importNotice": "Imported {{count}} AI-generated tasks — review before saving"
+  },
+  "saveBtn": {
+    "idle": "Validate & Save",
+    "saving": "Validating & saving…"
+  },
+  "detail": {
+    "titleFallback": "Task Set Detail",
+    "subtitle": "Mode {{mode}} · {{count}} tasks total",
+    "editingSuffix": " (editing)",
+    "previewSuffix": " (up to 20 previewed per split)",
+    "sampleReadonly": " · built-in sample is read-only; save a copy to edit",
+    "editBtn": "Edit Task Set",
+    "loadingFull": "Loading all tasks…",
+    "saveCopyBtn": "Save as My Task Set",
+    "copying": "Copying…",
+    "backToTasksets": "Back to Task Sets",
+    "copyPrompt": "New task set name:",
+    "copySuffix": "copy",
+    "discardConfirm": "Discard unsaved changes?",
+    "nameEmpty": "Name cannot be empty",
+    "tasksetEmpty": "Task set cannot be empty",
+    "splitPrefix": "{{split}}: {{message}}",
+    "savedNotice": "Saved ({{time}}) — edits affect future eval/train runs that use this task set",
+    "editCardTitle": "Edit Task Set",
+    "nameLabel": "Name",
+    "tasksLabel": "Task list",
+    "splitGroup": "{{split}} split",
+    "emptyToDelete": " (clear all tasks and save = delete this split)",
+    "addTest": "+ Add test split",
+    "splitCardTitle": "{{split}} ({{count}} tasks)",
+    "table": {
+      "id": "ID",
+      "type": "Type",
+      "question": "Question",
+      "rubric": "Rubric"
+    }
+  },
+  "deleteConfirm": "Delete task set {{id}}?",
+  "editor": {
+    "idPlaceholder": "id (e.g. task_001)",
+    "typePlaceholder": "task_type (optional)",
+    "filesBadge": "{{count}} file(s) attached",
+    "questionPlaceholder": "question — task text shown to the evaluated agent",
+    "rubricPlaceholder": "rubric — objective, checkable acceptance criteria (scoring basis)",
+    "addTask": "+ Add task",
+    "errors": {
+      "idEmpty": "id cannot be empty",
+      "idUnsafe": "id cannot contain /, \\ or .. (used as a directory name)",
+      "idDuplicate": "id \"{{id}}\" duplicates row {{line}}",
+      "questionEmpty": "question cannot be empty",
+      "rubricEmpty": "rubric cannot be empty",
+      "atLeastOne": "At least 1 task is required",
+      "rowPrefix": "Row {{line}}: {{message}}"
+    }
+  },
+  "formatDoc": {
+    "toggle": "View JSON format spec",
+    "intro": "A task file is a JSON array (JSONL, one object per line, is also accepted on upload); each element is one task. In split mode it is three files — train / val / test — with the same schema.",
+    "table": {
+      "field": "Field",
+      "required": "Required",
+      "desc": "Description"
+    },
+    "required": {
+      "yes": "Required",
+      "no": "Optional"
+    },
+    "fields": {
+      "id": "Unique and filesystem-safe (no / \\ ..); used as the task working-directory name, task_001 style recommended",
+      "question": "Task text shown to the evaluated agent (the agent sees the skill and this text, but not the rubric)",
+      "rubric": "Acceptance criteria for the LLM judge; must be objectively checkable (e.g. specific values, file names, required content), avoid vague descriptions like \"good quality\"",
+      "files": "{relative path: text content}, pre-seeded into the agent's working directory (use it to inline input data the task needs)",
+      "task_type": "Grouping key for aggregating results by type; defaults to default"
+    },
+    "copy": "Copy example",
+    "copied": "Copied ✓"
+  }
+}

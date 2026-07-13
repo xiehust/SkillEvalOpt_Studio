@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 import { api, ApiError, TaskItem, TaskSetInfo } from "../api";
 import GenerateTaskSetForm from "../components/GenerateTaskSetForm";
 import TaskItemsEditor, { emptyItem, validateItems } from "../components/TaskItemsEditor";
@@ -12,6 +13,7 @@ interface ImportState {
 }
 
 export default function TaskSets() {
+  const { t } = useTranslation("tasksets");
   const location = useLocation();
   const navigate = useNavigate();
   const [tasksets, setTasksets] = useState<TaskSetInfo[] | null>(null);
@@ -46,7 +48,7 @@ export default function TaskSets() {
   }, [location.state]);
 
   const onDelete = async (id: string) => {
-    if (!window.confirm(`确定删除任务集 ${id} 吗?`)) return;
+    if (!window.confirm(t("deleteConfirm", { id }))) return;
     try {
       await api.deleteTaskset(id);
       await reload();
@@ -58,11 +60,11 @@ export default function TaskSets() {
   return (
     <div>
       <PageHeader
-        title="任务集"
-        sub="skilleval 任务文件(每个任务自带 rubric 判分标准),保存前会做严格校验"
+        title={t("list.title")}
+        sub={t("list.subtitle")}
         actions={
           <button className="btn-primary" onClick={() => setShowForm((visible) => !visible)}>
-            {showForm ? "收起表单" : "新建任务集"}
+            {showForm ? t("list.hideForm") : t("list.newTaskset")}
           </button>
         }
       />
@@ -78,10 +80,10 @@ export default function TaskSets() {
       {tasksets === null && !error && <Spinner />}
       {tasksets !== null && tasksets.length === 0 && (
         <EmptyState
-          title="还没有任务集"
-          hint='上传一个 tasks.json,或在“新建任务集”里手动逐条输入(每项含 id / question / rubric)。'
+          title={t("list.empty.title")}
+          hint={t("list.empty.hint")}
           action={
-            <button className="btn-primary" onClick={() => setShowForm(true)}>新建任务集</button>
+            <button className="btn-primary" onClick={() => setShowForm(true)}>{t("list.newTaskset")}</button>
           }
         />
       )}
@@ -92,12 +94,12 @@ export default function TaskSets() {
             <table className="w-full">
               <thead>
                 <tr>
-                  <th className="th">名称</th>
-                  <th className="th">模式</th>
-                  <th className="th">任务数</th>
-                  <th className="th">分布</th>
-                  <th className="th">创建时间</th>
-                  <th className="th">更新时间</th>
+                  <th className="th">{t("list.table.name")}</th>
+                  <th className="th">{t("list.table.mode")}</th>
+                  <th className="th">{t("list.table.count")}</th>
+                  <th className="th">{t("list.table.distribution")}</th>
+                  <th className="th">{t("list.table.created")}</th>
+                  <th className="th">{t("list.table.updated")}</th>
                   <th className="th"></th>
                 </tr>
               </thead>
@@ -106,7 +108,7 @@ export default function TaskSets() {
                   <tr key={taskset.id} className="hover:bg-panel2/40" data-taskset-id={taskset.id}>
                     <td className="td">
                       <span className="flex items-center gap-2">
-                        <Link to={`/tasksets/${encodeURIComponent(taskset.id)}`} className="text-cyan hover:underline">
+                        <Link to={`/tasksets/${encodeURIComponent(taskset.id)}`} className="text-s1 hover:underline">
                           {taskset.name}
                         </Link>
                         {taskset.sample && <SampleTag />}
@@ -114,7 +116,7 @@ export default function TaskSets() {
                       <Mono className="block text-[11px] text-muted/70">{taskset.id}</Mono>
                     </td>
                     <td className="td">
-                      <Mono className="text-xs">{taskset.mode === "single" ? "single(单文件)" : "split(预分割)"}</Mono>
+                      <Mono className="text-xs">{taskset.mode === "single" ? t("list.modeCell.single") : t("list.modeCell.split")}</Mono>
                     </td>
                     <td className="td"><Mono>{taskset.task_count}</Mono></td>
                     <td className="td">
@@ -131,7 +133,7 @@ export default function TaskSets() {
                     <td className="td text-right">
                       {!taskset.sample && (
                         <button className="btn-danger !px-2 !py-1 text-xs" onClick={() => onDelete(taskset.id)}>
-                          删除
+                          {t("common:actions.delete")}
                         </button>
                       )}
                     </td>
@@ -148,10 +150,10 @@ export default function TaskSets() {
 
 type CreateTab = "upload" | "manual" | "generate";
 
-const CREATE_TABS: { key: CreateTab; label: string }[] = [
-  { key: "upload", label: "上传 JSON 文件" },
-  { key: "manual", label: "手动逐条输入" },
-  { key: "generate", label: "AI 自动生成" },
+const CREATE_TABS: { key: CreateTab; labelKey: string }[] = [
+  { key: "upload", labelKey: "list.createTabs.upload" },
+  { key: "manual", labelKey: "list.createTabs.manual" },
+  { key: "generate", labelKey: "list.createTabs.generate" },
 ];
 
 function CreateTaskSetForm({
@@ -161,6 +163,7 @@ function CreateTaskSetForm({
   onCreated: () => void;
   imported: { items: TaskItem[]; name: string } | null;
 }) {
+  const { t } = useTranslation("tasksets");
   const [tab, setTab] = useState<CreateTab>(imported ? "manual" : "upload");
   const [name, setName] = useState(imported?.name ?? "");
 
@@ -172,7 +175,7 @@ function CreateTaskSetForm({
   }, [imported]);
 
   return (
-    <Card title="新建任务集" className="mb-6">
+    <Card title={t("list.newTaskset")} className="mb-6">
       <div className="space-y-4">
         <div className="flex gap-2" data-testid="taskset-tabs">
           {CREATE_TABS.map((entry) => (
@@ -187,7 +190,7 @@ function CreateTaskSetForm({
               onClick={() => setTab(entry.key)}
               data-testid={`taskset-tab-${entry.key}`}
             >
-              {entry.label}
+              {t(entry.labelKey)}
             </button>
           ))}
         </div>
@@ -195,11 +198,11 @@ function CreateTaskSetForm({
         {tab !== "generate" && (
           <>
             <div>
-              <label className="label">名称</label>
+              <label className="label">{t("list.form.name")}</label>
               <input
                 className="input"
                 value={name}
-                placeholder="例如:报表生成回归集"
+                placeholder={t("list.form.namePlaceholder")}
                 onChange={(event) => setName(event.target.value)}
                 data-testid="taskset-name"
               />
@@ -219,6 +222,7 @@ function CreateTaskSetForm({
 }
 
 function UploadTaskSetForm({ name, onCreated }: { name: string; onCreated: () => void }) {
+  const { t } = useTranslation("tasksets");
   const [mode, setMode] = useState<"single" | "split">("single");
   const [files, setFiles] = useState<Record<string, File>>({});
   const [submitting, setSubmitting] = useState(false);
@@ -237,13 +241,13 @@ function UploadTaskSetForm({ name, onCreated }: { name: string; onCreated: () =>
     event.preventDefault();
     setFormError(null);
     if (!name.trim()) {
-      setFormError("请填写任务集名称");
+      setFormError(t("list.form.nameRequired"));
       return;
     }
     const required = mode === "single" ? ["tasks"] : ["train", "val"];
     const missing = required.filter((key) => !files[key]);
     if (missing.length > 0) {
-      setFormError(`缺少文件:${missing.join("、")}`);
+      setFormError(t("list.upload.missingFiles", { files: missing.join("、") }));
       return;
     }
     setSubmitting(true);
@@ -263,14 +267,14 @@ function UploadTaskSetForm({ name, onCreated }: { name: string; onCreated: () =>
   return (
     <form onSubmit={onSubmit} noValidate className="space-y-4" data-testid="taskset-form">
       <div>
-        <label className="label">模式</label>
+        <label className="label">{t("list.upload.mode")}</label>
         <select
           className="input"
           value={mode}
           onChange={(event) => setMode(event.target.value as "single" | "split")}
         >
-          <option value="single">single — 单个 tasks.json(训练时按比例自动分割)</option>
-          <option value="split">split — 预分割 train / val / test</option>
+          <option value="single">{t("list.upload.modeSingle")}</option>
+          <option value="split">{t("list.upload.modeSplit")}</option>
         </select>
       </div>
 
@@ -290,7 +294,7 @@ function UploadTaskSetForm({ name, onCreated }: { name: string; onCreated: () =>
           {(["train", "val", "test"] as const).map((split) => (
             <div key={split}>
               <label className="label">
-                {split}.json{split === "test" ? "(可选)" : ""}
+                {split}.json{split === "test" ? t("list.upload.optionalSuffix") : ""}
               </label>
               <input
                 type="file"
@@ -311,7 +315,7 @@ function UploadTaskSetForm({ name, onCreated }: { name: string; onCreated: () =>
       )}
 
       <button type="submit" className="btn-primary" disabled={submitting} data-testid="taskset-submit">
-        {submitting ? "校验并保存中…" : "校验并保存"}
+        {submitting ? t("saveBtn.saving") : t("saveBtn.idle")}
       </button>
     </form>
   );
@@ -326,6 +330,7 @@ function ManualTaskSetForm({
   onCreated: () => void;
   importedItems: TaskItem[] | null;
 }) {
+  const { t } = useTranslation("tasksets");
   const [items, setItems] = useState<TaskItem[]>(() =>
     importedItems?.length ? importedItems : [emptyItem([])],
   );
@@ -340,7 +345,7 @@ function ManualTaskSetForm({
     event.preventDefault();
     setFormError(null);
     if (!name.trim()) {
-      setFormError("请填写任务集名称");
+      setFormError(t("list.form.nameRequired"));
       return;
     }
     const problems = validateItems(items);
@@ -362,12 +367,12 @@ function ManualTaskSetForm({
   return (
     <form onSubmit={onSubmit} noValidate className="space-y-4" data-testid="taskset-manual-form">
       {importedItems && importedItems.length > 0 && (
-        <div className="rounded border border-cyan/50 bg-cyan/10 px-3 py-2 text-sm text-cyan" data-testid="taskset-import-notice">
-          已导入 {importedItems.length} 条 AI 生成任务,请审阅后保存
+        <div className="border border-amber/40 bg-amber/[.13] px-3 py-2 text-sm text-amber" data-testid="taskset-import-notice">
+          {t("list.importNotice", { count: importedItems.length })}
         </div>
       )}
       <p className="text-xs text-muted">
-        手动录入生成 single 模式任务集(训练时按比例自动分割);需要预分割 train / val / test 请改用文件上传。
+        {t("list.manual.hint")}
       </p>
       <TaskItemsEditor items={items} onChange={setItems} />
       {formError && (
@@ -376,7 +381,7 @@ function ManualTaskSetForm({
         </div>
       )}
       <button type="submit" className="btn-primary" disabled={submitting} data-testid="taskset-manual-submit">
-        {submitting ? "校验并保存中…" : "校验并保存"}
+        {submitting ? t("saveBtn.saving") : t("saveBtn.idle")}
       </button>
     </form>
   );

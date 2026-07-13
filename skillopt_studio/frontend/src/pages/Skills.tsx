@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
 import { api, ApiError, SkillInfo } from "../api";
 import {
@@ -9,6 +10,7 @@ import {
 const SOURCE_ORDER = ["sample", "claude", "claude-plugins", "codex", "kiro", "agents", "uploaded"];
 
 export default function Skills() {
+  const { t } = useTranslation("skills");
   const [skills, setSkills] = useState<SkillInfo[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
@@ -33,7 +35,7 @@ export default function Skills() {
 
   const onUpload = async (file: File) => {
     if (file.size > 50 * 1024 * 1024) {
-      setUploadError(`zip 为 ${(file.size / 1024 / 1024).toFixed(1)}MB,超过 50MB 上限。`);
+      setUploadError(t("upload.tooLarge", { size: (file.size / 1024 / 1024).toFixed(1) }));
       setUploadOk(null);
       if (fileRef.current) fileRef.current.value = "";
       return;
@@ -43,7 +45,7 @@ export default function Skills() {
     setUploadOk(null);
     try {
       const info = await api.uploadSkill(file);
-      setUploadOk(`已上传技能 ${info.name}`);
+      setUploadOk(t("upload.success", { name: info.name }));
       await reload();
     } catch (err) {
       setUploadError(err instanceof ApiError ? err.message : String(err));
@@ -79,8 +81,8 @@ export default function Skills() {
   return (
     <div>
       <PageHeader
-        title="技能库"
-        sub="扫描本机 claude / codex / kiro / agents 四个技能源,以及 Studio 上传的技能"
+        title={t("header.title")}
+        sub={t("header.sub")}
         actions={
           <>
             <input
@@ -99,7 +101,7 @@ export default function Skills() {
               disabled={uploading}
               onClick={() => fileRef.current?.click()}
             >
-              {uploading ? "上传中…" : "上传技能 zip"}
+              {uploading ? t("upload.uploading") : t("upload.button")}
             </button>
           </>
         }
@@ -112,7 +114,7 @@ export default function Skills() {
       )}
       {uploadOk && (
         <div
-          className="card border-green/40 bg-green/5 px-4 py-3 text-sm text-green mb-4"
+          className="card border-good/40 px-4 py-3 text-sm text-good mb-4"
           data-testid="upload-ok"
         >
           {uploadOk}
@@ -123,7 +125,7 @@ export default function Skills() {
       <div className="mb-5">
         <input
           className="input max-w-md"
-          placeholder="搜索技能名称 / ID / 描述…"
+          placeholder={t("search.placeholder")}
           value={query}
           onChange={(event) => setQuery(event.target.value)}
         />
@@ -132,12 +134,8 @@ export default function Skills() {
       {skills === null && !error && <Spinner />}
       {skills !== null && filtered.length === 0 && (
         <EmptyState
-          title={query ? "没有匹配的技能" : "没有发现技能"}
-          hint={
-            query
-              ? "换个关键词试试。"
-              : "四个本机技能源中都没有含 SKILL.md 的目录,可以先上传一个技能 zip。"
-          }
+          title={query ? t("empty.noMatchTitle") : t("empty.noSkillsTitle")}
+          hint={query ? t("empty.noMatchHint") : t("empty.noSkillsHint")}
         />
       )}
 
@@ -149,7 +147,7 @@ export default function Skills() {
               <span className="flex items-center gap-2">
                 <SourceTag source={group.source} />
                 <span className="text-muted normal-case tracking-normal">
-                  {group.items.length} 个技能
+                  {t("card.count", { n: group.items.length })}
                 </span>
               </span>
             }
@@ -160,18 +158,18 @@ export default function Skills() {
                   key={skill.id}
                   to={`/skills/${encodeURIComponent(skill.id)}`}
                   data-skill-id={skill.id}
-                  className="block bg-panel2 border border-line rounded-md p-4 hover:border-cyan transition-colors"
+                  className="block bg-panel2 border border-line p-4 hover:border-faint transition-colors"
                 >
                   <div className="flex items-center justify-between gap-2">
                     <div className="font-medium text-sm truncate">{skill.name}</div>
                     {skill.has_support_files && (
-                      <span className="text-[10px] text-cyan border border-cyan/40 rounded px-1.5 py-0.5 shrink-0">
-                        {skill.files_count} 文件
+                      <span className="font-mono text-[10px] text-s2 border border-s2/40 px-1.5 py-0.5 shrink-0">
+                        {t("card.filesChip", { n: skill.files_count })}
                       </span>
                     )}
                   </div>
                   <div className="text-xs text-muted mt-1.5 leading-relaxed min-h-[2rem]">
-                    {truncate(skill.description || "(无描述)", 90)}
+                    {truncate(skill.description || t("card.noDescription"), 90)}
                   </div>
                   <Mono className="text-[11px] text-muted/70 block mt-2 truncate">{skill.id}</Mono>
                 </Link>
