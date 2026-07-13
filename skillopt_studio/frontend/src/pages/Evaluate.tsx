@@ -2,7 +2,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { api, ApiError, BackendStatus, SkillInfo, TaskSetInfo } from "../api";
-import { BackendSelect, Card, ErrorBanner, Mono, PageHeader, SourceTag, Spinner } from "../components/ui";
+import { BackendSelect, Card, ErrorBanner, Mono, PageHeader, SourceFilterChips, SourceTag, Spinner } from "../components/ui";
 
 export default function Evaluate() {
   const { t } = useTranslation("wizards");
@@ -14,6 +14,7 @@ export default function Evaluate() {
 
   const [skillId, setSkillId] = useState(searchParams.get("skill") ?? "");
   const [skillQuery, setSkillQuery] = useState("");
+  const [skillSource, setSkillSource] = useState("");
   const [tasksetId, setTasksetId] = useState("");
   const [targetBackend, setTargetBackend] = useState("claude_code_exec");
   const [backends, setBackends] = useState<BackendStatus[] | null>(null);
@@ -50,11 +51,12 @@ export default function Evaluate() {
 
   const filteredSkills = useMemo(() => {
     const q = skillQuery.trim().toLowerCase();
-    if (!q) return skills ?? [];
     return (skills ?? []).filter(
-      (skill) => skill.name.toLowerCase().includes(q) || skill.id.toLowerCase().includes(q),
+      (skill) =>
+        (!skillSource || skill.source === skillSource) &&
+        (!q || skill.name.toLowerCase().includes(q) || skill.id.toLowerCase().includes(q)),
     );
-  }, [skills, skillQuery]);
+  }, [skills, skillQuery, skillSource]);
 
   const selectedTaskset = tasksets?.find((taskset) => taskset.id === tasksetId);
 
@@ -105,12 +107,15 @@ export default function Evaluate() {
       {skills !== null && tasksets !== null && (
         <form onSubmit={onSubmit} noValidate className="space-y-6" data-testid="evaluate-form">
           <Card title={t("picker.selectSkillTitle")}>
-            <input
-              className="input max-w-sm mb-3"
-              placeholder={t("picker.searchSkillPlaceholder")}
-              value={skillQuery}
-              onChange={(event) => setSkillQuery(event.target.value)}
-            />
+            <div className="flex flex-wrap items-center gap-3 mb-3">
+              <input
+                className="input max-w-sm !w-auto flex-1 min-w-[14rem]"
+                placeholder={t("picker.searchSkillPlaceholder")}
+                value={skillQuery}
+                onChange={(event) => setSkillQuery(event.target.value)}
+              />
+              <SourceFilterChips skills={skills} value={skillSource} onChange={setSkillSource} />
+            </div>
             <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3 max-h-72 overflow-y-auto pr-1">
               {filteredSkills.map((skill) => (
                 <label

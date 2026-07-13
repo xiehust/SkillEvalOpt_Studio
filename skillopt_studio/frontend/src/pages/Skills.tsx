@@ -3,17 +3,16 @@ import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
 import { api, ApiError, SkillInfo } from "../api";
 import {
-  Card, EmptyState, ErrorBanner, Mono, PageHeader, Pagination, SourceTag, Spinner,
-  truncate, usePagination,
+  Card, EmptyState, ErrorBanner, Mono, PageHeader, Pagination, SOURCE_ORDER, SourceFilterChips,
+  SourceTag, Spinner, truncate, usePagination,
 } from "../components/ui";
-
-const SOURCE_ORDER = ["sample", "claude", "claude-plugins", "codex", "kiro", "agents", "uploaded"];
 
 export default function Skills() {
   const { t } = useTranslation("skills");
   const [skills, setSkills] = useState<SkillInfo[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  const [sourceFilter, setSourceFilter] = useState("");
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [uploadOk, setUploadOk] = useState<string | null>(null);
@@ -56,6 +55,7 @@ export default function Skills() {
   };
 
   const filtered = (skills ?? []).filter((skill) => {
+    if (sourceFilter && skill.source !== sourceFilter) return false;
     const q = query.trim().toLowerCase();
     if (!q) return true;
     return (
@@ -71,6 +71,11 @@ export default function Skills() {
     return (ai === -1 ? SOURCE_ORDER.length : ai) - (bi === -1 ? SOURCE_ORDER.length : bi);
   });
   const { page, setPage, pageSize, setPageSize, pageCount, pageItems, total } = usePagination(ordered);
+  // 分组标题显示该来源在完整筛选结果中的总数,而非当前页条数
+  const countBySource = (source: string) =>
+    source === "other"
+      ? ordered.filter((skill) => !SOURCE_ORDER.includes(skill.source)).length
+      : ordered.filter((skill) => skill.source === source).length;
   const grouped = SOURCE_ORDER.map((source) => ({
     source,
     items: pageItems.filter((skill) => skill.source === source),
@@ -122,20 +127,21 @@ export default function Skills() {
       )}
       {error && <ErrorBanner message={error} />}
 
-      <div className="mb-5">
+      <div className="mb-5 flex flex-wrap items-center gap-3">
         <input
-          className="input max-w-md"
+          className="input max-w-md !w-auto flex-1 min-w-[16rem]"
           placeholder={t("search.placeholder")}
           value={query}
           onChange={(event) => setQuery(event.target.value)}
         />
+        <SourceFilterChips skills={skills ?? []} value={sourceFilter} onChange={setSourceFilter} />
       </div>
 
       {skills === null && !error && <Spinner />}
       {skills !== null && filtered.length === 0 && (
         <EmptyState
-          title={query ? t("empty.noMatchTitle") : t("empty.noSkillsTitle")}
-          hint={query ? t("empty.noMatchHint") : t("empty.noSkillsHint")}
+          title={query || sourceFilter ? t("empty.noMatchTitle") : t("empty.noSkillsTitle")}
+          hint={query || sourceFilter ? t("empty.noMatchHint") : t("empty.noSkillsHint")}
         />
       )}
 
@@ -147,7 +153,7 @@ export default function Skills() {
               <span className="flex items-center gap-2">
                 <SourceTag source={group.source} />
                 <span className="text-muted normal-case tracking-normal">
-                  {t("card.count", { n: group.items.length })}
+                  {t("card.count", { n: countBySource(group.source) })}
                 </span>
               </span>
             }

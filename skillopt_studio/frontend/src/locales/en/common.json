@@ -43,5 +43,6 @@
     "next": "Next",
     "pageOf": "Page {{page}} / {{pageCount}}"
   },
-  "networkError": "Cannot reach the backend service"
+  "networkError": "Cannot reach the backend service",
+  "filterAll": "All"
 }

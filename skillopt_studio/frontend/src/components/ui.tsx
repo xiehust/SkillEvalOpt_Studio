@@ -1,8 +1,11 @@
 // Shared design-system primitives for the studio console.
 import { ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { BackendStatus, JobStatus, TokenUsage } from "../api";
+import { BackendStatus, JobStatus, SkillInfo, TokenUsage } from "../api";
 import { dateLocale } from "../i18n";
+
+/** 技能来源的展示顺序(技能库分组与筛选 chips 共用)。 */
+export const SOURCE_ORDER = ["sample", "claude", "claude-plugins", "codex", "kiro", "agents", "uploaded"];
 
 export function PageHeader({
   title, sub, actions, kicker = "SKILLEVAL&OPT STUDIO",
@@ -143,6 +146,38 @@ export function SourceTag({ source }: { source: string }) {
     <span className={`inline-block px-2 py-[3px] border font-mono text-[10px] tracking-[0.05em] ${color}`}>
       {labelKey ? t(labelKey) : source}
     </span>
+  );
+}
+
+/** 按技能来源筛选的 chips 行(技能库 + 评估/训练向导共用);"" = 全部。 */
+export function SourceFilterChips({
+  skills, value, onChange,
+}: { skills: SkillInfo[]; value: string; onChange: (source: string) => void }) {
+  const { t } = useTranslation("common");
+  const present = new Set(skills.map((skill) => skill.source));
+  const sources = SOURCE_ORDER.filter((source) => present.has(source))
+    .concat([...present].filter((source) => !SOURCE_ORDER.includes(source)).sort());
+  if (sources.length < 2) return null;
+  const chip = "font-mono text-[10.5px] tracking-[0.05em] px-2.5 py-1.5 border cursor-pointer whitespace-nowrap";
+  const off = "border-line2 text-muted bg-well hover:border-faint hover:text-text";
+  const on = "border-amber text-amber bg-amber/[.13]";
+  return (
+    <div className="flex flex-wrap gap-1.5" data-testid="source-filter">
+      <button type="button" className={`${chip} ${value === "" ? on : off}`} onClick={() => onChange("")}>
+        {t("filterAll")}
+      </button>
+      {sources.map((source) => (
+        <button
+          key={source}
+          type="button"
+          data-source-chip={source}
+          className={`${chip} ${value === source ? on : off}`}
+          onClick={() => onChange(value === source ? "" : source)}
+        >
+          {SOURCE_LABEL_KEYS[source] ? t(SOURCE_LABEL_KEYS[source]) : source}
+        </button>
+      ))}
+    </div>
   );
 }
 
