@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import stat
+import struct
 import tempfile
 import unicodedata
 import zipfile
@@ -37,8 +38,14 @@ _OLE_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 _MAX_OOXML_ENTRIES = 10_000
 _MAX_OOXML_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 _MAX_CONTENT_TYPES_BYTES = 2 * 1024 * 1024
+_MAX_OOXML_LOCAL_METADATA_BYTES = 16 * 1024 * 1024
 _MAX_COMPRESSION_RATIO = 200.0
 _ZIP_STREAM_CHUNK = 1024 * 1024
+_LOCAL_FILE_HEADER = struct.Struct("<4s5H3L2H")
+_LOCAL_FILE_HEADER_SIGNATURE = b"PK\x03\x04"
+_ZIP64_EXTRA_ID = 0x0001
+_ZIP32_MAX = 0xFFFFFFFF
+_SUPPORTED_ZIP_FLAGS = 0x0806
 _CELL_PAGE_SIZE = 128
 _LIBREOFFICE_TIMEOUT_SECONDS = 120
 _SUPPORTED_ZIP_COMPRESSION = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
@@ -86,11 +93,19 @@ def _validate_member_name(info: zipfile.ZipInfo) -> str:
 
 
 def _validate_member_type(info: zipfile.ZipInfo) -> None:
-    if info.flag_bits & (0x1 | 0x40):
+    if info.flag_bits & 0x8:
+        raise InspectionError("OOXML data descriptor entries are unsupported")
+    if info.flag_bits & (0x1 | 0x40 | 0x2000):
         raise InspectionError("encrypted OOXML entries are unsupported")
+    if info.flag_bits & ~_SUPPORTED_ZIP_FLAGS:
+        raise InspectionError("unsupported OOXML general-purpose flags")
     if info.compress_type not in _SUPPORTED_ZIP_COMPRESSION:
         raise InspectionError(
             f"unsupported OOXML compression method {info.compress_type}"
+        )
+    if info.compress_type != zipfile.ZIP_DEFLATED and info.flag_bits & 0x6:
+        raise InspectionError(
+            "unsupported OOXML compression-option flags"
         )
     mode = (info.external_attr >> 16) & 0xFFFF
     file_type = stat.S_IFMT(mode)
@@ -109,6 +124,235 @@ def _validate_member_type(info: zipfile.ZipInfo) -> None:
                 "suspicious OOXML compression ratio: "
                 f"{ratio:.1f} > {_MAX_COMPRESSION_RATIO:.1f}"
             )
+
+
+def _read_local_header_bytes(
+    descriptor: int,
+    size: int,
+    offset: int,
+) -> bytes:
+    payload = bytearray()
+    try:
+        while len(payload) < size:
+            chunk = os.pread(
+                descriptor,
+                size - len(payload),
+                offset + len(payload),
+            )
+            if not chunk:
+                break
+            payload.extend(chunk)
+    except OSError as exc:
+        raise InspectionError(
+            "OOXML local file header could not be read: "
+            f"{bounded_diagnostic(exc)}"
+        ) from exc
+    if len(payload) != size:
+        raise InspectionError("OOXML local file header is truncated")
+    return bytes(payload)
+
+
+def _local_zip64_sizes(
+    extra: bytes,
+    compressed_size: int,
+    uncompressed_size: int,
+) -> tuple[int, int]:
+    offset = 0
+    zip64_payload: bytes | None = None
+    while offset < len(extra):
+        if len(extra) - offset < 4:
+            raise InspectionError(
+                "OOXML local file header has a truncated extra field"
+            )
+        field_id, field_size = struct.unpack_from("<HH", extra, offset)
+        offset += 4
+        field_end = offset + field_size
+        if field_end > len(extra):
+            raise InspectionError(
+                "OOXML local file header has a truncated extra field"
+            )
+        if field_id == _ZIP64_EXTRA_ID:
+            if zip64_payload is not None:
+                raise InspectionError(
+                    "OOXML local file header has duplicate ZIP64 metadata"
+                )
+            zip64_payload = extra[offset:field_end]
+        offset = field_end
+
+    needs_uncompressed = uncompressed_size == _ZIP32_MAX
+    needs_compressed = compressed_size == _ZIP32_MAX
+    if not needs_uncompressed and not needs_compressed:
+        return compressed_size, uncompressed_size
+    if zip64_payload is None:
+        raise InspectionError(
+            "OOXML local file header is missing ZIP64 size metadata"
+        )
+
+    zip64_offset = 0
+
+    def read_size() -> int:
+        nonlocal zip64_offset
+        if len(zip64_payload) - zip64_offset < 8:
+            raise InspectionError(
+                "OOXML local file header has truncated ZIP64 size metadata"
+            )
+        value = struct.unpack_from("<Q", zip64_payload, zip64_offset)[0]
+        zip64_offset += 8
+        return value
+
+    if needs_uncompressed:
+        uncompressed_size = read_size()
+    if needs_compressed:
+        compressed_size = read_size()
+    return compressed_size, uncompressed_size
+
+
+def _central_filename_bytes(member: zipfile.ZipInfo, name: str) -> bytes:
+    encoding = "utf-8" if member.flag_bits & 0x800 else "cp437"
+    try:
+        return name.encode(encoding)
+    except UnicodeEncodeError as exc:
+        raise InspectionError(
+            "OOXML central directory filename encoding is invalid"
+        ) from exc
+
+
+def _validate_local_headers(
+    descriptor: int,
+    archive: zipfile.ZipFile,
+    members: list[zipfile.ZipInfo],
+) -> None:
+    file_size = os.fstat(descriptor).st_size
+    central_start = getattr(archive, "start_dir", None)
+    if (
+        not isinstance(central_start, int)
+        or central_start < 0
+        or central_start > file_size
+    ):
+        raise InspectionError(
+            "OOXML local file header bounds are invalid"
+        )
+
+    intervals: list[tuple[int, int]] = []
+    local_metadata_bytes = 0
+    for member in members:
+        name = _member_name(member)
+        header_offset = member.header_offset
+        if not isinstance(header_offset, int) or header_offset < 0:
+            raise InspectionError(
+                "OOXML local file header is outside archive bounds"
+            )
+        fixed_end = header_offset + _LOCAL_FILE_HEADER.size
+        if fixed_end > central_start or fixed_end > file_size:
+            raise InspectionError(
+                "OOXML local file header is outside archive bounds"
+            )
+
+        fixed = _read_local_header_bytes(
+            descriptor,
+            _LOCAL_FILE_HEADER.size,
+            header_offset,
+        )
+        (
+            signature,
+            _extract_version,
+            flags,
+            compression_method,
+            _modified_time,
+            _modified_date,
+            crc,
+            compressed_size,
+            uncompressed_size,
+            filename_size,
+            extra_size,
+        ) = _LOCAL_FILE_HEADER.unpack(fixed)
+        if signature != _LOCAL_FILE_HEADER_SIGNATURE:
+            raise InspectionError(
+                "OOXML local file header signature is invalid"
+            )
+
+        central_filename = _central_filename_bytes(member, name)
+        if filename_size != len(central_filename):
+            raise InspectionError(
+                "OOXML local file header filename length differs "
+                "from central directory"
+            )
+        local_metadata_bytes += (
+            _LOCAL_FILE_HEADER.size + filename_size + extra_size
+        )
+        if local_metadata_bytes > _MAX_OOXML_LOCAL_METADATA_BYTES:
+            raise InspectionError(
+                "OOXML local file header metadata exceeds configured limits"
+            )
+
+        variable_size = filename_size + extra_size
+        data_start = fixed_end + variable_size
+        if data_start > central_start or data_start > file_size:
+            raise InspectionError(
+                "OOXML local file header extends outside archive bounds"
+            )
+        variable = _read_local_header_bytes(
+            descriptor,
+            variable_size,
+            fixed_end,
+        )
+        local_filename = variable[:filename_size]
+        local_extra = variable[filename_size:]
+        if local_filename != central_filename:
+            raise InspectionError(
+                "OOXML local file header filename bytes differ "
+                "from central directory"
+            )
+        encoding = "utf-8" if flags & 0x800 else "cp437"
+        try:
+            decoded_filename = local_filename.decode(encoding)
+        except UnicodeDecodeError as exc:
+            raise InspectionError(
+                "OOXML local file header filename encoding is invalid"
+            ) from exc
+        if decoded_filename != name:
+            raise InspectionError(
+                "OOXML local file header logical filename differs "
+                "from central directory"
+            )
+
+        if (
+            flags != member.flag_bits
+            or compression_method != member.compress_type
+            or crc != member.CRC
+        ):
+            raise InspectionError(
+                "OOXML local file header metadata differs "
+                "from central directory"
+            )
+        local_compressed, local_uncompressed = _local_zip64_sizes(
+            local_extra,
+            compressed_size,
+            uncompressed_size,
+        )
+        if (
+            local_compressed != member.compress_size
+            or local_uncompressed != member.file_size
+        ):
+            raise InspectionError(
+                "OOXML local file header sizes differ "
+                "from central directory"
+            )
+
+        data_end = data_start + member.compress_size
+        if data_end > central_start or data_end > file_size:
+            raise InspectionError(
+                "OOXML local file header data extends outside archive bounds"
+            )
+        intervals.append((header_offset, data_end))
+
+    previous_end = -1
+    for interval_start, interval_end in sorted(intervals):
+        if interval_start < previous_end:
+            raise InspectionError(
+                "OOXML local file header regions overlap"
+            )
+        previous_end = interval_end
 
 
 def _validate_content_types(payload: bytes, names: set[str]) -> None:
@@ -198,6 +442,7 @@ def preflight_xlsx(path: str) -> None:
                         if name == "[Content_Types].xml":
                             content_types_info = member
 
+                    _validate_local_headers(descriptor, archive, members)
                     if content_types_info is None:
                         raise InspectionError("OOXML content types are missing")
                     if content_types_info.file_size > _MAX_CONTENT_TYPES_BYTES:
@@ -718,6 +963,8 @@ class SpreadsheetInspector:
         budget: RenderBudget,
     ) -> list[str]:
         _validate_render_selectors(selectors)
+        if not _is_legacy_xls(path):
+            preflight_xlsx(path)
         pdf_path = _convert_with_libreoffice(path, scratch_dir, "pdf")
         try:
             from .pdf_image import PdfInspector

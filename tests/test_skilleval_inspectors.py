@@ -10,6 +10,7 @@ import multiprocessing
 import os
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1728,6 +1729,37 @@ class TestSpreadsheetInspector:
         book.save(path)
         book.close()
 
+    @staticmethod
+    def _rewrite_xlsx_member(path: Path, member_name: str, transform) -> None:
+        rewritten = path.with_name(f"{path.stem}-rewritten.xlsx")
+        with zipfile.ZipFile(path) as source:
+            members = [
+                (
+                    info,
+                    transform(source.read(info))
+                    if info.filename == member_name
+                    else source.read(info),
+                )
+                for info in source.infolist()
+            ]
+        with zipfile.ZipFile(rewritten, "w") as destination:
+            for info, payload in members:
+                destination.writestr(info, payload)
+        os.replace(rewritten, path)
+
+    @staticmethod
+    def _mutate_local_header(
+        path: Path,
+        member_name: str,
+        relative_offset: int,
+        replacement: bytes,
+    ) -> None:
+        with zipfile.ZipFile(path) as archive:
+            header_offset = archive.getinfo(member_name).header_offset
+        with path.open("r+b") as target:
+            target.seek(header_offset + relative_offset)
+            target.write(replacement)
+
     def test_xlsx_inspection_reports_values_formulas_and_layout(
         self, tmp_path
     ) -> None:
@@ -1867,7 +1899,64 @@ class TestSpreadsheetInspector:
         assert result["score"] == 0.0
         assert reason in result["reason"]
 
-    def test_xlsx_sparse_extreme_dimension_is_paginated_without_grid_walk(
+    def test_xlsx_forged_dimension_is_ignored_for_cell_pagination(
+        self, tmp_path
+    ) -> None:
+        from openpyxl import Workbook
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "forged-dimension.xlsx"
+        book = Workbook()
+        sheet = book.active
+        sheet.title = "Summary"
+        for row in range(1, 131):
+            sheet.cell(row=row, column=1, value=row)
+        book.save(path)
+        book.close()
+
+        def forge_dimension(payload: bytes) -> bytes:
+            original = b'<dimension ref="A1:A130"/>'
+            assert original in payload
+            return payload.replace(
+                original,
+                b'<dimension ref="A1:XFD1048576"/>',
+                1,
+            )
+
+        self._rewrite_xlsx_member(
+            path,
+            "xl/worksheets/sheet1.xml",
+            forge_dimension,
+        )
+
+        inspected = inspect_artifact(
+            "forged-dimension.xlsx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+        summary = inspected["sheets"][0]
+
+        assert summary["max_row"] == 130
+        assert summary["max_column"] == 1
+        assert summary["used_range"] == "A1:A130"
+        assert summary["cell_page"] == {
+            "page": 1,
+            "page_size": 128,
+            "total": 130,
+            "returned": 128,
+            "omitted": 2,
+            "omitted_due_to_budget": 0,
+        }
+
+        extracted = extract_artifact(
+            "forged-dimension.xlsx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["sheet:Summary:page:2"],
+        )
+        assert list(extracted["sheets"][0]["cells"]) == ["A129", "A130"]
+
+    def test_xlsx_real_far_cell_is_paginated_without_grid_walk(
         self, tmp_path
     ) -> None:
         from openpyxl import Workbook
@@ -2085,6 +2174,138 @@ class TestSpreadsheetInspector:
         with pytest.raises(InspectionError, match="unsafe"):
             spreadsheet._validate_member_name(nul_name)
 
+        data_descriptor = zipfile.ZipInfo("xl/descriptor.bin")
+        data_descriptor.flag_bits = 0x8
+        with pytest.raises(InspectionError, match="data descriptor"):
+            spreadsheet._validate_member_type(data_descriptor)
+
+    @pytest.mark.parametrize(
+        ("relative_offset", "replacement"),
+        [
+            (0, b"BAD!"),
+            (6, struct.pack("<H", 0x1)),
+            (6, struct.pack("<H", 0x8)),
+            (8, struct.pack("<H", zipfile.ZIP_STORED)),
+            (14, struct.pack("<L", 0)),
+            (18, struct.pack("<L", 0)),
+            (22, struct.pack("<L", 0)),
+            (30, b"X"),
+        ],
+        ids=[
+            "signature",
+            "encrypted-flags",
+            "descriptor-flags",
+            "method",
+            "crc",
+            "compressed-size",
+            "uncompressed-size",
+            "name",
+        ],
+    )
+    def test_xlsx_preflight_rejects_local_header_mismatch(
+        self,
+        tmp_path,
+        relative_offset,
+        replacement,
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        path = tmp_path / "local-header.xlsx"
+        self._save_xlsx(path)
+        self._mutate_local_header(
+            path,
+            "[Content_Types].xml",
+            relative_offset,
+            replacement,
+        )
+
+        with pytest.raises(InspectionError, match="local file header"):
+            preflight_xlsx(str(path))
+
+    def test_xlsx_preflight_rejects_overlapping_local_regions(
+        self, tmp_path
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        path = tmp_path / "overlapping-local-regions.xlsx"
+        self._save_xlsx(path)
+        with zipfile.ZipFile(path) as archive:
+            first, second = sorted(
+                archive.infolist(),
+                key=lambda member: member.header_offset,
+            )[:2]
+        with path.open("r+b") as target:
+            target.seek(first.header_offset)
+            fields = struct.unpack("<4s5H3L2H", target.read(30))
+            filename_size, extra_size = fields[-2:]
+            assert extra_size == 0
+            data_start = first.header_offset + 30 + filename_size
+            assert data_start + first.compress_size == second.header_offset
+            target.seek(first.header_offset + 28)
+            target.write(struct.pack("<H", 4))
+            target.seek(data_start)
+            target.write(struct.pack("<HH", 0xCAFE, 0))
+
+        with pytest.raises(InspectionError, match="regions overlap"):
+            preflight_xlsx(str(path))
+
+    def test_xlsx_preflight_rejects_local_header_out_of_bounds(
+        self, tmp_path
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        path = tmp_path / "out-of-bounds-local-header.xlsx"
+        self._save_xlsx(path)
+        with zipfile.ZipFile(path) as archive:
+            final_member = max(
+                archive.infolist(),
+                key=lambda member: member.header_offset,
+            )
+        self._mutate_local_header(
+            path,
+            final_member.filename,
+            28,
+            struct.pack("<H", 0xFFFF),
+        )
+
+        with pytest.raises(InspectionError, match="outside archive bounds"):
+            preflight_xlsx(str(path))
+
+    def test_xlsx_preflight_accepts_force_zip64_entries(self, tmp_path) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        source_path = tmp_path / "source.xlsx"
+        zip64_path = tmp_path / "zip64.xlsx"
+        self._save_xlsx(source_path)
+        with (
+            zipfile.ZipFile(source_path) as source,
+            zipfile.ZipFile(zip64_path, "w") as destination,
+        ):
+            for source_info in source.infolist():
+                target_info = zipfile.ZipInfo(
+                    source_info.filename,
+                    source_info.date_time,
+                )
+                target_info.compress_type = source_info.compress_type
+                target_info.external_attr = source_info.external_attr
+                target_info.create_system = source_info.create_system
+                with destination.open(
+                    target_info,
+                    "w",
+                    force_zip64=True,
+                ) as target:
+                    target.write(source.read(source_info))
+
+        preflight_xlsx(str(zip64_path))
+
     def test_xlsx_corrupt_workbook_raises_controlled_error(self, tmp_path) -> None:
         from skillopt.envs.skilleval.inspectors.spreadsheet import (
             evaluate_xlsx_check,
@@ -2123,6 +2344,68 @@ class TestSpreadsheetInspector:
         assert render_call[4].max_pixels == 321
         assert all("lo-profile" not in output for output in outputs)
         assert all("lo-render" not in output for output in outputs)
+
+    def test_xlsx_render_preflights_before_libreoffice(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "unsafe-render.xlsx"
+        self._save_xlsx(path)
+        with zipfile.ZipFile(path, "a") as archive:
+            archive.writestr("XL/workbook.xml", "collision")
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        monkeypatch.setattr(
+            spreadsheet,
+            "_convert_with_libreoffice",
+            lambda *args, **kwargs: pytest.fail(
+                "converter must not run before XLSX preflight"
+            ),
+        )
+
+        with pytest.raises(InspectionError, match="colliding OOXML entry"):
+            render_artifact(
+                "unsafe-render.xlsx",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+
+    def test_xls_render_does_not_run_ooxml_preflight(
+        self,
+        tmp_path,
+        fake_pdf_inspector,
+        monkeypatch,
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        (evidence / "legacy.xls").write_bytes(
+            b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1legacy"
+        )
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        def fake_convert(path, scratch_dir, target_format):
+            output = Path(scratch_dir) / "legacy.pdf"
+            output.write_bytes(b"%PDF-1.4\n")
+            return str(output)
+
+        monkeypatch.setattr(
+            spreadsheet,
+            "preflight_xlsx",
+            lambda path: pytest.fail("XLS must not use OOXML preflight"),
+        )
+        monkeypatch.setattr(
+            spreadsheet,
+            "_convert_with_libreoffice",
+            fake_convert,
+        )
+
+        outputs = render_artifact(
+            "legacy.xls",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        assert len(outputs) == 1
+        assert fake_pdf_inspector.calls[-1][0] == "render"
 
     def test_xlsx_render_rejects_non_pdf_selector_before_conversion(
         self, tmp_path, monkeypatch
