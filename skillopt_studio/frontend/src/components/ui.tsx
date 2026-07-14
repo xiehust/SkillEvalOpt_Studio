@@ -269,9 +269,9 @@ export function Pagination({
   const { t } = useTranslation("common");
   if (total <= PAGE_SIZES[0]) return null;
   return (
-    <div className="flex items-center justify-between gap-3 mt-4" data-testid="pagination">
+    <div className="flex flex-wrap items-center justify-between gap-3 mt-4" data-testid="pagination">
       <span className="font-mono text-[10.5px] text-faint tracking-[0.05em]">{t("pagination.total", { total })}</span>
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center justify-end gap-2">
         <select
           className="input !w-auto !py-1 text-xs"
           value={pageSize}
@@ -360,6 +360,19 @@ export function formatTime(iso: string | null | undefined): string {
   if (!iso) return "—";
   const date = new Date(iso);
   return isNaN(date.getTime()) ? iso : date.toLocaleString(dateLocale(), { hour12: false });
+}
+
+export function jobSkillLabel(job: { params?: Record<string, unknown> }): string {
+  const skillIds = Array.isArray(job.params?.skill_ids)
+    ? job.params.skill_ids.map(String).filter(Boolean)
+    : [];
+  if (skillIds.length > 0) {
+    const plugin = String(job.params?.plugin ?? "").trim();
+    return plugin
+      ? `Plugin · ${plugin} · ${skillIds.length} Skills`
+      : `Plugin · ${skillIds.length} Skills`;
+  }
+  return String(job.params?.skill_id ?? "—");
 }
 
 export function jobDuration(job: { started_at: string | null; finished_at: string | null }): string {

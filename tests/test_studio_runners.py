@@ -19,19 +19,27 @@ from skillopt_studio.config import StudioConfig
 from skillopt_studio.jobs import JobManager
 from skillopt_studio.models import JobInfo
 from skillopt_studio.runners import build_eval_command, build_taskgen_command, build_train_command
-from skillopt_studio.skill_sources import upload_skill_zip
+from skillopt_studio.skill_sources import scan_skills, upload_skill_zip
 from skillopt_studio.tasksets import save_taskset
 
-from tests.test_studio_core import SOURCES, make_skill, make_zip, valid_tasks, wait_until
+from tests.test_studio_core import (
+    SOURCES,
+    make_plugins_root,
+    make_skill,
+    make_zip,
+    valid_tasks,
+    wait_until,
+)
 
 # ── stub CLIs (same artifact layout as the real scripts) ─────────────────
 
 FAKE_EVAL_SCRIPT = """\
 import argparse, json, os
 p = argparse.ArgumentParser()
-for flag in ("--skill", "--tasks", "--out_root", "--model", "--optimizer_model",
+for flag in ("--tasks", "--out_root", "--model", "--optimizer_model",
              "--target_backend", "--optimizer_backend"):
     p.add_argument(flag, default="")
+p.add_argument("--skill", action="append", default=[])
 for flag in ("--workers", "--timeout", "--limit"):
     p.add_argument(flag, type=int, default=0)
 a = p.parse_args()
@@ -41,13 +49,56 @@ with open(a.tasks, encoding="utf-8") as f:
 print(f"[skilleval] tasks: {len(tasks)} from {a.tasks}", flush=True)
 results = [
     {"id": t["id"], "task_type": t.get("task_type", "default"),
+     "target_skills": t.get("target_skills", []),
      "hard": 1 if i % 2 == 0 else 0, "soft": 0.75 if i % 2 == 0 else 0.25,
      "judge_reason": "stub verdict", "duration_s": 1.5}
     for i, t in enumerate(tasks)
 ]
+def skill_name(path):
+    skill_file = os.path.join(path, "SKILL.md") if os.path.isdir(path) else path
+    with open(skill_file, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("name:"):
+                return line.split(":", 1)[1].strip().strip("'\\\"")
+    return os.path.basename(os.path.dirname(path) if os.path.isfile(path) else path)
+def metrics(rows):
+    return {
+        "count": len(rows),
+        "hard": sum(float(row["hard"]) for row in rows) / len(rows) if rows else 0.0,
+        "soft": sum(float(row["soft"]) for row in rows) / len(rows) if rows else 0.0,
+    }
+skill_names = [skill_name(path) for path in a.skill]
+by_skill = {
+    name: metrics([row for row in results if name in row["target_skills"]])
+    for name in skill_names
+}
+by_type = {
+    task_type: metrics([row for row in results if row["task_type"] == task_type])
+    for task_type in sorted({row["task_type"] for row in results})
+}
+routing = [row for row in results if row["task_type"] == "routing"]
+integration = [
+    row for row in results
+    if row["task_type"] == "integration" or len(row["target_skills"]) > 1
+]
+covered = [(name, metric) for name, metric in by_skill.items() if metric["count"]]
+weakest = min(covered, key=lambda entry: (entry[1]["hard"], entry[1]["soft"], entry[0])) if covered else None
+summary = {
+    "mode": "plugin" if len(skill_names) > 1 else "skill",
+    "skill_count": len(skill_names),
+    "skill_names": skill_names,
+    "overall": metrics(results),
+    "by_skill": by_skill,
+    "by_task_type": by_type,
+    "routing": metrics(routing) if routing else None,
+    "integration": metrics(integration) if integration else None,
+    "weakest_skill": ({"name": weakest[0], **weakest[1]} if weakest else None),
+}
 print(f"[skilleval] judging {len(results)} responses", flush=True)
 with open(os.path.join(a.out_root, "results.json"), "w", encoding="utf-8") as f:
     json.dump(results, f)
+with open(os.path.join(a.out_root, "summary.json"), "w", encoding="utf-8") as f:
+    json.dump(summary, f)
 with open(os.path.join(a.out_root, "report.md"), "w", encoding="utf-8") as f:
     f.write("# Skill Evaluation Report (stub)")
 """
@@ -103,8 +154,9 @@ print("  [STEP 2 done] epoch=1 action=reject current=0.5 best=0.5", flush=True)
 FAKE_GEN_SCRIPT = """\
 import argparse, json, os
 p = argparse.ArgumentParser()
-for flag in ("--skill", "--backend", "--model", "--guidance", "--out_root"):
+for flag in ("--backend", "--model", "--guidance", "--out_root"):
     p.add_argument(flag, default="")
+p.add_argument("--skill", action="append", default=[])
 for flag in ("--count", "--timeout"):
     p.add_argument(flag, type=int, default=0)
 a = p.parse_args()
@@ -118,7 +170,8 @@ print(f"[taskgen] attempt 1/2", flush=True)
 with open(os.path.join(a.out_root, "generated_tasks.json"), "w", encoding="utf-8") as f:
     json.dump(tasks, f)
 summary = {"count": len(tasks), "requested_count": a.count, "backend": a.backend,
-           "model": a.model, "skill": a.skill, "attempts": 1, "duration_s": 0.1}
+           "model": a.model, "skill": a.skill[0] if len(a.skill) == 1 else None,
+           "skills": a.skill, "skill_count": len(a.skill), "attempts": 1, "duration_s": 0.1}
 with open(os.path.join(a.out_root, "gen_summary.json"), "w", encoding="utf-8") as f:
     json.dump(summary, f)
 print(f"[taskgen] done: {len(tasks)} tasks", flush=True)
@@ -157,6 +210,28 @@ def claude_skill(studio_config) -> Path:
         studio_config.skill_sources["claude"], "local-skill",
         "---\ndescription: a local skill\n---\n# Local\nUse the checklist.\n",
     )
+
+
+@pytest.fixture
+def plugin_skills(studio_config, tmp_path) -> tuple[Path, Path]:
+    root = make_plugins_root(tmp_path, {})
+    install = root / "cache" / "market" / "knowledge" / "1.0.0"
+    skill_a = make_skill(
+        install / "skills",
+        "init",
+        "---\nname: knowledge-init\ndescription: Initialize knowledge\n---\n# Init\n",
+    )
+    skill_b = make_skill(
+        install / "skills",
+        "status",
+        "---\nname: knowledge-status\ndescription: Show knowledge status\n---\n# Status\n",
+    )
+    make_plugins_root(
+        tmp_path,
+        {"knowledge@market": [{"scope": "user", "installPath": str(install)}]},
+    )
+    studio_config.skill_sources["claude-plugins"] = root
+    return skill_a, skill_b
 
 
 @pytest.fixture
@@ -204,6 +279,109 @@ class TestBuildEvalCommand:
             job_dir_of(studio_config),
         )
         assert argv[argv.index("--skill") + 1] == str(studio_config.skills_dir / "up-skill")
+
+    def test_plugin_skills_emit_repeated_flags(
+        self, studio_config, stub_scripts, plugin_skills, single_taskset
+    ):
+        plugin_infos = [skill for skill in scan_skills(studio_config) if skill.plugin == "knowledge"]
+        ids = [skill.id for skill in plugin_infos]
+        argv = build_eval_command(
+            studio_config,
+            {
+                "target_mode": "plugin",
+                "skill_ids": ids,
+                "plugin": "knowledge",
+                "taskset_id": "single-set",
+            },
+            job_dir_of(studio_config),
+        )
+        assert [argv[index + 1] for index, value in enumerate(argv) if value == "--skill"] == [
+            str(skill.path) for skill in plugin_infos
+        ]
+
+    def test_plugin_selection_rejects_cross_plugin_or_spoofed_name(
+        self,
+        studio_config,
+        stub_scripts,
+        plugin_skills,
+        claude_skill,
+        single_taskset,
+    ):
+        with pytest.raises(ValueError, match="same plugin"):
+            build_eval_command(
+                studio_config,
+                {
+                    "skill_ids": [
+                        "claude-plugins--knowledge-init",
+                        "claude--local-skill",
+                    ],
+                    "plugin": "knowledge",
+                    "taskset_id": "single-set",
+                },
+                job_dir_of(studio_config, "eval-cross-plugin"),
+            )
+        with pytest.raises(ValueError, match="expected 'knowledge'"):
+            build_eval_command(
+                studio_config,
+                {
+                    "skill_ids": [
+                        "claude-plugins--knowledge-init",
+                        "claude-plugins--knowledge-status",
+                    ],
+                    "plugin": "spoofed",
+                    "taskset_id": "single-set",
+                },
+                job_dir_of(studio_config, "eval-spoofed-plugin"),
+            )
+
+    def test_plugin_selection_requires_distinct_ids_and_no_scalar_mix(
+        self, studio_config, stub_scripts, plugin_skills, single_taskset
+    ):
+        with pytest.raises(ValueError, match="at least two distinct"):
+            build_eval_command(
+                studio_config,
+                {
+                    "skill_ids": [
+                        "claude-plugins--knowledge-init",
+                        "claude-plugins--knowledge-init",
+                    ],
+                    "plugin": "knowledge",
+                    "taskset_id": "single-set",
+                },
+                job_dir_of(studio_config, "eval-duplicate-plugin"),
+            )
+        with pytest.raises(ValueError, match="either skill_id or skill_ids"):
+            build_eval_command(
+                studio_config,
+                {
+                    "skill_id": "claude-plugins--knowledge-init",
+                    "skill_ids": [
+                        "claude-plugins--knowledge-init",
+                        "claude-plugins--knowledge-status",
+                    ],
+                    "plugin": "knowledge",
+                    "taskset_id": "single-set",
+                },
+                job_dir_of(studio_config, "eval-mixed-contract"),
+            )
+
+    def test_target_mode_must_match_selection_shape(
+        self, studio_config, stub_scripts, plugin_skills, single_taskset
+    ):
+        with pytest.raises(ValueError, match="when using skill_ids"):
+            build_eval_command(
+                studio_config,
+                {
+                    "target_mode": "skill",
+                    "skill_ids": [
+                        "claude-plugins--knowledge-init",
+                        "claude-plugins--knowledge-status",
+                    ],
+                    "plugin": "knowledge",
+                    "taskset_id": "single-set",
+                },
+                job_dir_of(studio_config, "eval-wrong-mode"),
+            )
 
     def test_unknown_skill_fails_fast(self, studio_config, stub_scripts, single_taskset):
         with pytest.raises(ValueError, match="skill 'claude--nope' not found"):
@@ -374,6 +552,52 @@ class TestBuildTaskgenCommand:
                 studio_config, {"skill_id": "claude--ghost"}, job_dir_of(studio_config, "gen-ghost")
             )
 
+    def test_multi_skill_argv(self, studio_config, stub_scripts, plugin_skills):
+        skill_a, skill_b = plugin_skills
+        argv = build_taskgen_command(
+            studio_config,
+            {
+                "skill_ids": [
+                    "claude-plugins--knowledge-init",
+                    "claude-plugins--knowledge-status",
+                ],
+                "plugin": "knowledge",
+                "count": 8,
+            },
+            job_dir_of(studio_config, "gen-plugin"),
+        )
+        skill_args = [
+            argv[index + 1]
+            for index, value in enumerate(argv)
+            if value == "--skill"
+        ]
+        assert skill_args == [str(skill_a), str(skill_b)]
+        assert argv[argv.index("--count") + 1] == "8"
+
+    def test_multi_skill_requires_same_plugin(
+        self, studio_config, stub_scripts, plugin_skills, claude_skill
+    ):
+        with pytest.raises(ValueError, match="same plugin"):
+            build_taskgen_command(
+                studio_config,
+                {
+                    "skill_ids": [
+                        "claude-plugins--knowledge-init",
+                        "claude--local-skill",
+                    ],
+                    "plugin": "knowledge",
+                },
+                job_dir_of(studio_config, "gen-mixed"),
+            )
+
+    def test_skill_ids_must_be_list(self, studio_config, stub_scripts):
+        with pytest.raises(ValueError, match="skill_ids must be a list"):
+            build_taskgen_command(
+                studio_config,
+                {"skill_ids": "claude--local-skill"},
+                job_dir_of(studio_config, "gen-bad-list"),
+            )
+
 
 class TestStudioApiE2E:
     @pytest.fixture
@@ -406,6 +630,74 @@ class TestStudioApiE2E:
         assert body["summary"]["soft_mean"] == 0.5
         assert [row["id"] for row in body["rows"]] == ["t0", "t1", "t2", "t3"]
         assert body["rows"][0]["judge_reason"] == "stub verdict"
+
+    def test_plugin_eval_job_end_to_end(
+        self,
+        studio_config,
+        client,
+        plugin_skills,
+    ):
+        tasks = [
+            {
+                "id": "route",
+                "question": "Choose the correct workflow.",
+                "rubric": "Uses the initialization workflow.",
+                "task_type": "routing",
+                "target_skills": ["knowledge-init"],
+            },
+            {
+                "id": "integrate",
+                "question": "Initialize and report status.",
+                "rubric": "Completes both workflows.",
+                "task_type": "integration",
+                "target_skills": ["knowledge-init", "knowledge-status"],
+            },
+            {
+                "id": "general",
+                "question": "Summarize the plugin.",
+                "rubric": "Provides a concise summary.",
+            },
+        ]
+        save_taskset(
+            studio_config,
+            "plugin-eval",
+            {"tasks": json.dumps(tasks).encode("utf-8")},
+            "single",
+        )
+        skill_ids = [
+            "claude-plugins--knowledge-init",
+            "claude-plugins--knowledge-status",
+        ]
+        response = client.post(
+            "/api/jobs",
+            json={
+                "type": "eval",
+                "params": {
+                    "target_mode": "plugin",
+                    "skill_ids": skill_ids,
+                    "plugin": "knowledge",
+                    "taskset_id": "plugin-eval",
+                },
+            },
+        )
+        assert response.status_code == 200, response.text
+        job = response.json()
+        assert job["params"]["target_mode"] == "plugin"
+        assert job["params"]["skill_ids"] == skill_ids
+        assert job["params"]["plugin"] == "knowledge"
+        self._wait_status(client, job["id"], "succeeded")
+
+        body = client.get(f"/api/jobs/{job['id']}/results").json()
+        aggregates = body["aggregates"]
+        assert aggregates["mode"] == "plugin"
+        assert aggregates["skill_count"] == 2
+        assert aggregates["overall"]["count"] == 3
+        assert aggregates["by_skill"]["knowledge-init"]["count"] == 2
+        assert aggregates["by_skill"]["knowledge-status"]["count"] == 1
+        assert aggregates["routing"]["count"] == 1
+        assert aggregates["integration"]["count"] == 1
+        assert aggregates["weakest_skill"]["name"] == "knowledge-status"
+        assert body["rows"][0]["target_skills"] == ["knowledge-init"]
 
     def test_train_job_end_to_end(self, studio_config, client, claude_skill, single_taskset):
         response = client.post(
@@ -451,6 +743,30 @@ class TestStudioApiE2E:
         assert body["tasks"][0]["rubric"] == "Must satisfy criterion 0."
         assert body["summary"]["requested_count"] == 3
         assert body["summary"]["backend"] == "claude_code_exec"
+
+    def test_multi_skill_taskgen_job_end_to_end(
+        self, studio_config, client, plugin_skills
+    ):
+        response = client.post(
+            "/api/jobs",
+            json={
+                "type": "taskgen",
+                "params": {
+                    "skill_ids": [
+                        "claude-plugins--knowledge-init",
+                        "claude-plugins--knowledge-status",
+                    ],
+                    "plugin": "knowledge",
+                    "count": 2,
+                },
+            },
+        )
+        assert response.status_code == 200, response.text
+        job_id = response.json()["id"]
+        self._wait_status(client, job_id, "succeeded")
+        body = client.get(f"/api/jobs/{job_id}/results").json()
+        assert body["summary"]["skill_count"] == 2
+        assert len(body["summary"]["skills"]) == 2
 
     def test_unsupported_type_message_lists_taskgen(self, client):
         response = client.post("/api/jobs", json={"type": "bogus", "params": {}})

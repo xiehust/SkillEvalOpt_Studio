@@ -52,6 +52,23 @@ def _validate_files(index: int, item: dict) -> dict:
             f"{{relative path: text content}}, got {type(files).__name__}"
         )
     for rel_path, content in files.items():
+        if (
+            not isinstance(rel_path, str)
+            or not rel_path
+            or rel_path.startswith(("~", "/", "\\"))
+            or "\\" in rel_path
+            or any(part in ("", ".", "..") for part in rel_path.split("/"))
+        ):
+            raise ValueError(
+                f"{_item_label(index, item)}: 'files' path {rel_path!r} "
+                "must be a safe relative path"
+            )
+        parts = rel_path.split("/")
+        if parts[0] in {".agents", "task.md"}:
+            raise ValueError(
+                f"{_item_label(index, item)}: 'files' path {rel_path!r} "
+                "collides with the evaluation runtime"
+            )
         if not isinstance(content, str):
             raise ValueError(
                 f"{_item_label(index, item)}: 'files' value for {rel_path!r} "
@@ -86,9 +103,14 @@ def _normalize_items(raw_items: list, source: str) -> list[dict]:
             )
         seen_ids.add(task_id)
 
+        raw_task_type = item.get("task_type")
+        if raw_task_type is not None and not isinstance(raw_task_type, str):
+            raise ValueError(
+                f"{_item_label(index, item)}: 'task_type' must be a string"
+            )
         normalized = dict(item)
         normalized["files"] = _validate_files(index, item)
-        normalized["task_type"] = str(item.get("task_type") or _DEFAULT_TASK_TYPE)
+        normalized["task_type"] = raw_task_type or _DEFAULT_TASK_TYPE
         tasks.append(normalized)
     return tasks
 

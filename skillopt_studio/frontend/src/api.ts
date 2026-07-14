@@ -6,6 +6,7 @@ export interface SkillInfo {
   id: string;
   name: string;
   source: string;
+  plugin?: string | null;
   path: string;
   description: string;
   files_count: number;
@@ -43,6 +44,7 @@ export interface TaskItem {
   question: string;
   rubric: string;
   task_type?: string;
+  target_skills?: string[];
   files?: Record<string, string>;
   [key: string]: unknown;
 }
@@ -127,6 +129,7 @@ export interface LogChunk {
 export interface EvalRow {
   id: string;
   task_type?: string;
+  target_skills?: string[];
   hard?: number;
   soft?: number;
   judge_reason?: string;
@@ -135,9 +138,28 @@ export interface EvalRow {
   judge_error?: string;
 }
 
+export interface EvalMetric {
+  count: number;
+  hard: number;
+  soft: number;
+}
+
+export interface EvalAggregates {
+  mode: "skill" | "plugin";
+  skill_count: number;
+  skill_names: string[];
+  overall: EvalMetric;
+  by_skill: Record<string, EvalMetric>;
+  by_task_type: Record<string, EvalMetric>;
+  routing: EvalMetric | null;
+  integration: EvalMetric | null;
+  weakest_skill: (EvalMetric & { name: string }) | null;
+}
+
 export interface EvalResults {
   type: "eval";
   summary: { tasks: number; pass_rate: number; soft_mean: number; duration_s: number };
+  aggregates?: EvalAggregates | null;
   rows: EvalRow[];
 }
 
@@ -181,6 +203,9 @@ export interface TaskgenSummary {
   backend?: string;
   model?: string;
   skill?: string;
+  skills?: string[];
+  skill_names?: string[];
+  skill_count?: number;
   attempts?: number;
   duration_s?: number;
 }

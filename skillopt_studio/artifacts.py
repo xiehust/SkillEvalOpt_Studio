@@ -24,7 +24,7 @@ _STEP_FIELDS = (
 
 _ROW_FIELDS = (
     "id", "task_type", "hard", "soft", "judge_reason", "duration_s", "error", "judge_error",
-    "usage", "judge_usage",
+    "target_skills", "usage", "judge_usage",
 )
 
 _USAGE_KEYS = ("input", "cache_write", "cache_read", "output", "total")
@@ -100,6 +100,9 @@ def eval_results(config: StudioConfig, job: JobInfo) -> dict | None:
     if not isinstance(results, list):
         return None
     rows = [{key: r.get(key) for key in _ROW_FIELDS if key in r} for r in results if isinstance(r, dict)]
+    aggregates = _read_json(out / "summary.json")
+    if not isinstance(aggregates, dict) or not isinstance(aggregates.get("overall"), dict):
+        aggregates = None
     return {
         "summary": {
             "tasks": len(rows),
@@ -108,6 +111,7 @@ def eval_results(config: StudioConfig, job: JobInfo) -> dict | None:
             "duration_s": round(sum(float(r.get("duration_s") or 0.0) for r in rows), 1),
             "tokens": _sum_usage(rows),
         },
+        "aggregates": aggregates,
         "rows": rows,
     }
 

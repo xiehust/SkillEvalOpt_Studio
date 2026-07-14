@@ -14,6 +14,7 @@ import os
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from typing import TypedDict
 
 from skillopt.model.backend_config import get_target_backend
 from skillopt.model.codex_harness import (
@@ -30,11 +31,24 @@ GUIDE_PROMPT = (
     "Then complete the task described in `task.md`. Give your final "
     "answer or a summary of what you produced at the end of your reply."
 )
+PLUGIN_GUIDE_PROMPT = (
+    "Inspect the available skills under `.agents/skills/` and use the relevant "
+    "skill or skills while completing the task in `task.md`. Do not assume that "
+    "every installed skill is relevant. Relative paths in a skill resolve from "
+    "that skill's own directory. Give your final answer or a summary of what "
+    "you produced at the end of your reply."
+)
 
 # where prepare_workspace installs the skill inside each work_dir
 SKILL_INSTALL_DIR = os.path.join(".agents", "skills", "skillopt-target")
 
 _SKIP_DIRS = {"__pycache__", "node_modules", ".git"}
+
+
+class RuntimeSkill(TypedDict):
+    name: str
+    content: str
+    files: list[tuple[str, str]]
 
 
 def collect_support_files(skill_dir: str) -> list[tuple[str, str]]:
@@ -70,6 +84,7 @@ def _rollout_one(
     model: str,
     skill_files: list[tuple[str, str]] | None = None,
     skill_docs: dict[str, str] | None = None,
+    runtime_skills: list[RuntimeSkill] | None = None,
 ) -> dict:
     # absolute: codex exec receives work_dir both as cwd and as `-C`, so a
     # relative path would be resolved twice and fail with ENOENT
@@ -77,16 +92,24 @@ def _rollout_one(
     result = {
         "id": str(item["id"]),
         "task_type": item.get("task_type", "default"),
+        "target_skills": list(item.get("target_skills") or []),
         "response": "",
         "duration_s": 0.0,
         "work_dir": work_dir,
     }
     start = time.time()
     try:
-        copy_files = [
-            (src, os.path.join(SKILL_INSTALL_DIR, rel_dst))
-            for src, rel_dst in (skill_files or [])
-        ]
+        if runtime_skills:
+            copy_files = [
+                (src, os.path.join(".agents", "skills", skill["name"], rel_dst))
+                for skill in runtime_skills
+                for src, rel_dst in skill["files"]
+            ]
+        else:
+            copy_files = [
+                (src, os.path.join(SKILL_INSTALL_DIR, rel_dst))
+                for src, rel_dst in (skill_files or [])
+            ]
         extra_files = dict(item.get("files") or {})
         for rel_dst, content in (skill_docs or {}).items():
             extra_files[os.path.join(SKILL_INSTALL_DIR, rel_dst)] = content
@@ -96,6 +119,10 @@ def _rollout_one(
             task_text=item["question"],
             extra_files=extra_files or None,
             copy_files=copy_files or None,
+            installed_skills=(
+                [(skill["name"], skill["content"]) for skill in runtime_skills]
+                if runtime_skills else None
+            ),
         )
         # Artifact-producing tasks are the norm in skill evaluation: allow file
         # edits (the default exec prompt injects "Do not modify files.") and
@@ -104,14 +131,14 @@ def _rollout_one(
         if get_target_backend() == "codex_exec":
             response, raw = run_codex_exec(
                 work_dir=work_dir,
-                prompt=GUIDE_PROMPT,
+                prompt=PLUGIN_GUIDE_PROMPT if runtime_skills else GUIDE_PROMPT,
                 model=model,
                 timeout=timeout,
             )
         else:
             response, raw = run_claude_code_exec(
                 work_dir=work_dir,
-                prompt=GUIDE_PROMPT,
+                prompt=PLUGIN_GUIDE_PROMPT if runtime_skills else GUIDE_PROMPT,
                 model=model,
                 timeout=timeout,
                 allowed_tools="Read,Bash,Write,Edit,Glob,Grep",
@@ -138,6 +165,7 @@ def run_batch(
     model: str = "",
     skill_files: list[tuple[str, str]] | None = None,
     skill_docs: dict[str, str] | None = None,
+    runtime_skills: list[RuntimeSkill] | None = None,
 ) -> list[dict]:
     """Roll out every task in *items* under *skill_content*, input order preserved.
 
@@ -166,6 +194,7 @@ def run_batch(
                 model=model,
                 skill_files=skill_files,
                 skill_docs=skill_docs,
+                runtime_skills=runtime_skills,
             )
             for item in items
         ]

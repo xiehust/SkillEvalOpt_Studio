@@ -14,6 +14,7 @@ class SkillInfo(BaseModel):
     id: str
     name: str
     source: str
+    plugin: Optional[str] = None
     path: str
     description: str = ""
     files_count: int = 0

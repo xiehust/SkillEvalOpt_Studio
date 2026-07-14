@@ -1,7 +1,7 @@
 {
   "header": {
     "title": "技能库",
-    "sub": "扫描本机 claude / codex / kiro / agents 四个技能源,以及 Studio 上传的技能"
+    "sub": "扫描本机 Claude / Codex / Kiro / Agents 技能源、Claude Plugins,以及 Studio 上传的技能"
   },
   "upload": {
     "button": "上传技能 zip",
@@ -10,13 +10,18 @@
     "success": "已上传技能 {{name}}"
   },
   "search": {
-    "placeholder": "搜索技能名称 / ID / 描述…"
+    "placeholder": "搜索技能名称 / Plugin / ID / 描述…"
+  },
+  "plugin": {
+    "label": "PLUGIN",
+    "all": "全部 Plugins",
+    "unknown": "未知 Plugin"
   },
   "empty": {
     "noMatchTitle": "没有匹配的技能",
     "noMatchHint": "换个关键词试试。",
     "noSkillsTitle": "没有发现技能",
-    "noSkillsHint": "四个本机技能源中都没有含 SKILL.md 的目录,可以先上传一个技能 zip。"
+    "noSkillsHint": "本机技能源中没有含 SKILL.md 的目录,可以先上传一个技能 zip。"
   },
   "card": {
     "count": "{{n}} 个技能",

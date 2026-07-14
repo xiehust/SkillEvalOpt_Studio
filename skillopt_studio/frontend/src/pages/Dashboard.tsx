@@ -4,7 +4,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { api, ApiError, DashboardJobRow, TokenUsage, usePolling } from "../api";
 import {
   Card, EmptyState, ErrorBanner, Mono, PageHeader, Spinner, StatBadge, StatusPill,
-  TokenCell, formatTime, jobDuration,
+  TokenCell, formatTime, jobDuration, jobSkillLabel,
 } from "../components/ui";
 
 const STATUS_ORDER = ["running", "queued", "succeeded", "failed", "cancelled"] as const;
@@ -299,7 +299,7 @@ export default function Dashboard() {
                         </td>
                         <td className="td">{TYPE_LABEL_KEYS[job.type] ? t(TYPE_LABEL_KEYS[job.type]) : job.type}</td>
                         <td className="td">
-                          <Mono className="text-muted">{String(job.params?.skill_id ?? "—")}</Mono>
+                          <Mono className="text-muted">{jobSkillLabel(job)}</Mono>
                         </td>
                         <td className="td"><StatusPill status={job.status} /></td>
                         <td className="td">

@@ -113,7 +113,8 @@
       "question": "Task text shown to the evaluated agent (the agent sees the skill and this text, but not the rubric)",
       "rubric": "Acceptance criteria for the LLM judge; must be objectively checkable (e.g. specific values, file names, required content), avoid vague descriptions like \"good quality\"",
       "files": "{relative path: text content}, pre-seeded into the agent's working directory (use it to inline input data the task needs)",
-      "task_type": "Grouping key for aggregating results by type; defaults to default"
+      "task_type": "Grouping key for aggregating results by type; defaults to default",
+      "target_skills": "Target skill names for multi-skill tasksets, used for ownership, routing, and integration analysis"
     },
     "copy": "Copy example",
     "copied": "Copied ✓"

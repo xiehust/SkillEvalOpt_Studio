@@ -25,6 +25,22 @@ VALID_ITEMS = [
     {"id": "task_002", "question": "Do the other thing?", "rubric": "Output contains OK."},
 ]
 INVALID_ITEMS = [{"id": "task_001", "question": "No rubric here."}]
+MULTI_ITEMS = [
+    {
+        "id": "task_001",
+        "question": "Initialize a knowledge workspace.",
+        "rubric": "The workspace is initialized.",
+        "task_type": "skill-a",
+        "target_skills": ["skill-a"],
+    },
+    {
+        "id": "task_002",
+        "question": "Report the current knowledge workspace status.",
+        "rubric": "The response reports topic counts.",
+        "task_type": "skill-b",
+        "target_skills": ["skill-b"],
+    },
+]
 
 
 class TestBuildPrompt:
@@ -52,6 +68,43 @@ class TestBuildPrompt:
         assert "[... skill truncated for prompt ...]" in prompt
         assert len(prompt) < gen.MAX_SKILL_CHARS + 4000
 
+    def test_multi_skill_prompt_requires_targets_and_balanced_coverage(self):
+        skills = [
+            gen.SkillDocument("skill-a", "/a", "# A", ["references/a.md"]),
+            gen.SkillDocument("skill-b", "/b", "# B", []),
+        ]
+        prompt = gen.build_multi_skill_prompt(skills, 6)
+        assert "one unified evaluation task set" in prompt
+        assert "### Skill: skill-a" in prompt
+        assert "### Skill: skill-b" in prompt
+        assert '"target_skills"' in prompt
+        assert "every skill must be covered" in prompt
+        assert "routing/disambiguation" in prompt
+
+
+class TestValidateGeneratedTasks:
+    skills = [
+        gen.SkillDocument("skill-a", "/a", "# A", []),
+        gen.SkillDocument("skill-b", "/b", "# B", []),
+    ]
+
+    def test_multi_skill_valid(self):
+        gen.validate_generated_tasks(MULTI_ITEMS, 2, self.skills)
+
+    def test_multi_skill_rejects_unknown_target(self):
+        items = [dict(MULTI_ITEMS[0], target_skills=["ghost"]), MULTI_ITEMS[1]]
+        with pytest.raises(ValueError, match="unknown target_skills"):
+            gen.validate_generated_tasks(items, 2, self.skills)
+
+    def test_multi_skill_requires_full_coverage_when_count_allows(self):
+        items = [MULTI_ITEMS[0], dict(MULTI_ITEMS[0], id="task_002")]
+        with pytest.raises(ValueError, match="does not cover every skill"):
+            gen.validate_generated_tasks(items, 2, self.skills)
+
+    def test_generated_count_must_match_request(self):
+        with pytest.raises(ValueError, match="expected exactly 3"):
+            gen.validate_generated_tasks(MULTI_ITEMS, 3, self.skills)
+
 
 def _fake_writer(items_per_call: list[list[dict]], calls: list[dict]):
     """Fake run_* that logs kwargs and writes the next scripted file content."""
@@ -74,6 +127,36 @@ def _run_main(monkeypatch, tmp_path: Path, extra_argv: list[str]) -> Path:
     monkeypatch.setattr(
         sys, "argv",
         ["generate_tasks.py", "--skill", str(skill), "--out_root", str(out_root)] + extra_argv,
+    )
+    gen.main()
+    return out_root
+
+
+def _run_multi_main(monkeypatch, tmp_path: Path, extra_argv: list[str]) -> Path:
+    skill_a = tmp_path / "skill-a"
+    skill_a.mkdir()
+    (skill_a / "SKILL.md").write_text(
+        "---\nname: skill-a\n---\n# A\n", encoding="utf-8"
+    )
+    skill_b = tmp_path / "skill-b"
+    skill_b.mkdir()
+    (skill_b / "SKILL.md").write_text(
+        "---\nname: skill-b\n---\n# B\n", encoding="utf-8"
+    )
+    out_root = tmp_path / "out"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generate_tasks.py",
+            "--skill",
+            str(skill_a),
+            "--skill",
+            str(skill_b),
+            "--out_root",
+            str(out_root),
+        ]
+        + extra_argv,
     )
     gen.main()
     return out_root
@@ -145,3 +228,16 @@ class TestMainDispatch:
         assert summary["backend"] == "claude_code_exec"
         assert summary["model"] == "my-model"
         assert calls[0]["model"] == "my-model"
+
+    def test_multi_skill_dispatch_and_summary(self, monkeypatch, tmp_path):
+        calls: list[dict] = []
+        monkeypatch.setattr(gen, "run_claude_code_exec", _fake_writer([MULTI_ITEMS], calls))
+        out_root = _run_multi_main(monkeypatch, tmp_path, ["--count", "2"])
+        assert len(calls) == 1
+        assert "### Skill: skill-a" in calls[0]["prompt"]
+        assert "### Skill: skill-b" in calls[0]["prompt"]
+        summary = json.loads((out_root / "gen_summary.json").read_text(encoding="utf-8"))
+        assert summary["skill"] is None
+        assert summary["skill_names"] == ["skill-a", "skill-b"]
+        assert summary["skill_count"] == 2
+        assert len(summary["skills"]) == 2

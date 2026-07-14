@@ -15,7 +15,7 @@ import {
 } from "../components/highlight";
 import {
   Card, ErrorBanner, Mono, PageHeader, Spinner, StatBadge, StatusPill,
-  formatDuration, formatSize, formatTime, jobDuration, truncate,
+  formatDuration, formatSize, formatTime, jobDuration, jobSkillLabel, truncate,
 } from "../components/ui";
 
 const TABS = ["overview", "log", "results", "artifacts"] as const;
@@ -53,12 +53,12 @@ export default function JobDetailPage() {
 
       {job && (
         <>
-          <div className="flex gap-1 border-b border-line mb-6">
+          <div className="grid grid-cols-2 gap-1 border-b border-line mb-6 sm:flex">
             {TABS.map((key) => (
               <button
                 key={key}
                 data-testid={`tab-${key}`}
-                className={`px-4 py-2 text-sm border-b-2 -mb-px transition-colors ${
+                className={`min-w-0 px-2 py-2 text-sm border-b-2 -mb-px transition-colors sm:px-4 ${
                   tab === key
                     ? "border-amber text-amber font-medium"
                     : "border-transparent text-muted hover:text-text"
@@ -122,6 +122,9 @@ function OverviewTab({ job }: { job: JobInfo }) {
       <div className="flex flex-wrap gap-3">
         <StatBadge label={t("overview.status")} value={<StatusPill status={job.status} />} />
         <StatBadge label={t("overview.duration")} value={jobDuration(job)} tone="s2" />
+        {Array.isArray(job.params?.skill_ids) && (
+          <StatBadge label={t("overview.target")} value={jobSkillLabel(job)} tone="s5" />
+        )}
         {job.exit_code !== null && (
           <StatBadge label={t("overview.exitCode")} value={job.exit_code} tone={job.exit_code === 0 ? "good" : "critText"} />
         )}
@@ -280,10 +283,19 @@ function TaskgenResultsView({ results, job }: { results: TaskgenResults; job: Jo
   const { tasks, summary } = results;
 
   const suggestedName = () => {
+    const plugin = String(job.params.plugin ?? "");
+    const skillIds = Array.isArray(job.params.skill_ids)
+      ? job.params.skill_ids.map(String)
+      : [];
+    if (skillIds.length > 1) {
+      return `${plugin || t("taskgen.multiSkillBase")}-${t("taskgen.autoGenSuffix")}`;
+    }
     const skillId = String(job.params.skill_id ?? "");
     const base = skillId.includes("--") ? skillId.split("--").slice(1).join("--") : skillId;
     return `${base || t("taskgen.defaultBase")}-${t("taskgen.autoGenSuffix")}`;
   };
+
+  const showTargets = tasks.some((task) => task.target_skills?.length);
 
   const importTasks = () => {
     navigate("/tasksets", {
@@ -296,6 +308,9 @@ function TaskgenResultsView({ results, job }: { results: TaskgenResults; job: Jo
       <div className="flex flex-wrap gap-3">
         <StatBadge label={t("taskgen.generatedCount")} value={tasks.length} tone="good" />
         {summary.requested_count != null && <StatBadge label={t("taskgen.requestedCount")} value={summary.requested_count} />}
+        {summary.skill_count != null && summary.skill_count > 1 && (
+          <StatBadge label={t("taskgen.skillCount")} value={summary.skill_count} tone="s2" />
+        )}
         {summary.backend && <StatBadge label={t("taskgen.backend")} value={summary.backend} tone="s2" />}
         {summary.model != null && <StatBadge label={t("taskgen.model")} value={summary.model || t("taskgen.cliDefault")} tone="muted" />}
         {summary.attempts != null && <StatBadge label={t("taskgen.attempts")} value={summary.attempts} tone="muted" />}
@@ -318,6 +333,7 @@ function TaskgenResultsView({ results, job }: { results: TaskgenResults; job: Jo
               <tr>
                 <th className="th">ID</th>
                 <th className="th">{t("taskgen.table.type")}</th>
+                {showTargets && <th className="th">{t("taskgen.table.targets")}</th>}
                 <th className="th">{t("taskgen.table.question")}</th>
                 <th className="th">{t("taskgen.table.rubric")}</th>
               </tr>
@@ -327,6 +343,13 @@ function TaskgenResultsView({ results, job }: { results: TaskgenResults; job: Jo
                 <tr key={task.id} className="hover:bg-panel2/40">
                   <td className="td"><Mono className="text-s1">{task.id}</Mono></td>
                   <td className="td"><Mono className="text-xs text-muted">{task.task_type ?? "default"}</Mono></td>
+                  {showTargets && (
+                    <td className="td">
+                      <Mono className="text-xs text-s2">
+                        {task.target_skills?.join(", ") || "—"}
+                      </Mono>
+                    </td>
+                  )}
                   <td className="td text-sm max-w-md">{truncate(task.question, 120)}</td>
                   <td className="td text-sm text-muted max-w-md">{truncate(task.rubric, 120)}</td>
                 </tr>
@@ -342,15 +365,97 @@ function TaskgenResultsView({ results, job }: { results: TaskgenResults; job: Jo
 function EvalResultsView({ results }: { results: EvalResults }) {
   const { t } = useTranslation("jobs");
   const [expanded, setExpanded] = useState<string | null>(null);
-  const { summary, rows } = results;
+  const { summary, aggregates, rows } = results;
+  const pluginAggregates = aggregates?.mode === "plugin" ? aggregates : null;
+  const showTargets = rows.some((row) => row.target_skills?.length);
+  const metricValue = (metric: { hard: number; soft: number }) =>
+    `${(metric.hard * 100).toFixed(0)}% / ${metric.soft.toFixed(3)}`;
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap gap-3">
         <StatBadge label={t("eval.tasks")} value={summary.tasks} />
         <StatBadge label={t("eval.passRate")} value={`${(summary.pass_rate * 100).toFixed(0)}%`} tone="good" />
         <StatBadge label={t("eval.softMean")} value={summary.soft_mean.toFixed(3)} tone="s2" />
+        {pluginAggregates && (
+          <StatBadge label={t("eval.skills")} value={pluginAggregates.skill_count} tone="s5" />
+        )}
         <StatBadge label={t("eval.totalDuration")} value={formatDuration(summary.duration_s)} tone="muted" />
       </div>
+      {pluginAggregates && (
+        <>
+          <div className="flex flex-wrap gap-3" data-testid="eval-plugin-metrics">
+            {pluginAggregates.routing && (
+              <StatBadge
+                label={t("eval.routing")}
+                value={metricValue(pluginAggregates.routing)}
+                tone="s2"
+              />
+            )}
+            {pluginAggregates.integration && (
+              <StatBadge
+                label={t("eval.integration")}
+                value={metricValue(pluginAggregates.integration)}
+                tone="s5"
+              />
+            )}
+            {pluginAggregates.weakest_skill && (
+              <StatBadge
+                label={t("eval.weakestSkill")}
+                value={`${pluginAggregates.weakest_skill.name} · ${metricValue(pluginAggregates.weakest_skill)}`}
+                tone="critText"
+              />
+            )}
+          </div>
+          <Card title={t("eval.pluginBreakdownTitle")}>
+            <div className="grid gap-6 xl:grid-cols-2">
+              <div className="overflow-x-auto">
+                <table className="w-full" data-testid="eval-by-skill">
+                  <thead>
+                    <tr>
+                      <th className="th">{t("eval.skill")}</th>
+                      <th className="th">{t("eval.count")}</th>
+                      <th className="th">{t("eval.hard")}</th>
+                      <th className="th">{t("eval.soft")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Object.entries(pluginAggregates.by_skill).map(([name, metric]) => (
+                      <tr key={name}>
+                        <td className="td"><Mono className="text-s1">{name}</Mono></td>
+                        <td className="td"><Mono>{metric.count}</Mono></td>
+                        <td className="td"><Mono>{(metric.hard * 100).toFixed(0)}%</Mono></td>
+                        <td className="td"><Mono>{metric.soft.toFixed(3)}</Mono></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full" data-testid="eval-by-task-type">
+                  <thead>
+                    <tr>
+                      <th className="th">{t("eval.table.type")}</th>
+                      <th className="th">{t("eval.count")}</th>
+                      <th className="th">{t("eval.hard")}</th>
+                      <th className="th">{t("eval.soft")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Object.entries(pluginAggregates.by_task_type).map(([name, metric]) => (
+                      <tr key={name}>
+                        <td className="td"><Mono className="text-s2">{name}</Mono></td>
+                        <td className="td"><Mono>{metric.count}</Mono></td>
+                        <td className="td"><Mono>{(metric.hard * 100).toFixed(0)}%</Mono></td>
+                        <td className="td"><Mono>{metric.soft.toFixed(3)}</Mono></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </Card>
+        </>
+      )}
       <Card title={t("eval.perTaskTitle")}>
         <div className="overflow-x-auto -m-4">
           <table className="w-full" data-testid="eval-results-table">
@@ -358,6 +463,7 @@ function EvalResultsView({ results }: { results: EvalResults }) {
               <tr>
                 <th className="th">ID</th>
                 <th className="th">{t("eval.table.type")}</th>
+                {showTargets && <th className="th">{t("eval.table.targets")}</th>}
                 <th className="th">{t("eval.table.pass")}</th>
                 <th className="th">{t("eval.table.soft")}</th>
                 <th className="th">{t("eval.table.judgeReason")}</th>
@@ -369,6 +475,11 @@ function EvalResultsView({ results }: { results: EvalResults }) {
                 <tr key={row.id} className="hover:bg-panel2/40">
                   <td className="td"><Mono className="text-s1">{row.id}</Mono></td>
                   <td className="td"><Mono className="text-xs text-muted">{row.task_type ?? "default"}</Mono></td>
+                  {showTargets && (
+                    <td className="td">
+                      <Mono className="text-xs text-s2">{row.target_skills?.join(", ") || "—"}</Mono>
+                    </td>
+                  )}
                   <td className="td">
                     <span className={row.hard ? "text-good font-semibold" : "text-critText font-semibold"}>
                       {row.hard ? "✓" : "✗"}

@@ -108,6 +108,7 @@ class TestScanSkills:
         skills = scan_skills(studio_config)
         assert {s.source for s in skills} == set(SOURCES)
         assert {s.id for s in skills} == {f"{source}--{source}-skill" for source in SOURCES}
+        assert all(s.plugin is None for s in skills)
 
     def test_skips_dirs_without_skill_md(self, studio_config):
         make_skill(studio_config.skill_sources["claude"], "real-skill")
@@ -200,6 +201,7 @@ class TestScanClaudePlugins:
             "claude-plugins--doc-skills-pdf",
         ]
         assert all(s.source == "claude-plugins" for s in skills)
+        assert {s.plugin for s in skills} == {"doc-skills"}
         docx = next(s for s in skills if s.name == "docx")
         assert docx.description == "Word docs"
 

@@ -64,6 +64,44 @@ def render_skill_md(
     return "\n".join(chunks)
 
 
+def _workspace_target(work_dir: str, rel_path: str, *, label: str) -> str:
+    if (
+        not isinstance(rel_path, str)
+        or not rel_path
+        or rel_path.startswith(("~", "/", "\\"))
+        or "\\" in rel_path
+        or os.path.isabs(rel_path)
+        or any(part in ("", ".", "..") for part in rel_path.split("/"))
+    ):
+        raise ValueError(f"{label} must be a safe relative path: {rel_path!r}")
+    root = os.path.abspath(work_dir)
+    target = os.path.abspath(os.path.join(root, os.path.normpath(rel_path)))
+    if os.path.commonpath((root, target)) != root:
+        raise ValueError(f"{label} escapes the workspace: {rel_path!r}")
+    return target
+
+
+def _reserve_workspace_target(
+    work_dir: str,
+    rel_path: str,
+    *,
+    label: str,
+    reserved: dict[str, str],
+) -> str:
+    target = _workspace_target(work_dir, rel_path, label=label)
+    for other, other_label in reserved.items():
+        if (
+            target == other
+            or target.startswith(other + os.sep)
+            or other.startswith(target + os.sep)
+        ):
+            raise ValueError(
+                f"{label} collides with {other_label}: {rel_path!r}"
+            )
+    reserved[target] = label
+    return target
+
+
 def prepare_workspace(
     *,
     work_dir: str,
@@ -74,63 +112,139 @@ def prepare_workspace(
     extra_files: dict[str, str] | None = None,
     copy_files: list[tuple[str, str]] | None = None,
     link_dirs: list[tuple[str, str]] | None = None,
+    installed_skills: list[tuple[str, str]] | None = None,
 ) -> tuple[str, str]:
-    if os.path.exists(work_dir):
-        shutil.rmtree(work_dir)
-    os.makedirs(os.path.join(work_dir, ".agents", "skills", "skillopt-target"), exist_ok=True)
+    reserved: dict[str, str] = {}
+    skill_writes: list[tuple[str, str]] = []
+    if installed_skills is not None:
+        if not installed_skills:
+            raise ValueError("installed_skills must not be empty")
+        seen_names: set[str] = set()
+        for name, content in installed_skills:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+                raise ValueError(f"invalid installed skill name: {name!r}")
+            if name in seen_names:
+                raise ValueError(f"duplicate installed skill name: {name!r}")
+            seen_names.add(name)
+            rel_path = os.path.join(".agents", "skills", name, "SKILL.md")
+            path = _reserve_workspace_target(
+                work_dir,
+                rel_path,
+                label=f"installed skill {name!r}",
+                reserved=reserved,
+            )
+            skill_writes.append((path, content))
+        skill_path = skill_writes[0][0]
+    else:
+        skill_path = _reserve_workspace_target(
+            work_dir,
+            os.path.join(".agents", "skills", "skillopt-target", "SKILL.md"),
+            label="target skill",
+            reserved=reserved,
+        )
+        skill_writes.append((skill_path, skill_md))
 
-    skill_path = os.path.join(work_dir, ".agents", "skills", "skillopt-target", "SKILL.md")
-    with open(skill_path, "w", encoding="utf-8") as f:
-        f.write(skill_md)
+    task_path = _reserve_workspace_target(
+        work_dir,
+        task_filename,
+        label="task file",
+        reserved=reserved,
+    )
+    extra_writes = [
+        (
+            _reserve_workspace_target(
+                work_dir,
+                rel_path,
+                label=f"extra file {rel_path!r}",
+                reserved=reserved,
+            ),
+            content,
+        )
+        for rel_path, content in (extra_files or {}).items()
+    ]
+    copy_writes = [
+        (
+            src,
+            _reserve_workspace_target(
+                work_dir,
+                rel_dst,
+                label=f"copied file {rel_dst!r}",
+                reserved=reserved,
+            ),
+        )
+        for src, rel_dst in (copy_files or [])
+    ]
+    link_writes = [
+        (
+            src,
+            _reserve_workspace_target(
+                work_dir,
+                rel_dst,
+                label=f"linked directory {rel_dst!r}",
+                reserved=reserved,
+            ),
+        )
+        for src, rel_dst in (link_dirs or [])
+    ]
 
-    task_path = os.path.join(work_dir, task_filename)
-    if task_text:
-        with open(task_path, "w", encoding="utf-8") as f:
-            f.write(task_text)
-
-    if extra_files:
-        for rel_path, content in extra_files.items():
-            full_path = os.path.join(work_dir, rel_path)
-            parent = os.path.dirname(full_path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(full_path, "w", encoding="utf-8") as f:
-                f.write(content)
-
-    if copy_files:
-        for src, rel_dst in copy_files:
-            dst = os.path.join(work_dir, rel_dst)
-            parent = os.path.dirname(dst)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            shutil.copy2(src, dst)
-
-    if link_dirs:
-        for src, rel_dst in link_dirs:
-            dst = os.path.join(work_dir, rel_dst)
-            parent = os.path.dirname(dst)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            os.symlink(os.path.abspath(src), dst)
-
-    attachment_lines: list[str] = []
+    image_writes: list[tuple[str, str, str]] = []
     if images:
-        attachments_dir = os.path.join(work_dir, "attachments")
-        os.makedirs(attachments_dir, exist_ok=True)
         for index, image in enumerate(images, 1):
             if not os.path.exists(image):
                 raise FileNotFoundError(image)
             src = os.path.abspath(image)
             base = os.path.basename(src) or f"image_{index}"
-            dst_name = f"{index:02d}_{base}"
-            dst = os.path.join(attachments_dir, dst_name)
-            if os.path.abspath(src) != os.path.abspath(dst):
-                shutil.copy2(src, dst)
-            rel_dst = os.path.relpath(dst, work_dir)
-            attachment_lines.append(f"- `{rel_dst}` (source: `{src}`)")
+            rel_dst = os.path.join("attachments", f"{index:02d}_{base}")
+            dst = _reserve_workspace_target(
+                work_dir,
+                rel_dst,
+                label=f"attachment {index}",
+                reserved=reserved,
+            )
+            image_writes.append((src, dst, rel_dst))
+        attachments_manifest = _reserve_workspace_target(
+            work_dir,
+            "ATTACHMENTS.md",
+            label="attachments manifest",
+            reserved=reserved,
+        )
+    else:
+        attachments_manifest = ""
+
+    if os.path.exists(work_dir):
+        shutil.rmtree(work_dir)
+    for path, content in skill_writes:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    if task_text:
+        os.makedirs(os.path.dirname(task_path), exist_ok=True)
+        with open(task_path, "w", encoding="utf-8") as f:
+            f.write(task_text)
+
+    for full_path, content in extra_writes:
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    for src, dst in copy_writes:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+
+    for src, dst in link_writes:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        os.symlink(os.path.abspath(src), dst)
+
+    attachment_lines: list[str] = []
+    for src, dst, rel_dst in image_writes:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.abspath(src) != os.path.abspath(dst):
+            shutil.copy2(src, dst)
+        attachment_lines.append(f"- `{rel_dst}` (source: `{src}`)")
 
     if attachment_lines:
-        with open(os.path.join(work_dir, "ATTACHMENTS.md"), "w", encoding="utf-8") as f:
+        with open(attachments_manifest, "w", encoding="utf-8") as f:
             f.write(
                 "# Attachments\n\n"
                 "Use these local files when the task refers to attached images or documents.\n\n"

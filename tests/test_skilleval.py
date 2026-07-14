@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -84,6 +85,24 @@ class TestLoadTasks:
         with pytest.raises(ValueError, match="'files' must be a dict"):
             load_tasks(path)
 
+    @pytest.mark.parametrize(
+        "bad_path",
+        [
+            "../secret.txt",
+            "data/../secret.txt",
+            "/tmp/secret.txt",
+            r"data\secret.txt",
+            "task.md",
+            "task.md/notes.txt",
+            ".agents",
+            ".agents/skills/target/SKILL.md",
+        ],
+    )
+    def test_unsafe_or_runtime_colliding_file_path_raises(self, tmp_path, bad_path) -> None:
+        path = _write_tasks(tmp_path, [_valid_item(files={bad_path: "no"})])
+        with pytest.raises(ValueError, match="'files' path"):
+            load_tasks(path)
+
     def test_limit_truncates_after_full_validation(self, tmp_path) -> None:
         bad = _valid_item("late_bad")
         del bad["rubric"]
@@ -112,6 +131,11 @@ class TestLoadTasks:
         task = load_tasks(path)[0]
         assert task["task_type"] == "qa"
         assert task["files"] == {"a.txt": "hello"}
+
+    def test_non_string_task_type_raises(self, tmp_path) -> None:
+        path = _write_tasks(tmp_path, [_valid_item(task_type={"bad": True})])
+        with pytest.raises(ValueError, match="'task_type' must be a string"):
+            load_tasks(path)
 
     def test_does_not_mutate_caller_visible_structures(self, tmp_path) -> None:
         path = _write_tasks(tmp_path, [_valid_item()])
@@ -407,6 +431,64 @@ class TestRunBatch:
         assert results[0]["response"] == "claude answer"
         assert not codex_calls
 
+    def test_plugin_runtime_installs_every_skill_without_leaking_targets(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        prepared = []
+        exec_calls = []
+        monkeypatch.setattr(
+            rollout_mod,
+            "prepare_workspace",
+            lambda **kwargs: prepared.append(kwargs) or ("", ""),
+        )
+        monkeypatch.setattr(
+            rollout_mod,
+            "run_claude_code_exec",
+            lambda **kwargs: exec_calls.append(kwargs) or ("ok", "raw"),
+        )
+        skills = [
+            {
+                "name": "alpha",
+                "content": "# Alpha",
+                "files": [("/source/alpha/run.py", "scripts/run.py")],
+            },
+            {
+                "name": "beta",
+                "content": "# Beta",
+                "files": [("/source/beta/doc.md", "references/doc.md")],
+            },
+        ]
+        item = _valid_item(
+            "t1",
+            target_skills=["beta"],
+            task_type="routing",
+        )
+        result = run_batch(
+            [item],
+            "# Alpha",
+            str(tmp_path),
+            runtime_skills=skills,
+        )[0]
+
+        assert prepared[0]["installed_skills"] == [
+            ("alpha", "# Alpha"),
+            ("beta", "# Beta"),
+        ]
+        assert prepared[0]["copy_files"] == [
+            (
+                "/source/alpha/run.py",
+                os.path.join(".agents", "skills", "alpha", "scripts", "run.py"),
+            ),
+            (
+                "/source/beta/doc.md",
+                os.path.join(".agents", "skills", "beta", "references", "doc.md"),
+            ),
+        ]
+        assert prepared[0]["task_text"] == item["question"]
+        assert "beta" not in prepared[0]["task_text"]
+        assert exec_calls[0]["prompt"] == rollout_mod.PLUGIN_GUIDE_PROMPT
+        assert result["target_skills"] == ["beta"]
+
 
 # ── CLI / report ──────────────────────────────────────────────────────────
 
@@ -508,6 +590,64 @@ class TestBuildReport:
         assert "# Skill Evaluation Report" in captured.out
 
 
+class TestPluginAggregation:
+    def test_attributes_multi_target_and_weakest_skill(self) -> None:
+        results = [
+            _result("t1", 1, 1.0, task_type="routing", target_skills=["alpha"]),
+            _result("t2", 0, 0.4, task_type="integration", target_skills=["alpha", "beta"]),
+        ]
+        summary = evaluate_skill.aggregate_results(results, ["alpha", "beta"])
+        assert summary["overall"] == {"count": 2, "hard": 0.5, "soft": 0.7}
+        assert summary["by_skill"]["alpha"]["count"] == 2
+        assert summary["by_skill"]["beta"] == {"count": 1, "hard": 0.0, "soft": 0.4}
+        assert summary["routing"]["count"] == 1
+        assert summary["integration"]["count"] == 1
+        assert summary["weakest_skill"]["name"] == "beta"
+        assert summary["mode"] == "plugin"
+        assert summary["skill_names"] == ["alpha", "beta"]
+
+    def test_normalize_rejects_unknown_target(self) -> None:
+        items = [_valid_item(target_skills=["unknown"])]
+        with pytest.raises(ValueError, match="unknown skills"):
+            evaluate_skill.normalize_plugin_tasks(items, {"alpha"})
+
+    @pytest.mark.parametrize("bad_targets", [[], "alpha", [""], [1]])
+    def test_normalize_rejects_malformed_targets(self, bad_targets) -> None:
+        with pytest.raises(ValueError, match="target_skills"):
+            evaluate_skill.normalize_plugin_tasks(
+                [_valid_item(target_skills=bad_targets)],
+                {"alpha"},
+            )
+
+    def test_normalize_defaults_absent_targets_and_strips_values(self) -> None:
+        items = [
+            _valid_item(task_type="  routing  ", target_skills=[" alpha ", "alpha"]),
+            _valid_item("t2", task_type="   "),
+        ]
+        evaluate_skill.normalize_plugin_tasks(items, {"alpha"})
+        assert items[0]["target_skills"] == ["alpha"]
+        assert items[0]["task_type"] == "routing"
+        assert items[1]["target_skills"] == []
+        assert items[1]["task_type"] == "default"
+
+    def test_normalize_rejects_non_string_task_type(self) -> None:
+        with pytest.raises(ValueError, match="task_type must be a string"):
+            evaluate_skill.normalize_plugin_tasks(
+                [_valid_item(task_type={"bad": True})],
+                {"alpha"},
+            )
+
+    def test_unassigned_tasks_only_contribute_to_overall_and_type(self) -> None:
+        summary = evaluate_skill.aggregate_results(
+            [_result("t1", 1, 0.8, task_type="general", target_skills=[])],
+            ["alpha"],
+        )
+        assert summary["overall"]["count"] == 1
+        assert summary["by_task_type"]["general"]["count"] == 1
+        assert summary["by_skill"]["alpha"]["count"] == 0
+        assert summary["weakest_skill"] is None
+
+
 class TestMergeScores:
     def _items(self):
         return [_valid_item("t1"), _valid_item("t2")]
@@ -600,6 +740,238 @@ class TestCollectSkill:
         _content, files = evaluate_skill._collect_skill(str(skill))
         assert "link.txt" not in [rel for _src, rel in files]
 
+    def test_runtime_skills_use_frontmatter_names(self, tmp_path) -> None:
+        first = tmp_path / "one"
+        second = tmp_path / "two"
+        first.mkdir()
+        second.mkdir()
+        (first / "SKILL.md").write_text("---\nname: alpha\n---\n# A\n", encoding="utf-8")
+        (second / "SKILL.md").write_text("---\nname: beta\n---\n# B\n", encoding="utf-8")
+        skills = evaluate_skill.collect_runtime_skills([str(first), str(second)])
+        assert [skill["name"] for skill in skills] == ["alpha", "beta"]
+
+    def test_runtime_skills_reject_duplicate_names(self, tmp_path) -> None:
+        first = tmp_path / "one"
+        second = tmp_path / "two"
+        for path in (first, second):
+            path.mkdir()
+            (path / "SKILL.md").write_text(
+                "---\nname: duplicate\n---\n# Skill\n",
+                encoding="utf-8",
+            )
+        with pytest.raises(ValueError, match="duplicate skill name"):
+            evaluate_skill.collect_runtime_skills([str(first), str(second)])
+
+    def test_runtime_skills_reject_unsafe_name(self, tmp_path) -> None:
+        skill = tmp_path / "unsafe"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            "---\nname: ../escape\n---\n# Skill\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="filesystem-safe"):
+            evaluate_skill.collect_runtime_skills([str(skill)])
+
+    def test_standalone_markdown_uses_file_stem_as_runtime_name(self, tmp_path) -> None:
+        skill = tmp_path / "standalone.md"
+        skill.write_text("# Standalone\n", encoding="utf-8")
+        runtime_skills = evaluate_skill.collect_runtime_skills([str(skill)])
+        assert runtime_skills[0]["name"] == "standalone"
+
+
+class TestEvaluateSkillCli:
+    @staticmethod
+    def _skill(tmp_path, name: str):
+        skill = tmp_path / name
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            f"---\nname: {name}\n---\n# {name}\n",
+            encoding="utf-8",
+        )
+        return skill
+
+    def test_single_skill_keeps_legacy_runtime_layout(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        skill = self._skill(tmp_path, "alpha")
+        tasks = _write_tasks(tmp_path, [_valid_item()])
+        out_root = tmp_path / "out"
+        seen = {}
+        args = SimpleNamespace(
+            skill=[str(skill)],
+            tasks=tasks,
+            limit=0,
+            out_root=str(out_root),
+            workers=1,
+            timeout=60,
+            model="",
+        )
+        monkeypatch.setattr(evaluate_skill, "parse_args", lambda: args)
+        monkeypatch.setattr(evaluate_skill, "_configure_backends", lambda _args: None)
+
+        def fake_run_batch(items, skill_content, output, **kwargs):
+            seen.update(
+                items=items,
+                skill_content=skill_content,
+                output=output,
+                kwargs=kwargs,
+            )
+            return [{"id": items[0]["id"], "response": "ok", "duration_s": 0.1}]
+
+        monkeypatch.setattr(evaluate_skill, "run_batch", fake_run_batch)
+        monkeypatch.setattr(
+            evaluate_skill,
+            "merge_scores",
+            lambda items, rollouts, judge_fn: [
+                _result(items[0]["id"], 1, 1.0)
+            ],
+        )
+
+        evaluate_skill.main()
+
+        assert seen["kwargs"]["runtime_skills"] is None
+        assert seen["skill_content"].endswith("# alpha\n")
+        summary = json.loads((out_root / "summary.json").read_text(encoding="utf-8"))
+        assert summary["mode"] == "skill"
+        assert summary["skill_names"] == ["alpha"]
+
+    def test_repeated_skills_share_one_rollout_and_write_plugin_summary(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        alpha = self._skill(tmp_path, "alpha")
+        beta = self._skill(tmp_path, "beta")
+        tasks = _write_tasks(
+            tmp_path,
+            [
+                _valid_item(
+                    target_skills=["alpha", "beta"],
+                    task_type="integration",
+                )
+            ],
+        )
+        out_root = tmp_path / "plugin-out"
+        seen = {}
+        args = SimpleNamespace(
+            skill=[str(alpha), str(beta)],
+            tasks=tasks,
+            limit=0,
+            out_root=str(out_root),
+            workers=1,
+            timeout=60,
+            model="",
+        )
+        monkeypatch.setattr(evaluate_skill, "parse_args", lambda: args)
+        monkeypatch.setattr(evaluate_skill, "_configure_backends", lambda _args: None)
+
+        def fake_run_batch(items, skill_content, output, **kwargs):
+            seen["runtime_skills"] = kwargs["runtime_skills"]
+            return [{"id": items[0]["id"], "response": "ok", "duration_s": 0.1}]
+
+        monkeypatch.setattr(evaluate_skill, "run_batch", fake_run_batch)
+        monkeypatch.setattr(
+            evaluate_skill,
+            "merge_scores",
+            lambda items, rollouts, judge_fn: [
+                _result(items[0]["id"], 1, 0.9)
+            ],
+        )
+
+        evaluate_skill.main()
+
+        assert [skill["name"] for skill in seen["runtime_skills"]] == ["alpha", "beta"]
+        summary = json.loads((out_root / "summary.json").read_text(encoding="utf-8"))
+        assert summary["mode"] == "plugin"
+        assert summary["skill_count"] == 2
+        assert summary["integration"]["count"] == 1
+        results = json.loads((out_root / "results.json").read_text(encoding="utf-8"))
+        assert results[0]["target_skills"] == ["alpha", "beta"]
+
+    def test_limit_does_not_hide_unknown_target(self, tmp_path, monkeypatch) -> None:
+        alpha = self._skill(tmp_path, "alpha")
+        beta = self._skill(tmp_path, "beta")
+        tasks = _write_tasks(
+            tmp_path,
+            [
+                _valid_item(target_skills=["alpha"]),
+                _valid_item("late", target_skills=["unknown"]),
+            ],
+        )
+        args = SimpleNamespace(
+            skill=[str(alpha), str(beta)],
+            tasks=tasks,
+            limit=1,
+        )
+        monkeypatch.setattr(evaluate_skill, "parse_args", lambda: args)
+        with pytest.raises(SystemExit, match="unknown skills"):
+            evaluate_skill.main()
+
+
+from skillopt.model.codex_harness import prepare_workspace  # noqa: E402
+
+
+class TestPluginWorkspace:
+    def test_materializes_separate_skills_with_support_files(self, tmp_path) -> None:
+        source = tmp_path / "source.py"
+        source.write_text("print('ok')", encoding="utf-8")
+        work_dir = tmp_path / "work"
+
+        skill_path, task_path = prepare_workspace(
+            work_dir=str(work_dir),
+            skill_md="unused",
+            task_text="Do the task",
+            installed_skills=[("alpha", "# Alpha"), ("beta", "# Beta")],
+            copy_files=[
+                (
+                    str(source),
+                    os.path.join(".agents", "skills", "beta", "scripts", "source.py"),
+                )
+            ],
+        )
+
+        assert skill_path == str(work_dir / ".agents" / "skills" / "alpha" / "SKILL.md")
+        assert task_path == str(work_dir / "task.md")
+        assert (work_dir / ".agents" / "skills" / "alpha" / "SKILL.md").read_text() == "# Alpha"
+        assert (work_dir / ".agents" / "skills" / "beta" / "SKILL.md").read_text() == "# Beta"
+        assert (
+            work_dir / ".agents" / "skills" / "beta" / "scripts" / "source.py"
+        ).read_text() == "print('ok')"
+
+    @pytest.mark.parametrize(
+        ("installed_skills", "copy_destination", "message"),
+        [
+            ([("alpha", "# A"), ("alpha", "# B")], None, "duplicate"),
+            ([("../escape", "# A")], None, "invalid"),
+            ([("alpha", "# A")], "../escape.txt", "safe relative"),
+            (
+                [("alpha", "# A")],
+                os.path.join(".agents", "skills", "alpha", "SKILL.md"),
+                "collides",
+            ),
+        ],
+    )
+    def test_invalid_layout_fails_before_existing_workspace_is_deleted(
+        self,
+        tmp_path,
+        installed_skills,
+        copy_destination,
+        message,
+    ) -> None:
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        sentinel = work_dir / "keep.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+        source = tmp_path / "source.txt"
+        source.write_text("source", encoding="utf-8")
+        copy_files = [(str(source), copy_destination)] if copy_destination else None
+
+        with pytest.raises(ValueError, match=message):
+            prepare_workspace(
+                work_dir=str(work_dir),
+                skill_md="unused",
+                installed_skills=installed_skills,
+                copy_files=copy_files,
+            )
+        assert sentinel.read_text(encoding="utf-8") == "keep"
 
 # ── Training adapter ──────────────────────────────────────────────────────
 

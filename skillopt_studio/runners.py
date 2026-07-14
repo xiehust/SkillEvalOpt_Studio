@@ -120,16 +120,55 @@ def _validated_int(params: dict, key: str) -> int | None:
     return number
 
 
+def _resolve_skill_selection(config: StudioConfig, params: dict) -> list[SkillInfo]:
+    raw_skill_ids = params.get("skill_ids")
+    target_mode = params.get("target_mode")
+    if raw_skill_ids is None:
+        if target_mode not in (None, "skill"):
+            raise ValueError("target_mode must be 'skill' when using skill_id")
+        skill_id = params.get("skill_id")
+        if not isinstance(skill_id, str) or not skill_id:
+            raise ValueError("select a skill")
+        return [_resolve_skill(config, skill_id)]
+
+    if target_mode not in (None, "plugin"):
+        raise ValueError("target_mode must be 'plugin' when using skill_ids")
+    if "skill_id" in params:
+        raise ValueError("use either skill_id or skill_ids, not both")
+    if not isinstance(raw_skill_ids, list):
+        raise ValueError("skill_ids must be a list")
+    if any(not isinstance(skill_id, str) or not skill_id for skill_id in raw_skill_ids):
+        raise ValueError("skill_ids must contain non-empty strings")
+    skill_ids = list(dict.fromkeys(raw_skill_ids))
+    if len(skill_ids) < 2:
+        raise ValueError("plugin mode requires at least two distinct skills")
+
+    skills = [_resolve_skill(config, skill_id) for skill_id in skill_ids]
+    plugin_keys = {(skill.source, skill.plugin) for skill in skills}
+    if len(plugin_keys) != 1 or any(skill.plugin is None for skill in skills):
+        raise ValueError("plugin skills must belong to the same plugin")
+    plugin_name = skills[0].plugin
+    requested_plugin = params.get("plugin")
+    if not isinstance(requested_plugin, str) or requested_plugin != plugin_name:
+        raise ValueError(
+            f"plugin must match the selected skills: expected {plugin_name!r}"
+        )
+    return skills
+
+
 def build_eval_command(config: StudioConfig, params: dict, job_dir: Path) -> list[str]:
     """argv for scripts/evaluate_skill.py; output goes to <job_dir>/out."""
     _require_script(EVAL_SCRIPT)
-    skill = _resolve_skill(config, str(params.get("skill_id", "")))
+    skills = _resolve_skill_selection(config, params)
     tasks_file = _resolve_taskset_file(config, str(params.get("taskset_id", "")))
     target_backend = _resolve_target_backend(params)
 
     argv = [
         PYTHON, str(EVAL_SCRIPT),
-        "--skill", skill.path,
+    ]
+    for skill in skills:
+        argv += ["--skill", skill.path]
+    argv += [
         "--tasks", str(tasks_file),
         "--out_root", str(job_dir / "out"),
         "--target_backend", target_backend,
@@ -152,13 +191,16 @@ def build_eval_command(config: StudioConfig, params: dict, job_dir: Path) -> lis
 def build_taskgen_command(config: StudioConfig, params: dict, job_dir: Path) -> list[str]:
     """argv for scripts/generate_tasks.py; output goes to <job_dir>/out."""
     _require_script(GEN_SCRIPT)
-    skill = _resolve_skill(config, str(params.get("skill_id", "")))
+    skills = _resolve_skill_selection(config, params)
     target_backend = _resolve_target_backend(params)
 
     count = _validated_int(params, "count")
     argv = [
         PYTHON, str(GEN_SCRIPT),
-        "--skill", skill.path,
+    ]
+    for skill in skills:
+        argv += ["--skill", skill.path]
+    argv += [
         "--backend", target_backend,
         "--count", str(count if count is not None else 5),
         "--out_root", str(job_dir / "out"),

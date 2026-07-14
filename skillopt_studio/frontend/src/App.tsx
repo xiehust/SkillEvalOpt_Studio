@@ -90,19 +90,19 @@ function Topbar() {
   const healthy = useHealth();
   const { t } = useTranslation("app");
   return (
-    <header className="h-[52px] sticky top-0 z-50 flex items-center gap-5 px-5 border-b border-line bg-[rgba(11,14,13,.92)] backdrop-blur-[6px]">
+    <header className="h-[52px] sticky top-0 z-50 flex items-center gap-2 px-3 border-b border-line bg-[rgba(11,14,13,.92)] backdrop-blur-[6px] sm:gap-5 sm:px-5">
       <div className="flex items-center gap-2.5 whitespace-nowrap">
         <BrandGlyph />
         <span className="[font-stretch:125%] font-extrabold tracking-[0.14em] text-[13px]">
-          SKILLEVAL&amp;OPT <em className="not-italic text-amber">STUDIO</em>
+          SKILLEVAL&amp;OPT <em className="hidden not-italic text-amber sm:inline">STUDIO</em>
         </span>
       </div>
       <span className="font-mono text-[11px] text-faint tracking-[0.06em] hidden sm:inline">
         CONSOLE / <b className="text-muted font-medium">{currentCrumb(location.pathname)}</b>
       </span>
-      <div className="ml-auto flex items-center gap-2.5">
+      <div className="ml-auto flex items-center gap-1.5 sm:gap-2.5">
         <span
-          className="font-mono text-[10.5px] text-muted border border-line bg-panel px-2.5 py-1 flex items-center gap-2"
+          className="hidden font-mono text-[10.5px] text-muted border border-line bg-panel px-2.5 py-1 items-center gap-2 sm:flex"
           data-testid="syschip"
         >
           <span
@@ -126,9 +126,11 @@ export default function App() {
   return (
     <div className="min-h-screen">
       <Topbar />
-      <div className="grid grid-cols-[216px_1fr] min-h-[calc(100vh-52px)]">
+      <div className="grid grid-cols-[132px_minmax(0,1fr)] min-h-[calc(100vh-52px)] sm:grid-cols-[216px_minmax(0,1fr)]">
         <aside className="border-r border-line py-4 flex flex-col gap-0.5 sticky top-[52px] h-[calc(100vh-52px)]">
-          <div className="font-mono text-[9.5px] tracking-[0.22em] text-faint px-5 pt-2 pb-1.5">CONSOLE</div>
+          <div className="font-mono text-[9.5px] tracking-[0.22em] text-faint px-3 pt-2 pb-1.5 sm:px-5">
+            CONSOLE
+          </div>
           <nav className="flex-1">
             {NAV_ITEMS.map((item, index) => (
               <NavLink
@@ -136,7 +138,7 @@ export default function App() {
                 to={item.to}
                 end={item.to === "/"}
                 className={({ isActive }) =>
-                  `flex items-center gap-3 px-5 py-[9px] text-[13px] font-medium border-l-2 ${
+                  `flex items-center gap-2 px-3 py-[9px] text-[12px] font-medium border-l-2 sm:gap-3 sm:px-5 sm:text-[13px] ${
                     isActive
                       ? "border-amber text-amber bg-gradient-to-r from-amber/[.13] to-transparent"
                       : "border-transparent text-muted hover:text-text hover:bg-white/[.02]"
@@ -145,7 +147,7 @@ export default function App() {
               >
                 {({ isActive }) => (
                   <>
-                    <span className={`font-mono text-[9.5px] w-5 ${isActive ? "text-amber" : "text-faint"}`}>
+                    <span className={`font-mono text-[9.5px] w-4 sm:w-5 ${isActive ? "text-amber" : "text-faint"}`}>
                       {String(index + 1).padStart(2, "0")}
                     </span>
                     {t(item.labelKey)}
@@ -154,7 +156,7 @@ export default function App() {
               </NavLink>
             ))}
           </nav>
-          <div className="mt-auto px-5 py-3.5 border-t border-line font-mono text-[9.5px] text-faint leading-[1.9]">
+          <div className="mt-auto hidden px-5 py-3.5 border-t border-line font-mono text-[9.5px] text-faint leading-[1.9] sm:block">
             <div className="truncate">
               HOST <b className="text-muted font-medium">{window.location.host}</b>
             </div>
@@ -164,7 +166,7 @@ export default function App() {
           </div>
         </aside>
         <main className="min-w-0">
-          <div className="max-w-[1460px] mx-auto px-7 py-6 pb-16">
+          <div className="max-w-[1460px] mx-auto px-3 py-5 pb-16 sm:px-7 sm:py-6">
             <Routes>
               <Route path="/" element={<Dashboard />} />
               <Route path="/skills" element={<Skills />} />

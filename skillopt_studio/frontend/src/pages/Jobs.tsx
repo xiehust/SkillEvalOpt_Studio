@@ -4,7 +4,7 @@ import { useTranslation } from "react-i18next";
 import { api, JobInfo, JobStatus, usePolling } from "../api";
 import {
   Card, EmptyState, ErrorBanner, Mono, PageHeader, Pagination, Spinner, StatusPill,
-  TokenCell, formatTime, jobDuration, usePagination,
+  TokenCell, formatTime, jobDuration, jobSkillLabel, usePagination,
 } from "../components/ui";
 
 const STATUS_FILTERS: (JobStatus | "all")[] = ["all", "running", "queued", "succeeded", "failed", "cancelled"];
@@ -113,7 +113,7 @@ export default function Jobs() {
                     <td className="td">{t(`common:jobType.${job.type}`, { defaultValue: job.type })}</td>
                     <td className="td">
                       <Mono className="text-xs text-muted block">
-                        {String(job.params?.skill_id ?? "—")}
+                        {jobSkillLabel(job)}
                       </Mono>
                       <Mono className="text-xs text-muted/60 block">
                         {String(job.params?.taskset_id ?? "")}

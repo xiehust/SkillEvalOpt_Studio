@@ -104,7 +104,12 @@ def _read_sidecar(skill_dir: Path) -> dict:
     return loaded if isinstance(loaded, dict) else {}
 
 
-def _build_skill_info(source: str, skill_dir: Path, slug_base: str | None = None) -> SkillInfo:
+def _build_skill_info(
+    source: str,
+    skill_dir: Path,
+    slug_base: str | None = None,
+    plugin: str | None = None,
+) -> SkillInfo:
     skill_md_path = skill_dir / "SKILL.md"
     try:
         skill_md_text = skill_md_path.read_text(encoding="utf-8", errors="replace")
@@ -118,6 +123,7 @@ def _build_skill_info(source: str, skill_dir: Path, slug_base: str | None = None
         id=f"{source}--{slugify(slug_base or skill_dir.name)}",
         name=str(name),
         source=source,
+        plugin=plugin,
         path=str(skill_dir),
         description=str(description),
         files_count=len(files),
@@ -142,8 +148,8 @@ def _topmost_skill_dirs(root: Path, depth: int = PLUGIN_SCAN_DEPTH) -> list[Path
     return found
 
 
-def _plugin_candidates(root: Path) -> list[tuple[Path, str | None]]:
-    """(skill_dir, slug_base) for every skill of every installed Claude Code plugin.
+def _plugin_candidates(root: Path) -> list[tuple[Path, str | None, str | None]]:
+    """(skill_dir, slug_base, plugin) for every skill of every installed Claude Code plugin.
 
     Reads ``installed_plugins.json`` (``{"plugins": {"name@marketplace": [{"scope",
     "installPath", ...}]}}``) rather than walking cache/marketplaces directories, so
@@ -158,7 +164,7 @@ def _plugin_candidates(root: Path) -> list[tuple[Path, str | None]]:
     plugins = manifest.get("plugins") if isinstance(manifest, dict) else None
     if not isinstance(plugins, dict):
         return []
-    candidates: list[tuple[Path, str | None]] = []
+    candidates: list[tuple[Path, str | None, str | None]] = []
     seen_installs: set[Path] = set()
     for key in sorted(plugins):
         installs = plugins[key]
@@ -180,27 +186,29 @@ def _plugin_candidates(root: Path) -> list[tuple[Path, str | None]]:
                 continue
             seen_installs.add(install_dir)
             for skill_dir in _topmost_skill_dirs(install_dir):
-                candidates.append((skill_dir, f"{plugin_name}-{skill_dir.name}"))
+                candidates.append((skill_dir, f"{plugin_name}-{skill_dir.name}", plugin_name))
     return candidates
 
 
-def _candidate_dirs(source: str, root: Path) -> list[tuple[Path, str | None]]:
-    """(dir, id slug base) pairs to probe for SKILL.md under one source root.
+def _candidate_dirs(source: str, root: Path) -> list[tuple[Path, str | None, str | None]]:
+    """(dir, id slug base, plugin) tuples to probe for SKILL.md under one source root.
 
     A None slug base means "use the resolved directory name" (plain sources);
-    plugin candidates carry an explicit ``<plugin>-<skill>`` base instead.
+    plugin candidates carry an explicit ``<plugin>-<skill>`` base and plugin name.
     """
     if (root / PLUGINS_MANIFEST).is_file():
         return _plugin_candidates(root)
     if not root.is_dir():
         return []
-    candidates: list[tuple[Path, str | None]] = [
-        (entry, None) for entry in sorted(root.iterdir()) if entry.is_dir()
+    candidates: list[tuple[Path, str | None, str | None]] = [
+        (entry, None, None) for entry in sorted(root.iterdir()) if entry.is_dir()
     ]
     if source == "codex":
         system_layer = root / ".system"
         if system_layer.is_dir():
-            candidates.extend((entry, None) for entry in sorted(system_layer.iterdir()) if entry.is_dir())
+            candidates.extend(
+                (entry, None, None) for entry in sorted(system_layer.iterdir()) if entry.is_dir()
+            )
     return candidates
 
 
@@ -217,14 +225,14 @@ def scan_skills(config: StudioConfig) -> list[SkillInfo]:
     seen_resolved: set[Path] = set()
     seen_ids: set[str] = set()
     for source, root in sources.items():
-        for entry, slug_base in _candidate_dirs(source, root.expanduser()):
+        for entry, slug_base, plugin in _candidate_dirs(source, root.expanduser()):
             try:
                 resolved = entry.resolve()
             except OSError:
                 continue
             if resolved in seen_resolved or not (resolved / "SKILL.md").is_file():
                 continue
-            info = _build_skill_info(source, resolved, slug_base)
+            info = _build_skill_info(source, resolved, slug_base, plugin)
             if info.id in seen_ids:  # same plugin at another scope/version, or a name clash
                 continue
             seen_resolved.add(resolved)

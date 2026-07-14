@@ -7,7 +7,8 @@ export const EXAMPLE_JSON = `[
     "question": "阅读 data/app.log,统计 ERROR 行数,并把结果写入 report.md。",
     "rubric": "report.md 必须存在,且给出的 ERROR 行数为 3。",
     "files": { "data/app.log": "INFO boot ok\\nERROR db timeout\\nERROR retry failed\\nERROR gave up\\n" },
-    "task_type": "log-analysis"
+    "task_type": "log-analysis",
+    "target_skills": ["log-analyzer"]
   },
   {
     "id": "task_002",
@@ -22,6 +23,7 @@ const FIELDS: { name: string; required: "yes" | "no"; descKey: string }[] = [
   { name: "rubric", required: "yes", descKey: "rubric" },
   { name: "files", required: "no", descKey: "files" },
   { name: "task_type", required: "no", descKey: "task_type" },
+  { name: "target_skills", required: "no", descKey: "target_skills" },
 ];
 
 /** Collapsible JSON schema documentation for skilleval task files. */

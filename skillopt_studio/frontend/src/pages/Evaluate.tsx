@@ -13,6 +13,9 @@ export default function Evaluate() {
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const [skillId, setSkillId] = useState(searchParams.get("skill") ?? "");
+  const [targetMode, setTargetMode] = useState<"skill" | "plugin">("skill");
+  const [pluginKey, setPluginKey] = useState("");
+  const [pluginSkillIds, setPluginSkillIds] = useState<string[]>([]);
   const [skillQuery, setSkillQuery] = useState("");
   const [skillSource, setSkillSource] = useState("");
   const [tasksetId, setTasksetId] = useState("");
@@ -58,11 +61,43 @@ export default function Evaluate() {
     );
   }, [skills, skillQuery, skillSource]);
 
+  const pluginGroups = useMemo(() => {
+    const grouped = new Map<string, { key: string; name: string; source: string; skills: SkillInfo[] }>();
+    for (const skill of skills ?? []) {
+      if (!skill.plugin) continue;
+      const key = `${skill.source}::${skill.plugin}`;
+      const group = grouped.get(key) ?? { key, name: skill.plugin, source: skill.source, skills: [] };
+      group.skills.push(skill);
+      grouped.set(key, group);
+    }
+    return [...grouped.values()]
+      .filter((group) => group.skills.length >= 2)
+      .map((group) => ({ ...group, skills: group.skills.sort((a, b) => a.name.localeCompare(b.name)) }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [skills]);
+  const filteredPluginGroups = useMemo(() => {
+    const query = skillQuery.trim().toLowerCase();
+    if (!query) return pluginGroups;
+    return pluginGroups.filter(
+      (group) =>
+        group.name.toLowerCase().includes(query)
+        || group.skills.some(
+          (skill) =>
+            skill.name.toLowerCase().includes(query)
+            || skill.id.toLowerCase().includes(query),
+        ),
+    );
+  }, [pluginGroups, skillQuery]);
+  const selectedPlugin = pluginGroups.find((group) => group.key === pluginKey);
+
   const selectedTaskset = tasksets?.find((taskset) => taskset.id === tasksetId);
 
   const onSubmit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!skillId || !tasksetId) {
+    const hasTarget = targetMode === "skill"
+      ? Boolean(skillId)
+      : Boolean(selectedPlugin) && pluginSkillIds.length >= 2;
+    if (!hasTarget || !tasksetId) {
       setFormError(t("evaluate.errNoSkillTaskset"));
       return;
     }
@@ -82,7 +117,10 @@ export default function Evaluate() {
     setSubmitting(true);
     try {
       const job = await api.createJob("eval", {
-        skill_id: skillId,
+        target_mode: targetMode,
+        ...(targetMode === "skill"
+          ? { skill_id: skillId }
+          : { skill_ids: pluginSkillIds, plugin: selectedPlugin?.name }),
         taskset_id: tasksetId,
         target_backend: targetBackend,
         model: model.trim(),
@@ -106,16 +144,38 @@ export default function Evaluate() {
 
       {skills !== null && tasksets !== null && (
         <form onSubmit={onSubmit} noValidate className="space-y-6" data-testid="evaluate-form">
-          <Card title={t("picker.selectSkillTitle")}>
+          <Card title={t("evaluate.selectTargetTitle")}>
+            <div className="inline-flex border border-line bg-panel2 mb-3" data-testid="eval-target-mode">
+              {(["skill", "plugin"] as const).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  className={`min-w-28 px-3 py-2 text-sm transition-colors ${
+                    targetMode === mode ? "bg-amber/15 text-amber" : "text-muted hover:text-text"
+                  }`}
+                  onClick={() => { setTargetMode(mode); setSkillQuery(""); setFormError(null); }}
+                  data-testid={`eval-mode-${mode}`}
+                >
+                  {t(`taskgen.mode.${mode}`)}
+                </button>
+              ))}
+            </div>
             <div className="flex flex-wrap items-center gap-3 mb-3">
               <input
                 className="input max-w-sm !w-auto flex-1 min-w-[14rem]"
-                placeholder={t("picker.searchSkillPlaceholder")}
+                placeholder={
+                  targetMode === "skill"
+                    ? t("picker.searchSkillPlaceholder")
+                    : t("taskgen.searchPluginPlaceholder")
+                }
                 value={skillQuery}
                 onChange={(event) => setSkillQuery(event.target.value)}
               />
-              <SourceFilterChips skills={skills} value={skillSource} onChange={setSkillSource} />
+              {targetMode === "skill" && (
+                <SourceFilterChips skills={skills} value={skillSource} onChange={setSkillSource} />
+              )}
             </div>
+            {targetMode === "skill" ? (
             <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3 max-h-72 overflow-y-auto pr-1">
               {filteredSkills.map((skill) => (
                 <label
@@ -151,6 +211,75 @@ export default function Evaluate() {
                 </div>
               )}
             </div>
+            ) : (
+              <>
+                <div className="grid gap-2 md:grid-cols-2 max-h-56 overflow-y-auto pr-1">
+                  {filteredPluginGroups.map((group) => (
+                      <label
+                        key={group.key}
+                        data-plugin-option={group.name}
+                        className={`flex items-start gap-2.5 p-3 border cursor-pointer ${
+                          pluginKey === group.key ? "border-amber bg-amber/[.13]" : "border-line bg-panel2 hover:border-muted"
+                        }`}
+                      >
+                        <input
+                          type="radio"
+                          name="eval-plugin"
+                          className="mt-1 accent-amber"
+                          checked={pluginKey === group.key}
+                          onChange={() => {
+                            setPluginKey(group.key);
+                            setPluginSkillIds(group.skills.map((skill) => skill.id));
+                            applyBackend(group.source === "codex" ? "codex_exec" : "claude_code_exec");
+                          }}
+                        />
+                        <span>
+                          <span className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm font-medium">
+                            {group.name}<SourceTag source={group.source} />
+                          </span>
+                          <span className="block text-xs text-muted mt-0.5">
+                            {t("taskgen.pluginSkillCount", { count: group.skills.length })}
+                          </span>
+                        </span>
+                      </label>
+                    ))}
+                  {filteredPluginGroups.length === 0 && (
+                    <div className="text-sm text-muted col-span-full py-4">
+                      {t("taskgen.noPluginMatch")}
+                    </div>
+                  )}
+                </div>
+                {selectedPlugin && (
+                  <div className="mt-3 border border-line bg-panel2/40 p-3" data-testid="eval-plugin-skills">
+                    <div className="text-xs text-muted mb-2">
+                      <span className="text-text font-medium">{selectedPlugin.name}</span>
+                      {" · "}
+                      {t("taskgen.selectedPluginSkills", {
+                        selected: pluginSkillIds.length,
+                        total: selectedPlugin.skills.length,
+                      })}
+                    </div>
+                    <div className="grid gap-2 md:grid-cols-2">
+                      {selectedPlugin.skills.map((skill) => (
+                        <label key={skill.id} className="flex items-center gap-2 min-w-0 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            className="accent-amber"
+                            checked={pluginSkillIds.includes(skill.id)}
+                            onChange={() => setPluginSkillIds((current) =>
+                              current.includes(skill.id)
+                                ? current.filter((id) => id !== skill.id)
+                                : [...current, skill.id],
+                            )}
+                          />
+                          <span className="text-sm truncate">{skill.name}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
           </Card>
 
           <Card title={t("evaluate.selectTasksetTitle")}>

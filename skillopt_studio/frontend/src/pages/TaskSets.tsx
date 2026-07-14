@@ -177,15 +177,15 @@ function CreateTaskSetForm({
   return (
     <Card title={t("list.newTaskset")} className="mb-6">
       <div className="space-y-4">
-        <div className="flex gap-2" data-testid="taskset-tabs">
+        <div className="grid gap-2 sm:grid-cols-3" data-testid="taskset-tabs">
           {CREATE_TABS.map((entry) => (
             <button
               key={entry.key}
               type="button"
               className={
                 tab === entry.key
-                  ? "btn-primary !px-3 !py-1.5 text-sm"
-                  : "btn-ghost !px-3 !py-1.5 text-sm"
+                  ? "btn-primary w-full !px-3 !py-1.5 text-sm"
+                  : "btn-ghost w-full !px-3 !py-1.5 text-sm"
               }
               onClick={() => setTab(entry.key)}
               data-testid={`taskset-tab-${entry.key}`}

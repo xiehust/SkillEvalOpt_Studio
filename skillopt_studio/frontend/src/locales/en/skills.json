@@ -1,7 +1,7 @@
 {
   "header": {
     "title": "Skill Library",
-    "sub": "Scans the local claude / codex / kiro / agents skill sources, plus skills uploaded to Studio"
+    "sub": "Scans local Claude / Codex / Kiro / Agents sources, Claude Plugins, and skills uploaded to Studio"
   },
   "upload": {
     "button": "Upload skill zip",
@@ -10,13 +10,18 @@
     "success": "Uploaded skill {{name}}"
   },
   "search": {
-    "placeholder": "Search skill name / ID / description…"
+    "placeholder": "Search skill name / plugin / ID / description…"
+  },
+  "plugin": {
+    "label": "PLUGIN",
+    "all": "All plugins",
+    "unknown": "Unknown plugin"
   },
   "empty": {
     "noMatchTitle": "No matching skills",
     "noMatchHint": "Try a different keyword.",
     "noSkillsTitle": "No skills found",
-    "noSkillsHint": "None of the four local skill sources contain a directory with a SKILL.md — upload a skill zip to get started."
+    "noSkillsHint": "None of the local skill sources contain a directory with a SKILL.md — upload a skill zip to get started."
   },
   "card": {
     "count": "{{n}} skills",
