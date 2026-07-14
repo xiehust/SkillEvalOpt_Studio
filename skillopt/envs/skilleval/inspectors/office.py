@@ -63,6 +63,46 @@ _WORD_NAMESPACE = (
 _PRESENTATION_NAMESPACE = (
     "http://schemas.openxmlformats.org/presentationml/2006/main"
 )
+_DRAWING_NAMESPACE = (
+    "http://schemas.openxmlformats.org/drawingml/2006/main"
+)
+_CHART_NAMESPACE = (
+    "http://schemas.openxmlformats.org/drawingml/2006/chart"
+)
+_CHART_DRAWING_NAMESPACE = (
+    "http://schemas.openxmlformats.org/drawingml/2006/chartDrawing"
+)
+_DIAGRAM_NAMESPACE = (
+    "http://schemas.openxmlformats.org/drawingml/2006/diagram"
+)
+_DIAGRAM_DRAWING_NAMESPACE = (
+    "http://schemas.microsoft.com/office/drawing/2008/diagram"
+)
+_SPREADSHEET_DRAWING_NAMESPACE = (
+    "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+)
+_CHART_STYLE_NAMESPACE = (
+    "http://schemas.microsoft.com/office/drawing/2012/chartStyle"
+)
+_CHARTEX_NAMESPACE = (
+    "http://schemas.microsoft.com/office/drawing/2014/chartex"
+)
+_CORE_PROPERTIES_NAMESPACE = (
+    "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+)
+_EXTENDED_PROPERTIES_NAMESPACE = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/"
+    "extended-properties"
+)
+_CUSTOM_PROPERTIES_NAMESPACE = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/"
+    "custom-properties"
+)
+_CUSTOM_XML_NAMESPACE = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/customXml"
+)
+_XML_SIGNATURE_NAMESPACE = "http://www.w3.org/2000/09/xmldsig#"
+_INK_NAMESPACE = "http://www.w3.org/2003/InkML"
 _SLIDE_RELATIONSHIP = f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/slide"
 _SLIDE_LAYOUT_RELATIONSHIP = (
     f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/slideLayout"
@@ -92,6 +132,117 @@ _NOTES_SLIDE_CONTENT_TYPE = (
 _CHART_CONTENT_TYPES = {
     "application/vnd.openxmlformats-officedocument.drawingml.chart+xml",
     "application/vnd.ms-office.chartex+xml",
+}
+_PPT_RELATIONSHIP_TARGET_ROOTS = {
+    "application/vnd.openxmlformats-package.core-properties+xml": (
+        f"{{{_CORE_PROPERTIES_NAMESPACE}}}coreProperties"
+    ),
+    "application/vnd.openxmlformats-officedocument."
+    "extended-properties+xml": (
+        f"{{{_EXTENDED_PROPERTIES_NAMESPACE}}}Properties"
+    ),
+    "application/vnd.openxmlformats-officedocument."
+    "custom-properties+xml": (
+        f"{{{_CUSTOM_PROPERTIES_NAMESPACE}}}Properties"
+    ),
+    "application/vnd.openxmlformats-officedocument."
+    "customXmlProperties+xml": (
+        f"{{{_CUSTOM_XML_NAMESPACE}}}datastoreItem"
+    ),
+    _PPT_MAIN_CONTENT_TYPE: (
+        f"{{{_PRESENTATION_NAMESPACE}}}presentation"
+    ),
+    _SLIDE_CONTENT_TYPE: f"{{{_PRESENTATION_NAMESPACE}}}sld",
+    _SLIDE_LAYOUT_CONTENT_TYPE: (
+        f"{{{_PRESENTATION_NAMESPACE}}}sldLayout"
+    ),
+    _NOTES_SLIDE_CONTENT_TYPE: (
+        f"{{{_PRESENTATION_NAMESPACE}}}notes"
+    ),
+    "application/vnd.openxmlformats-officedocument."
+    "presentationml.slideMaster+xml": (
+        f"{{{_PRESENTATION_NAMESPACE}}}sldMaster"
+    ),
+    "application/vnd.openxmlformats-officedocument."
+    "presentationml.notesMaster+xml": (
+        f"{{{_PRESENTATION_NAMESPACE}}}notesMaster"
+    ),
+    "application/vnd.openxmlformats-officedocument."
+    "presentationml.handoutMaster+xml": (
+        f"{{{_PRESENTATION_NAMESPACE}}}handoutMaster"
+    ),
+    "application/vnd.openxmlformats-officedocument."
+    "presentationml.presProps+xml": (
+        f"{{{_PRESENTATION_NAMESPACE}}}presentationPr"
+    ),
+    "application/vnd.openxmlformats-officedocument."
+    "presentationml.viewProps+xml": (
+        f"{{{_PRESENTATION_NAMESPACE}}}viewPr"
+    ),
+    "application/vnd.openxmlformats-officedocument."
+    "presentationml.tableStyles+xml": (
+        f"{{{_DRAWING_NAMESPACE}}}tblStyleLst"
+    ),
+    "application/vnd.openxmlformats-officedocument."
+    "presentationml.comments+xml": (
+        f"{{{_PRESENTATION_NAMESPACE}}}cmLst"
+    ),
+    "application/vnd.openxmlformats-officedocument."
+    "presentationml.commentAuthors+xml": (
+        f"{{{_PRESENTATION_NAMESPACE}}}cmAuthorLst"
+    ),
+    "application/vnd.openxmlformats-officedocument."
+    "presentationml.tags+xml": (
+        f"{{{_PRESENTATION_NAMESPACE}}}tagLst"
+    ),
+    "application/vnd.openxmlformats-officedocument.theme+xml": (
+        f"{{{_DRAWING_NAMESPACE}}}theme"
+    ),
+    "application/vnd.openxmlformats-officedocument.themeOverride+xml": (
+        f"{{{_DRAWING_NAMESPACE}}}themeOverride"
+    ),
+    "application/vnd.openxmlformats-officedocument."
+    "drawingml.chart+xml": f"{{{_CHART_NAMESPACE}}}chartSpace",
+    "application/vnd.ms-office.chartex+xml": (
+        f"{{{_CHARTEX_NAMESPACE}}}chartSpace"
+    ),
+    "application/vnd.openxmlformats-officedocument."
+    "drawingml.chartshapes+xml": (
+        f"{{{_CHART_DRAWING_NAMESPACE}}}userShapes"
+    ),
+    "application/vnd.openxmlformats-officedocument."
+    "drawingml.diagramColors+xml": (
+        f"{{{_DIAGRAM_NAMESPACE}}}colorsDef"
+    ),
+    "application/vnd.openxmlformats-officedocument."
+    "drawingml.diagramData+xml": (
+        f"{{{_DIAGRAM_NAMESPACE}}}dataModel"
+    ),
+    "application/vnd.openxmlformats-officedocument."
+    "drawingml.diagramLayout+xml": (
+        f"{{{_DIAGRAM_NAMESPACE}}}layoutDef"
+    ),
+    "application/vnd.openxmlformats-officedocument."
+    "drawingml.diagramStyle+xml": (
+        f"{{{_DIAGRAM_NAMESPACE}}}styleDef"
+    ),
+    "application/vnd.ms-office.drawingml.diagramDrawing+xml": (
+        f"{{{_DIAGRAM_DRAWING_NAMESPACE}}}drawing"
+    ),
+    "application/vnd.openxmlformats-officedocument.drawing+xml": (
+        f"{{{_SPREADSHEET_DRAWING_NAMESPACE}}}wsDr"
+    ),
+    "application/vnd.ms-office.chartstyle+xml": (
+        f"{{{_CHART_STYLE_NAMESPACE}}}chartStyle"
+    ),
+    "application/vnd.ms-office.chartcolorstyle+xml": (
+        f"{{{_CHART_STYLE_NAMESPACE}}}colorStyle"
+    ),
+    "application/vnd.openxmlformats-package."
+    "digital-signature-xmlsignature+xml": (
+        f"{{{_XML_SIGNATURE_NAMESPACE}}}Signature"
+    ),
+    "application/inkml+xml": f"{{{_INK_NAMESPACE}}}ink",
 }
 _RELATIONSHIPS_CONTENT_TYPE = (
     "application/vnd.openxmlformats-package.relationships+xml"
@@ -140,6 +291,15 @@ _DOC_TABLE_ROWS_CURSOR_RE = re.compile(
 )
 _DOC_TABLE_CELLS_CURSOR_RE = re.compile(
     r"^table:([1-9][0-9]*):row:([1-9][0-9]*):cells:"
+    r"cursor:(0|[1-9][0-9]*):limit:([1-9][0-9]*)$"
+)
+_DOC_SCOPED_TABLE_ROWS_CURSOR_RE = re.compile(
+    r"^(header|footer):([1-9][0-9]*):table:([1-9][0-9]*):"
+    r"rows:cursor:(0|[1-9][0-9]*):limit:([1-9][0-9]*)$"
+)
+_DOC_SCOPED_TABLE_CELLS_CURSOR_RE = re.compile(
+    r"^(header|footer):([1-9][0-9]*):table:([1-9][0-9]*):"
+    r"row:([1-9][0-9]*):cells:"
     r"cursor:(0|[1-9][0-9]*):limit:([1-9][0-9]*)$"
 )
 _SLIDE_SELECTOR_RE = re.compile(
@@ -444,6 +604,48 @@ def _parse_relationship_part(
     return rows
 
 
+def _validate_ppt_relationship_target_roots(
+    archive: zipfile.ZipFile,
+    members: dict[str, zipfile.ZipInfo],
+    part_content_types: dict[str, str],
+    relationships: list[dict],
+) -> dict[str, str]:
+    root_tags: dict[str, str] = {}
+    for relationship in relationships:
+        if relationship["external"]:
+            continue
+        target = relationship.get("_normalized_target")
+        if not isinstance(target, str):
+            raise InspectionError(
+                "OOXML PowerPoint relationship target is invalid"
+            )
+        content_type = part_content_types.get(target)
+        expected_root = _PPT_RELATIONSHIP_TARGET_ROOTS.get(
+            content_type or ""
+        )
+        if expected_root is None:
+            if ooxml._is_xml_content_type(content_type):
+                raise InspectionError(
+                    "OOXML PowerPoint relationship target has an "
+                    "unsupported XML content type"
+                )
+            continue
+        if target in root_tags:
+            continue
+        root = ooxml._parse_graph_xml(
+            archive,
+            members,
+            target,
+            "PowerPoint relationship target",
+        )
+        if root.tag != expected_root:
+            raise InspectionError(
+                "OOXML PowerPoint relationship target root is invalid"
+            )
+        root_tags[target] = root.tag
+    return root_tags
+
+
 def _validate_main_part_graph(
     archive: zipfile.ZipFile,
     members: dict[str, zipfile.ZipInfo],
@@ -478,6 +680,12 @@ def _validate_main_part_graph(
     relationship_id = f"{{{_OFFICE_RELATIONSHIPS_NAMESPACE}}}id"
     if root.tag != presentation_tag:
         raise InspectionError("OOXML PowerPoint presentation root is invalid")
+    relationship_root_tags = _validate_ppt_relationship_target_roots(
+        archive,
+        members,
+        part_content_types,
+        relationships,
+    )
     slide_lists = [child for child in root if child.tag == slide_list_tag]
     if len(slide_lists) > 1:
         raise InspectionError(
@@ -583,13 +791,7 @@ def _validate_main_part_graph(
         ),
     }
     for slide_part in sorted(slide_parts):
-        slide_root = ooxml._parse_graph_xml(
-            archive,
-            members,
-            slide_part,
-            "PowerPoint slide",
-        )
-        if slide_root.tag != slide_tag:
+        if relationship_root_tags.get(slide_part) != slide_tag:
             raise InspectionError(
                 "OOXML PowerPoint slide root is invalid"
             )
@@ -636,13 +838,7 @@ def _validate_main_part_graph(
             "OOXML PowerPoint notes slide relationship graph is incomplete"
         )
     for notes_part in sorted(notes_parts):
-        notes_root = ooxml._parse_graph_xml(
-            archive,
-            members,
-            notes_part,
-            "PowerPoint notes slide",
-        )
-        if notes_root.tag != notes_tag:
+        if relationship_root_tags.get(notes_part) != notes_tag:
             raise InspectionError(
                 "OOXML PowerPoint notes slide root is invalid"
             )
@@ -1287,12 +1483,14 @@ def _table_detail(
     table,
     index: int,
     *,
+    selector_prefix: str | None = None,
     row_cursor: int = 0,
     row_limit: int = _TABLE_ROW_PAGE_SIZE,
     cell_row: int | None = None,
     cell_cursor: int = 0,
     cell_limit: int = _TABLE_CELL_PAGE_SIZE,
 ) -> dict:
+    selector_prefix = selector_prefix or f"table:{index}"
     rows = list(table.rows)
     bounded_row_limit = min(row_limit, _TABLE_ROW_PAGE_SIZE)
     bounded_cell_limit = min(cell_limit, _TABLE_CELL_PAGE_SIZE)
@@ -1382,12 +1580,12 @@ def _table_detail(
     )
     if row_page["next_cursor"] is not None:
         row_page["next_selector"] = (
-            f"table:{index}:rows:cursor:{row_page['next_cursor']}:"
+            f"{selector_prefix}:rows:cursor:{row_page['next_cursor']}:"
             f"limit:{effective_row_limit}"
         )
     if cell_page["next_cursor"] is not None:
         cell_page["next_selector"] = (
-            f"table:{index}:row:{cell_page['row']}:cells:"
+            f"{selector_prefix}:row:{cell_page['row']}:cells:"
             f"cursor:{cell_page['next_cursor']}:"
             f"limit:{cell_page['limit']}"
         )
@@ -1447,6 +1645,7 @@ def _header_footer_detail(
     *,
     table_cursor: int = 0,
     table_limit: int = _TABLE_PAGE_SIZE,
+    table_detail_selection: dict | None = None,
 ) -> dict:
     paragraphs = _nonempty_paragraphs(item.paragraphs)
     start = (page - 1) * _PARAGRAPH_PAGE_SIZE
@@ -1477,7 +1676,14 @@ def _header_footer_detail(
         label: index,
         "paragraphs": [_bounded_text(paragraph.text) for paragraph in selected],
         "tables": [
-            _table_detail(table, table_cursor + offset)
+            _table_detail(
+                table,
+                table_cursor + offset,
+                selector_prefix=(
+                    f"{label}:{index}:table:{table_cursor + offset}"
+                ),
+                **(table_detail_selection or {}),
+            )
             for offset, table in enumerate(
                 selected_tables, start=1
             )
@@ -2113,6 +2319,47 @@ def _doc_extract_pages(
             )
             exact_keys.add(selector)
             continue
+        scoped_rows_match = _DOC_SCOPED_TABLE_ROWS_CURSOR_RE.fullmatch(
+            selector
+        )
+        if scoped_rows_match is not None:
+            exact.append(
+                {
+                    "label": scoped_rows_match.group(1),
+                    "number": int(scoped_rows_match.group(2)),
+                    "page": 1,
+                    "table_cursor": int(scoped_rows_match.group(3)) - 1,
+                    "table_limit": 1,
+                    "table_detail_selection": {
+                        "row_cursor": int(scoped_rows_match.group(4)),
+                        "row_limit": int(scoped_rows_match.group(5)),
+                    },
+                    "selector": selector,
+                }
+            )
+            exact_keys.add(selector)
+            continue
+        scoped_cells_match = _DOC_SCOPED_TABLE_CELLS_CURSOR_RE.fullmatch(
+            selector
+        )
+        if scoped_cells_match is not None:
+            exact.append(
+                {
+                    "label": scoped_cells_match.group(1),
+                    "number": int(scoped_cells_match.group(2)),
+                    "page": 1,
+                    "table_cursor": int(scoped_cells_match.group(3)) - 1,
+                    "table_limit": 1,
+                    "table_detail_selection": {
+                        "cell_row": int(scoped_cells_match.group(4)),
+                        "cell_cursor": int(scoped_cells_match.group(5)),
+                        "cell_limit": int(scoped_cells_match.group(6)),
+                    },
+                    "selector": selector,
+                }
+            )
+            exact_keys.add(selector)
+            continue
         table_rows_match = _DOC_TABLE_ROWS_CURSOR_RE.fullmatch(selector)
         if table_rows_match is not None:
             exact.append(
@@ -2383,6 +2630,9 @@ class OfficeInspector:
                         table_cursor=selection.get("table_cursor", 0),
                         table_limit=selection.get(
                             "table_limit", _TABLE_PAGE_SIZE
+                        ),
+                        table_detail_selection=selection.get(
+                            "table_detail_selection"
                         ),
                     )
                 candidate = {

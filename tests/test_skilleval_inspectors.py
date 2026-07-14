@@ -1921,6 +1921,80 @@ class TestOfficeInspector:
         ]
         assert detail["details"][0]["table_page"]["next_cursor"] is None
 
+    @pytest.mark.parametrize("scope", ["header", "footer"])
+    def test_docx_header_footer_table_continuations_keep_scope(
+        self, tmp_path, monkeypatch, scope
+    ) -> None:
+        from docx import Document
+        from docx.shared import Inches
+        from skillopt.envs.skilleval.inspectors import office
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / f"{scope}-table-pages.docx"
+        document = Document()
+        body_table = document.add_table(rows=2, cols=5)
+        for row_index, row in enumerate(body_table.rows, start=1):
+            for cell_index, cell in enumerate(row.cells, start=1):
+                cell.text = f"body-r{row_index}c{cell_index}"
+        scoped_part = getattr(document.sections[0], scope)
+        scoped_table = scoped_part.add_table(
+            rows=2,
+            cols=5,
+            width=Inches(5),
+        )
+        for row_index, row in enumerate(scoped_table.rows, start=1):
+            for cell_index, cell in enumerate(row.cells, start=1):
+                cell.text = f"{scope}-r{row_index}c{cell_index}"
+        document.save(path)
+        monkeypatch.setattr(office, "_TABLE_CELL_PAGE_SIZE", 4)
+
+        inventory = inspect_artifact(
+            path.name,
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+        scoped_detail = inventory[f"{scope}s"]["items"][0]
+        first_window = scoped_detail["tables"][0]
+        row_selector = first_window["row_page"]["next_selector"]
+        cell_selector = first_window["cell_page"]["next_selector"]
+
+        assert row_selector == (
+            f"{scope}:1:table:1:rows:cursor:1:limit:16"
+        )
+        assert cell_selector == (
+            f"{scope}:1:table:1:row:1:cells:cursor:4:limit:4"
+        )
+
+        next_row = extract_artifact(
+            path.name,
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=[row_selector],
+        )
+        row_tail = extract_artifact(
+            path.name,
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=[cell_selector],
+        )
+
+        assert next_row["details"][0][scope] == 1
+        assert next_row["details"][0]["tables"][0]["cells"] == [
+            [
+                f"{scope}-r2c1",
+                f"{scope}-r2c2",
+                f"{scope}-r2c3",
+                f"{scope}-r2c4",
+            ],
+        ]
+        assert row_tail["details"][0]["tables"][0]["cells"] == [
+            [f"{scope}-r1c5"],
+        ]
+        assert "body" not in json.dumps(
+            [next_row, row_tail],
+            ensure_ascii=False,
+        )
+
     def test_docx_table_pages_preserve_rows_and_offer_cell_cursor(
         self, tmp_path, monkeypatch
     ) -> None:
@@ -2207,6 +2281,136 @@ class TestOfficeInspector:
         with pytest.raises(InspectionError, match="PowerPoint"):
             inspect_artifact(
                 "invalid-root.pptx",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+        assert parser_calls == []
+
+    @pytest.mark.parametrize(
+        ("member", "old_root", "new_root"),
+        [
+            (
+                "ppt/slideLayouts/slideLayout2.xml",
+                b"p:sldLayout",
+                b"p:notSlideLayout",
+            ),
+            (
+                "ppt/charts/chart1.xml",
+                b"c:chartSpace",
+                b"c:notChartSpace",
+            ),
+        ],
+    )
+    def test_pptx_preflight_rejects_invalid_relationship_target_root(
+        self, tmp_path, monkeypatch, member, old_root, new_root
+    ) -> None:
+        from pptx import Presentation
+        from pptx.chart.data import ChartData
+        from pptx.enum.chart import XL_CHART_TYPE
+        from pptx.util import Inches
+        from skillopt.envs.skilleval.inspectors import office
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "invalid-related-root.pptx"
+        presentation = Presentation()
+        slide = presentation.slides.add_slide(presentation.slide_layouts[1])
+        chart_data = ChartData()
+        chart_data.categories = ["One"]
+        chart_data.add_series("Series", (1,))
+        slide.shapes.add_chart(
+            XL_CHART_TYPE.COLUMN_CLUSTERED,
+            0,
+            0,
+            Inches(2),
+            Inches(2),
+            chart_data,
+        )
+        presentation.save(path)
+        self._rewrite_member(
+            path,
+            member,
+            lambda payload: payload.replace(
+                b"<" + old_root,
+                b"<" + new_root,
+                1,
+            ).replace(
+                b"</" + old_root + b">",
+                b"</" + new_root + b">",
+                1,
+            ),
+        )
+        parser_calls = []
+
+        def forbidden_parser(*args, **kwargs):
+            parser_calls.append((args, kwargs))
+            raise AssertionError("python-pptx must not see invalid OOXML")
+
+        monkeypatch.setattr(office, "Presentation", forbidden_parser)
+        with pytest.raises(
+            InspectionError,
+            match="relationship target root",
+        ):
+            inspect_artifact(
+                path.name,
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+        assert parser_calls == []
+
+    def test_pptx_preflight_rejects_unknown_xml_relationship_target(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from pptx import Presentation
+        from skillopt.envs.skilleval.inspectors import office
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "unknown-related-xml.pptx"
+        presentation = Presentation()
+        presentation.slides.add_slide(presentation.slide_layouts[1])
+        presentation.save(path)
+
+        def add_unknown_relationship(
+            name: str,
+            payload: bytes,
+        ) -> tuple[str, bytes]:
+            if name == "[Content_Types].xml":
+                payload = payload.replace(
+                    b"</Types>",
+                    (
+                        b'<Override PartName="/ppt/unknown.xml" '
+                        b'ContentType="application/vnd.example.unknown+xml"/>'
+                        b"</Types>"
+                    ),
+                    1,
+                )
+            elif name == "ppt/_rels/presentation.xml.rels":
+                payload = payload.replace(
+                    b"</Relationships>",
+                    (
+                        b'<Relationship Id="rIdUnknown" '
+                        b'Type="urn:example:unknown" '
+                        b'Target="unknown.xml"/></Relationships>'
+                    ),
+                    1,
+                )
+            return name, payload
+
+        self._rewrite_package(path, add_unknown_relationship)
+        with zipfile.ZipFile(path, "a") as archive:
+            archive.writestr(
+                "ppt/unknown.xml",
+                b'<x:unknown xmlns:x="urn:example"/>',
+            )
+        parser_calls = []
+        monkeypatch.setattr(
+            office,
+            "Presentation",
+            lambda *args, **kwargs: parser_calls.append((args, kwargs)),
+        )
+
+        with pytest.raises(InspectionError, match="unsupported XML"):
+            inspect_artifact(
+                path.name,
                 evidence_dir=str(evidence),
                 scratch_dir=str(scratch),
             )
