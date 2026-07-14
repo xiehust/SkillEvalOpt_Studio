@@ -840,15 +840,11 @@ def _open_created_directory(parent_descriptor: int, name: str, mode: int) -> int
     created_info: os.stat_result | None = None
     descriptor = -1
     try:
-        created_info = os.stat(
-            name,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-        if not stat.S_ISDIR(created_info.st_mode):
-            raise ValueError(f"created entry is not a directory: {name}")
         descriptor = os.open(name, _directory_flags(), dir_fd=parent_descriptor)
         opened = os.fstat(descriptor)
+        created_info = opened
+        if not stat.S_ISDIR(created_info.st_mode):
+            raise ValueError(f"created entry is not a directory: {name}")
         named = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
         if (
             not stat.S_ISDIR(named.st_mode)
@@ -858,6 +854,11 @@ def _open_created_directory(parent_descriptor: int, name: str, mode: int) -> int
             raise ValueError(f"created directory changed unexpectedly: {name}")
         return descriptor
     except Exception:
+        if created_info is None and descriptor >= 0:
+            try:
+                created_info = os.fstat(descriptor)
+            except OSError:
+                pass
         if descriptor >= 0:
             os.close(descriptor)
         if created_info is not None:

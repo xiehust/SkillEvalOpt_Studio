@@ -1,8 +1,10 @@
 """Tests for the skilleval environment (custom skill evaluation)."""
 from __future__ import annotations
 
+import errno
 import json
 import os
+import stat
 from types import SimpleNamespace
 
 import pytest
@@ -285,6 +287,7 @@ class TestJudge:
 
 import time  # noqa: E402
 
+from skillopt.envs.skilleval import artifacts as artifacts_mod  # noqa: E402
 from skillopt.envs.skilleval import rollout as rollout_mod  # noqa: E402
 from skillopt.envs.skilleval.rollout import GUIDE_PROMPT, run_batch  # noqa: E402
 
@@ -321,6 +324,24 @@ class TestRunBatch:
         monkeypatch.setattr(rollout_mod, "prepare_workspace", fake_prepare)
         monkeypatch.setattr(rollout_mod, "run_claude_code_exec", exec_fn)
         return prepared
+
+    @staticmethod
+    def _deny_mode_zero_opens(monkeypatch, blocked_name):
+        real_open = artifacts_mod.os.open
+
+        def deny_mode_zero(path, flags, *args, **kwargs):
+            dir_fd = kwargs.get("dir_fd")
+            if dir_fd is not None and os.fspath(path) == blocked_name:
+                info = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+                if stat.S_IMODE(info.st_mode) == 0:
+                    raise PermissionError(
+                        errno.EACCES,
+                        "injected permission denial",
+                        os.fspath(path),
+                    )
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(artifacts_mod.os, "open", deny_mode_zero)
 
     def test_order_preserved_despite_completion_order(self, tmp_path, monkeypatch) -> None:
         def slow_first(*, work_dir, prompt, model, timeout, **kw):
@@ -631,8 +652,69 @@ class TestRunBatch:
         assert [row["path"] for row in result["artifacts"]] == ["report.pdf"]
         assert "artifact_error" not in result
 
-    def test_artifact_collection_failure_is_invalid_not_target_zero(
+    @pytest.mark.parametrize("entry_type", ["file", "directory"])
+    def test_target_permission_denial_is_scoreable_artifact_failure(
+        self, tmp_path, monkeypatch, entry_type
+    ) -> None:
+        blocked_name = "blocked.pdf" if entry_type == "file" else "blocked"
+        self._deny_mode_zero_opens(monkeypatch, blocked_name)
+
+        def produce(*, work_dir, **kwargs):
+            blocked = os.path.join(work_dir, blocked_name)
+            if entry_type == "file":
+                with open(blocked, "wb") as handle:
+                    handle.write(b"%PDF-1.4\n")
+            else:
+                os.mkdir(blocked)
+            os.chmod(blocked, 0)
+            return "done", "raw"
+
+        self._patch_harness(monkeypatch, produce)
+        result = run_batch([_valid_item("t1")], "# skill", str(tmp_path))[0]
+        blocked = os.path.join(result["work_dir"], blocked_name)
+        os.chmod(blocked, 0o700 if entry_type == "directory" else 0o600)
+
+        assert result["response"] == "done"
+        assert "permission denial" in result["artifact_error"]
+        assert result["artifact_failure"] is True
+        assert result["artifact_error_type"] == "target_validation"
+        assert result["score_valid"] is True
+        assert result["error"] == result["artifact_error"]
+        assert "artifact_collection_error" not in result
+
+    def test_baseline_permission_denial_remains_infrastructure_invalid(
         self, tmp_path, monkeypatch
+    ) -> None:
+        blocked_name = "blocked.pdf"
+        target_called = False
+        self._deny_mode_zero_opens(monkeypatch, blocked_name)
+
+        def prepare(**kwargs):
+            self._seed_workspace(**kwargs)
+            blocked = os.path.join(kwargs["work_dir"], blocked_name)
+            with open(blocked, "wb") as handle:
+                handle.write(b"%PDF-1.4\n")
+            os.chmod(blocked, 0)
+
+        def target(**kwargs):
+            nonlocal target_called
+            target_called = True
+            return "done", "raw"
+
+        monkeypatch.setattr(rollout_mod, "prepare_workspace", prepare)
+        monkeypatch.setattr(rollout_mod, "run_claude_code_exec", target)
+        result = run_batch([_valid_item("t1")], "# skill", str(tmp_path))[0]
+        os.chmod(os.path.join(result["work_dir"], blocked_name), 0o600)
+
+        assert target_called is False
+        assert "permission denial" in result["artifact_collection_error"]
+        assert result["artifact_collection_error_type"] == "infrastructure"
+        assert result["score_valid"] is False
+        assert "artifact_error" not in result
+        assert "error" not in result
+
+    def test_artifact_collection_failure_is_invalid_not_target_zero(
+        self, tmp_path, monkeypatch, capsys
     ) -> None:
         error_type = getattr(
             rollout_mod,
@@ -671,6 +753,7 @@ class TestRunBatch:
         assert judged == []
         assert scored["score_valid"] is False
         assert scored["judge_skipped"] == "invalid_rollout"
+        assert "rollout finished: 0 ok, 0 errored, 1 invalid" in capsys.readouterr().out
 
     def test_target_execution_error_is_preserved_with_artifact_validation_error(
         self, tmp_path, monkeypatch

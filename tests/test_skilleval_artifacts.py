@@ -1092,6 +1092,44 @@ class TestFilesystemHelpers:
         not os.path.isdir("/proc/self/fd"),
         reason="requires Linux fd accounting",
     )
+    def test_created_directory_first_stat_failure_removes_inode(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        parent_descriptor = os.open(tmp_path, artifacts_mod._directory_flags())
+        baseline_fds = len(os.listdir("/proc/self/fd"))
+        real_stat = artifacts_mod.os.stat
+        failed = False
+
+        def failing_stat(path, *args, **kwargs):
+            nonlocal failed
+            if (
+                path == "created"
+                and kwargs.get("dir_fd") == parent_descriptor
+                and kwargs.get("follow_symlinks") is False
+                and not failed
+            ):
+                failed = True
+                raise OSError("injected first stat failure")
+            return real_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(artifacts_mod.os, "stat", failing_stat)
+        try:
+            with pytest.raises(OSError, match="injected"):
+                artifacts_mod._open_created_directory(
+                    parent_descriptor,
+                    "created",
+                    0o700,
+                )
+            assert failed is True
+            assert not (tmp_path / "created").exists()
+            assert len(os.listdir("/proc/self/fd")) == baseline_fds
+        finally:
+            os.close(parent_descriptor)
+
+    @pytest.mark.skipif(
+        not os.path.isdir("/proc/self/fd"),
+        reason="requires Linux fd accounting",
+    )
     def test_created_directory_fstat_failure_closes_fd_and_removes_inode(
         self, tmp_path, monkeypatch
     ) -> None:

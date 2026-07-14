@@ -10,6 +10,7 @@ rollout adds no retry of its own (the exec harness owns retries).
 """
 from __future__ import annotations
 
+import errno
 import os
 import time
 import traceback
@@ -55,6 +56,31 @@ class RuntimeSkill(TypedDict):
     name: str
     content: str
     files: list[tuple[str, str]]
+
+
+def _has_permission_denied_cause(exc: BaseException) -> bool:
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, OSError) and current.errno in {errno.EACCES, errno.EPERM}:
+            return True
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return False
+
+
+def _record_target_artifact_failure(result: dict, exc: BaseException) -> None:
+    result["artifact_error"] = f"{type(exc).__name__}: {exc}"
+    result["artifact_failure"] = True
+    result["artifact_error_type"] = "target_validation"
+    if not result.get("error"):
+        result["error"] = result["artifact_error"]
 
 
 def collect_support_files(skill_dir: str) -> list[tuple[str, str]]:
@@ -164,15 +190,15 @@ def _rollout_one(
                 after = build_manifest(work_dir)
                 result["artifacts"] = diff_manifests(before, after)
             except ArtifactValidationError as exc:
-                result["artifact_error"] = f"{type(exc).__name__}: {exc}"
-                result["artifact_failure"] = True
-                result["artifact_error_type"] = "target_validation"
-                if not result.get("error"):
-                    result["error"] = result["artifact_error"]
+                _record_target_artifact_failure(result, exc)
             except ArtifactCollectionError as exc:
-                result["artifact_collection_error"] = f"{type(exc).__name__}: {exc}"
-                result["artifact_collection_error_type"] = "infrastructure"
-                result["score_valid"] = False
+                if _has_permission_denied_cause(exc):
+                    validation_error = ArtifactValidationError(str(exc))
+                    _record_target_artifact_failure(result, validation_error)
+                else:
+                    result["artifact_collection_error"] = f"{type(exc).__name__}: {exc}"
+                    result["artifact_collection_error_type"] = "infrastructure"
+                    result["score_valid"] = False
             except Exception as exc:  # noqa: BLE001 — unexpected collection failure
                 result["artifact_collection_error"] = f"{type(exc).__name__}: {exc}"
                 result["artifact_collection_error_type"] = "infrastructure"
@@ -233,6 +259,15 @@ def run_batch(
         ]
         results = [future.result() for future in futures]
 
-    failed = sum(1 for r in results if r.get("error"))
-    print(f"  [skilleval] rollout finished: {len(results) - failed} ok, {failed} errored")
+    invalid = sum(1 for result in results if result.get("score_valid") is False)
+    failed = sum(
+        1
+        for result in results
+        if result.get("error") and result.get("score_valid") is not False
+    )
+    ok = len(results) - failed - invalid
+    print(
+        f"  [skilleval] rollout finished: "
+        f"{ok} ok, {failed} errored, {invalid} invalid"
+    )
     return results
