@@ -43,9 +43,12 @@ _MAX_COMPRESSION_RATIO = 200.0
 _ZIP_STREAM_CHUNK = 1024 * 1024
 _LOCAL_FILE_HEADER = struct.Struct("<4s5H3L2H")
 _LOCAL_FILE_HEADER_SIGNATURE = b"PK\x03\x04"
+_DATA_DESCRIPTOR_SIGNATURE = b"PK\x07\x08"
+_ZIP32_DATA_DESCRIPTOR = struct.Struct("<3L")
+_ZIP64_DATA_DESCRIPTOR = struct.Struct("<LQQ")
 _ZIP64_EXTRA_ID = 0x0001
 _ZIP32_MAX = 0xFFFFFFFF
-_SUPPORTED_ZIP_FLAGS = 0x0806
+_SUPPORTED_ZIP_FLAGS = 0x080E
 _CELL_PAGE_SIZE = 128
 _LIBREOFFICE_TIMEOUT_SECONDS = 120
 _SUPPORTED_ZIP_COMPRESSION = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
@@ -93,8 +96,6 @@ def _validate_member_name(info: zipfile.ZipInfo) -> str:
 
 
 def _validate_member_type(info: zipfile.ZipInfo) -> None:
-    if info.flag_bits & 0x8:
-        raise InspectionError("OOXML data descriptor entries are unsupported")
     if info.flag_bits & (0x1 | 0x40 | 0x2000):
         raise InspectionError("encrypted OOXML entries are unsupported")
     if info.flag_bits & ~_SUPPORTED_ZIP_FLAGS:
@@ -157,28 +158,7 @@ def _local_zip64_sizes(
     compressed_size: int,
     uncompressed_size: int,
 ) -> tuple[int, int]:
-    offset = 0
-    zip64_payload: bytes | None = None
-    while offset < len(extra):
-        if len(extra) - offset < 4:
-            raise InspectionError(
-                "OOXML local file header has a truncated extra field"
-            )
-        field_id, field_size = struct.unpack_from("<HH", extra, offset)
-        offset += 4
-        field_end = offset + field_size
-        if field_end > len(extra):
-            raise InspectionError(
-                "OOXML local file header has a truncated extra field"
-            )
-        if field_id == _ZIP64_EXTRA_ID:
-            if zip64_payload is not None:
-                raise InspectionError(
-                    "OOXML local file header has duplicate ZIP64 metadata"
-                )
-            zip64_payload = extra[offset:field_end]
-        offset = field_end
-
+    zip64_payload = _local_zip64_payload(extra)
     needs_uncompressed = uncompressed_size == _ZIP32_MAX
     needs_compressed = compressed_size == _ZIP32_MAX
     if not needs_uncompressed and not needs_compressed:
@@ -205,6 +185,119 @@ def _local_zip64_sizes(
     if needs_compressed:
         compressed_size = read_size()
     return compressed_size, uncompressed_size
+
+
+def _local_zip64_payload(extra: bytes) -> bytes | None:
+    offset = 0
+    zip64_payload: bytes | None = None
+    while offset < len(extra):
+        if len(extra) - offset < 4:
+            raise InspectionError(
+                "OOXML local file header has a truncated extra field"
+            )
+        field_id, field_size = struct.unpack_from("<HH", extra, offset)
+        offset += 4
+        field_end = offset + field_size
+        if field_end > len(extra):
+            raise InspectionError(
+                "OOXML local file header has a truncated extra field"
+            )
+        if field_id == _ZIP64_EXTRA_ID:
+            if zip64_payload is not None:
+                raise InspectionError(
+                    "OOXML local file header has duplicate ZIP64 metadata"
+                )
+            zip64_payload = extra[offset:field_end]
+        offset = field_end
+    return zip64_payload
+
+
+def _descriptor_uses_zip64(
+    crc: int,
+    compressed_size: int,
+    uncompressed_size: int,
+    extra: bytes,
+) -> bool:
+    zip64_payload = _local_zip64_payload(extra)
+    if crc != 0:
+        raise InspectionError(
+            "OOXML local file header descriptor placeholders conflict"
+        )
+    if compressed_size == 0 and uncompressed_size == 0:
+        if zip64_payload is not None:
+            raise InspectionError(
+                "OOXML local file header descriptor placeholders conflict"
+            )
+        return False
+    if (
+        compressed_size == _ZIP32_MAX
+        and uncompressed_size == _ZIP32_MAX
+        and zip64_payload is not None
+        and len(zip64_payload) == 16
+        and struct.unpack("<QQ", zip64_payload) == (0, 0)
+    ):
+        return True
+    raise InspectionError(
+        "OOXML local file header descriptor placeholders conflict"
+    )
+
+
+def _validate_data_descriptor(
+    descriptor: int,
+    member: zipfile.ZipInfo,
+    descriptor_start: int,
+    boundary: int,
+    *,
+    zip64: bool,
+) -> int:
+    if descriptor_start > boundary:
+        raise InspectionError(
+            "OOXML data descriptor overlaps the next archive region"
+        )
+    body_struct = (
+        _ZIP64_DATA_DESCRIPTOR
+        if zip64
+        else _ZIP32_DATA_DESCRIPTOR
+    )
+    unsigned_size = body_struct.size
+    signed_size = len(_DATA_DESCRIPTOR_SIGNATURE) + unsigned_size
+    available = boundary - descriptor_start
+    if available > signed_size:
+        raise InspectionError("OOXML data descriptor has wrong width")
+    payload = _read_local_header_bytes(
+        descriptor,
+        available,
+        descriptor_start,
+    )
+    if len(payload) < len(_DATA_DESCRIPTOR_SIGNATURE):
+        raise InspectionError("OOXML data descriptor is truncated")
+
+    has_signature = payload.startswith(_DATA_DESCRIPTOR_SIGNATURE)
+    expected_size = signed_size if has_signature else unsigned_size
+    if len(payload) < expected_size:
+        if has_signature and len(payload) == unsigned_size:
+            raise InspectionError("OOXML data descriptor is ambiguous")
+        raise InspectionError("OOXML data descriptor is truncated")
+    if len(payload) > expected_size:
+        raise InspectionError("OOXML data descriptor has wrong width")
+
+    body = payload[len(_DATA_DESCRIPTOR_SIGNATURE):] if has_signature else payload
+    actual_crc, actual_compressed, actual_uncompressed = body_struct.unpack(body)
+    if actual_crc != member.CRC:
+        raise InspectionError(
+            "OOXML data descriptor CRC differs from central directory"
+        )
+    if actual_compressed != member.compress_size:
+        raise InspectionError(
+            "OOXML data descriptor compressed size differs "
+            "from central directory"
+        )
+    if actual_uncompressed != member.file_size:
+        raise InspectionError(
+            "OOXML data descriptor uncompressed size differs "
+            "from central directory"
+        )
+    return boundary
 
 
 def _central_filename_bytes(member: zipfile.ZipInfo, name: str) -> bytes:
@@ -236,11 +329,28 @@ def _validate_local_headers(
     intervals: list[tuple[int, int]] = []
     local_metadata_bytes = 0
     for member in members:
-        name = _member_name(member)
-        header_offset = member.header_offset
-        if not isinstance(header_offset, int) or header_offset < 0:
+        if (
+            not isinstance(member.header_offset, int)
+            or member.header_offset < 0
+        ):
             raise InspectionError(
                 "OOXML local file header is outside archive bounds"
+            )
+    ordered_members = sorted(
+        members,
+        key=lambda member: member.header_offset,
+    )
+    for index, member in enumerate(ordered_members):
+        name = _member_name(member)
+        header_offset = member.header_offset
+        boundary = (
+            ordered_members[index + 1].header_offset
+            if index + 1 < len(ordered_members)
+            else central_start
+        )
+        if boundary <= header_offset or boundary > central_start:
+            raise InspectionError(
+                "OOXML local file header regions overlap"
             )
         fixed_end = header_offset + _LOCAL_FILE_HEADER.size
         if fixed_end > central_start or fixed_end > file_size:
@@ -319,32 +429,61 @@ def _validate_local_headers(
         if (
             flags != member.flag_bits
             or compression_method != member.compress_type
-            or crc != member.CRC
         ):
             raise InspectionError(
                 "OOXML local file header metadata differs "
                 "from central directory"
             )
-        local_compressed, local_uncompressed = _local_zip64_sizes(
-            local_extra,
-            compressed_size,
-            uncompressed_size,
-        )
-        if (
-            local_compressed != member.compress_size
-            or local_uncompressed != member.file_size
-        ):
-            raise InspectionError(
-                "OOXML local file header sizes differ "
-                "from central directory"
+        uses_descriptor = bool(flags & 0x8)
+        descriptor_is_zip64 = False
+        if uses_descriptor:
+            descriptor_is_zip64 = _descriptor_uses_zip64(
+                crc,
+                compressed_size,
+                uncompressed_size,
+                local_extra,
             )
+        else:
+            if crc != member.CRC:
+                raise InspectionError(
+                    "OOXML local file header metadata differs "
+                    "from central directory"
+                )
+            local_compressed, local_uncompressed = _local_zip64_sizes(
+                local_extra,
+                compressed_size,
+                uncompressed_size,
+            )
+            if (
+                local_compressed != member.compress_size
+                or local_uncompressed != member.file_size
+            ):
+                raise InspectionError(
+                    "OOXML local file header sizes differ "
+                    "from central directory"
+                )
 
         data_end = data_start + member.compress_size
+        if data_end > boundary:
+            raise InspectionError(
+                "OOXML local file header regions overlap"
+            )
         if data_end > central_start or data_end > file_size:
             raise InspectionError(
                 "OOXML local file header data extends outside archive bounds"
             )
-        intervals.append((header_offset, data_end))
+        interval_end = (
+            _validate_data_descriptor(
+                descriptor,
+                member,
+                data_end,
+                boundary,
+                zip64=descriptor_is_zip64,
+            )
+            if uses_descriptor
+            else data_end
+        )
+        intervals.append((header_offset, interval_end))
 
     previous_end = -1
     for interval_start, interval_end in sorted(intervals):

@@ -17,6 +17,7 @@ import tempfile
 import time
 import types
 import zipfile
+import zlib
 from pathlib import Path
 
 import pytest
@@ -1760,6 +1761,134 @@ class TestSpreadsheetInspector:
             target.seek(header_offset + relative_offset)
             target.write(replacement)
 
+    @staticmethod
+    def _rewrite_xlsx_with_data_descriptors(
+        path: Path,
+        *,
+        zip64: bool,
+        signature: bool,
+        descriptor_transform=None,
+    ) -> None:
+        with zipfile.ZipFile(path) as source:
+            members = [
+                (info, source.read(info))
+                for info in source.infolist()
+            ]
+
+        output = bytearray()
+        central_records = []
+        for info, payload in members:
+            name = info.filename.encode("utf-8")
+            compressor = zlib.compressobj(level=6, wbits=-15)
+            compressed = compressor.compress(payload) + compressor.flush()
+            crc = zlib.crc32(payload) & 0xFFFFFFFF
+            version = 45 if zip64 else 20
+            flags = 0x808
+            local_offset = len(output)
+            if zip64:
+                local_compressed = 0xFFFFFFFF
+                local_uncompressed = 0xFFFFFFFF
+                local_extra = struct.pack("<HHQQ", 0x0001, 16, 0, 0)
+                descriptor = struct.pack(
+                    "<LQQ",
+                    crc,
+                    len(compressed),
+                    len(payload),
+                )
+            else:
+                local_compressed = 0
+                local_uncompressed = 0
+                local_extra = b""
+                descriptor = struct.pack(
+                    "<3L",
+                    crc,
+                    len(compressed),
+                    len(payload),
+                )
+            if signature:
+                descriptor = b"PK\x07\x08" + descriptor
+            if descriptor_transform is not None:
+                descriptor = descriptor_transform(info.filename, descriptor)
+
+            output.extend(
+                struct.pack(
+                    "<4s5H3L2H",
+                    b"PK\x03\x04",
+                    version,
+                    flags,
+                    zipfile.ZIP_DEFLATED,
+                    0,
+                    0,
+                    0,
+                    local_compressed,
+                    local_uncompressed,
+                    len(name),
+                    len(local_extra),
+                )
+            )
+            output.extend(name)
+            output.extend(local_extra)
+            output.extend(compressed)
+            output.extend(descriptor)
+
+            central_records.append(
+                struct.pack(
+                    "<4s6H3L5H2L",
+                    b"PK\x01\x02",
+                    (3 << 8) | version,
+                    version,
+                    flags,
+                    zipfile.ZIP_DEFLATED,
+                    0,
+                    0,
+                    crc,
+                    len(compressed),
+                    len(payload),
+                    len(name),
+                    0,
+                    0,
+                    0,
+                    0,
+                    info.external_attr,
+                    local_offset,
+                )
+                + name
+            )
+
+        central_offset = len(output)
+        for record in central_records:
+            output.extend(record)
+        central_size = len(output) - central_offset
+        output.extend(
+            struct.pack(
+                "<4s4H2LH",
+                b"PK\x05\x06",
+                0,
+                0,
+                len(members),
+                len(members),
+                central_size,
+                central_offset,
+                0,
+            )
+        )
+        path.write_bytes(output)
+
+    @staticmethod
+    def _data_descriptor_offset(path: Path, member_name: str) -> int:
+        with zipfile.ZipFile(path) as archive:
+            info = archive.getinfo(member_name)
+            with path.open("rb") as source:
+                source.seek(info.header_offset)
+                fields = struct.unpack("<4s5H3L2H", source.read(30))
+            return (
+                info.header_offset
+                + 30
+                + fields[-2]
+                + fields[-1]
+                + info.compress_size
+            )
+
     def test_xlsx_inspection_reports_values_formulas_and_layout(
         self, tmp_path
     ) -> None:
@@ -2176,8 +2305,228 @@ class TestSpreadsheetInspector:
 
         data_descriptor = zipfile.ZipInfo("xl/descriptor.bin")
         data_descriptor.flag_bits = 0x8
-        with pytest.raises(InspectionError, match="data descriptor"):
-            spreadsheet._validate_member_type(data_descriptor)
+        spreadsheet._validate_member_type(data_descriptor)
+
+    @pytest.mark.parametrize(
+        ("zip64", "signature"),
+        [
+            (False, False),
+            (False, True),
+            (True, False),
+            (True, True),
+        ],
+        ids=[
+            "zip32-unsigned",
+            "zip32-signed",
+            "zip64-unsigned",
+            "zip64-signed",
+        ],
+    )
+    def test_xlsx_preflight_accepts_data_descriptors(
+        self,
+        tmp_path,
+        zip64,
+        signature,
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        path = tmp_path / "descriptor.xlsx"
+        self._save_xlsx(path)
+        self._rewrite_xlsx_with_data_descriptors(
+            path,
+            zip64=zip64,
+            signature=signature,
+        )
+
+        preflight_xlsx(str(path))
+
+    @pytest.mark.parametrize(
+        (
+            "zip64",
+            "field_offset",
+            "field_format",
+            "central_attribute",
+            "reason",
+        ),
+        [
+            (False, 4, "<L", "CRC", "CRC"),
+            (False, 8, "<L", "compress_size", "compressed size"),
+            (False, 12, "<L", "file_size", "uncompressed size"),
+            (True, 4, "<L", "CRC", "CRC"),
+            (True, 8, "<Q", "compress_size", "compressed size"),
+            (True, 16, "<Q", "file_size", "uncompressed size"),
+        ],
+        ids=[
+            "zip32-crc",
+            "zip32-compressed-size",
+            "zip32-uncompressed-size",
+            "zip64-crc",
+            "zip64-compressed-size",
+            "zip64-uncompressed-size",
+        ],
+    )
+    def test_xlsx_preflight_rejects_corrupt_data_descriptor(
+        self,
+        tmp_path,
+        zip64,
+        field_offset,
+        field_format,
+        central_attribute,
+        reason,
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        path = tmp_path / "corrupt-descriptor.xlsx"
+        self._save_xlsx(path)
+        self._rewrite_xlsx_with_data_descriptors(
+            path,
+            zip64=zip64,
+            signature=True,
+        )
+        member_name = "[Content_Types].xml"
+        descriptor_offset = self._data_descriptor_offset(path, member_name)
+        with zipfile.ZipFile(path) as archive:
+            expected = getattr(archive.getinfo(member_name), central_attribute)
+        with path.open("r+b") as target:
+            target.seek(descriptor_offset + field_offset)
+            target.write(struct.pack(field_format, expected ^ 1))
+
+        with pytest.raises(
+            InspectionError,
+            match=f"data descriptor {reason}",
+        ):
+            preflight_xlsx(str(path))
+
+    def test_xlsx_preflight_rejects_truncated_data_descriptor(
+        self, tmp_path
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        path = tmp_path / "truncated-descriptor.xlsx"
+        self._save_xlsx(path)
+        self._rewrite_xlsx_with_data_descriptors(
+            path,
+            zip64=False,
+            signature=True,
+            descriptor_transform=lambda name, descriptor: (
+                descriptor[:-1]
+                if name == "[Content_Types].xml"
+                else descriptor
+            ),
+        )
+
+        with pytest.raises(
+            InspectionError,
+            match="data descriptor.*truncated",
+        ):
+            preflight_xlsx(str(path))
+
+    def test_xlsx_preflight_rejects_ambiguous_data_descriptor(
+        self, tmp_path
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        path = tmp_path / "ambiguous-descriptor.xlsx"
+        self._save_xlsx(path)
+        self._rewrite_xlsx_with_data_descriptors(
+            path,
+            zip64=False,
+            signature=False,
+            descriptor_transform=lambda name, descriptor: (
+                b"PK\x07\x08" + descriptor[4:]
+                if name == "[Content_Types].xml"
+                else descriptor
+            ),
+        )
+
+        with pytest.raises(
+            InspectionError,
+            match="data descriptor is ambiguous",
+        ):
+            preflight_xlsx(str(path))
+
+    def test_xlsx_preflight_rejects_wrong_data_descriptor_width(
+        self, tmp_path
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        def widen_descriptor(name, descriptor):
+            if name != "[Content_Types].xml":
+                return descriptor
+            signature, crc, compressed, uncompressed = struct.unpack(
+                "<4s3L",
+                descriptor,
+            )
+            return struct.pack(
+                "<4sLQQ",
+                signature,
+                crc,
+                compressed,
+                uncompressed,
+            )
+
+        path = tmp_path / "wrong-width-descriptor.xlsx"
+        self._save_xlsx(path)
+        self._rewrite_xlsx_with_data_descriptors(
+            path,
+            zip64=False,
+            signature=True,
+            descriptor_transform=widen_descriptor,
+        )
+
+        with pytest.raises(
+            InspectionError,
+            match="data descriptor has wrong width",
+        ):
+            preflight_xlsx(str(path))
+
+    @pytest.mark.parametrize(
+        ("relative_offset", "replacement"),
+        [
+            (14, struct.pack("<L", 1)),
+            (18, struct.pack("<L", 1)),
+        ],
+        ids=["crc", "size"],
+    )
+    def test_xlsx_preflight_rejects_conflicting_descriptor_placeholders(
+        self,
+        tmp_path,
+        relative_offset,
+        replacement,
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        path = tmp_path / "descriptor-placeholders.xlsx"
+        self._save_xlsx(path)
+        self._rewrite_xlsx_with_data_descriptors(
+            path,
+            zip64=False,
+            signature=True,
+        )
+        self._mutate_local_header(
+            path,
+            "[Content_Types].xml",
+            relative_offset,
+            replacement,
+        )
+
+        with pytest.raises(
+            InspectionError,
+            match="local file header descriptor placeholders",
+        ):
+            preflight_xlsx(str(path))
 
     @pytest.mark.parametrize(
         ("relative_offset", "replacement"),
@@ -2529,6 +2878,65 @@ class TestSpreadsheetInspector:
 
         with pytest.raises(InspectionError, match="expected output"):
             evaluate_xlsx_check(str(path), check)
+
+    @pytest.mark.skipif(
+        shutil.which("libreoffice") is None
+        and shutil.which("soffice") is None,
+        reason="LibreOffice is not installed",
+    )
+    def test_libreoffice_xls_round_trip_inspect_smoke(
+        self, tmp_path
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        seed = tmp_path / "seed.xlsx"
+        self._save_xlsx(seed)
+        profile = tmp_path / "xls-seed-profile"
+        output_dir = tmp_path / "xls-seed-output"
+        profile.mkdir()
+        output_dir.mkdir()
+        executable = shutil.which("libreoffice") or shutil.which("soffice")
+        command = [
+            executable,
+            "--headless",
+            "--invisible",
+            "--nologo",
+            "--nodefault",
+            "--nolockcheck",
+            "--norestore",
+            f"-env:UserInstallation={profile.as_uri()}",
+            "--convert-to",
+            "xls:MS Excel 97",
+            "--outdir",
+            str(output_dir),
+            str(seed),
+        ]
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        assert completed.returncode == 0, (
+            completed.stdout,
+            completed.stderr,
+        )
+        generated = output_dir / "seed.xls"
+        assert generated.read_bytes().startswith(
+            b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+        )
+        os.replace(generated, evidence / "report.xls")
+
+        inspected = inspect_artifact(
+            "report.xls",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        assert inspected["kind"] == "spreadsheet"
+        assert inspected["opens"] is True
+        assert inspected["sheets"][0]["name"] == "Summary"
+        assert inspected["sheets"][0]["cells"]["A1"]["value"] == "Revenue"
 
     @pytest.mark.skipif(
         shutil.which("libreoffice") is None,
