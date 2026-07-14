@@ -172,6 +172,12 @@ class TestNormalizeArtifactChecks:
                 _item(artifact_checks=[_check(spec=spec)]),
             )
 
+    def test_rejects_omitted_spec_for_check_without_type_fields(self) -> None:
+        check = _check(type="exists")
+        del check["spec"]
+        with pytest.raises(ValueError, match="artifact.*spec.*object"):
+            normalize_judge_contract(0, _item(artifact_checks=[check]))
+
     @pytest.mark.parametrize(
         ("check_type", "missing_field"),
         [

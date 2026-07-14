@@ -86,7 +86,7 @@ def normalize_judge_contract(
         if not isinstance(check_type, str) or check_type not in CHECK_FIELDS:
             raise ValueError(f"{check_label} has unknown artifact check type {check_type!r}")
 
-        spec = raw_check.get("spec", {})
+        spec = raw_check.get("spec")
         if not isinstance(spec, dict):
             raise ValueError(f"{check_label} spec must be an object")
         missing_fields = [field for field in CHECK_FIELDS[check_type] if field not in spec]
