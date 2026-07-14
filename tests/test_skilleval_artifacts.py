@@ -1,6 +1,7 @@
 """Artifact manifest and immutable evidence tests for SkillEval."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -9,6 +10,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
+from skillopt.envs.skilleval import artifacts as artifacts_mod
 from skillopt.envs.skilleval.artifacts import (
     EvidenceLimitError,
     ManifestEntry,
@@ -128,6 +130,46 @@ class TestManifest:
         with pytest.raises(ValueError, match="non-regular"):
             build_manifest(str(root))
 
+    @pytest.mark.parametrize("name", [".agents", ".claude", ".codex", ".git"])
+    def test_reserved_runtime_name_as_regular_file_is_excluded(
+        self, tmp_path, name
+    ) -> None:
+        root = tmp_path / "work"
+        root.mkdir()
+        (root / name).write_text("runtime", encoding="utf-8")
+
+        assert build_manifest(str(root)) == {}
+
+    def test_parent_symlink_swap_cannot_change_manifest_snapshot(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        root = tmp_path / "work"
+        nested = root / "nested"
+        nested.mkdir(parents=True)
+        original = b"%PDF-1.4\noriginal"
+        (nested / "report.pdf").write_bytes(original)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "report.pdf").write_bytes(b"\x89PNG\r\n\x1a\nreplacement")
+        moved = tmp_path / "original-nested"
+        real_open = os.open
+        swapped = False
+
+        def racing_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if os.fspath(path).endswith("report.pdf") and not swapped:
+                swapped = True
+                os.rename(nested, moved)
+                os.symlink(outside, nested, target_is_directory=True)
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(artifacts_mod.os, "open", racing_open)
+        manifest = build_manifest(str(root))
+
+        assert swapped is True
+        assert manifest["nested/report.pdf"].sha256 == hashlib.sha256(original).hexdigest()
+        assert manifest["nested/report.pdf"].kind == "pdf"
+
 
 class TestArtifactKind:
     @pytest.mark.parametrize(
@@ -193,6 +235,19 @@ class TestArtifactKind:
         path = tmp_path / "report.pdf"
         path.write_bytes(b"%PDF-1.7\n")
         assert detect_artifact_kind(str(path), "text/plain") is None
+
+    def test_unavailable_file_command_uses_signature_before_suffix(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        path = tmp_path / "report.xlsx"
+        path.write_bytes(b"%PDF-1.7\n")
+
+        def unavailable(*args, **kwargs):
+            raise FileNotFoundError("file utility unavailable")
+
+        monkeypatch.setattr(artifacts_mod.subprocess, "run", unavailable)
+
+        assert detect_artifact_kind(str(path)) == "pdf"
 
     def test_unsafe_or_corrupt_ooxml_is_unsupported(self, tmp_path) -> None:
         unsafe = tmp_path / "unsafe.xlsx"
@@ -413,6 +468,36 @@ class TestEvidenceSnapshot:
                 str(work), outputs, str(tmp_path / "judge"), max_bytes=1024
             )
 
+    def test_rejects_hard_link_added_after_initial_source_validation(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        work = tmp_path / "work"
+        work.mkdir()
+        output = work / "report.pdf"
+        outputs = _outputs_after(work, lambda: output.write_bytes(b"%PDF-1.4\n"))
+        late_link = tmp_path / "late-link.pdf"
+        real_open_destination = artifacts_mod._open_destination_file
+        linked = False
+
+        def racing_open_destination(root_descriptor, parts):
+            nonlocal linked
+            if not linked:
+                linked = True
+                os.link(output, late_link)
+            return real_open_destination(root_descriptor, parts)
+
+        monkeypatch.setattr(
+            artifacts_mod,
+            "_open_destination_file",
+            racing_open_destination,
+        )
+
+        with pytest.raises(ValueError, match="changed|single-link"):
+            create_evidence_snapshot(
+                str(work), outputs, str(tmp_path / "judge"), max_bytes=1024
+            )
+        assert linked is True
+
     def test_rejects_symlinked_judge_root_without_touching_target(self, tmp_path) -> None:
         work = tmp_path / "work"
         work.mkdir()
@@ -471,5 +556,56 @@ class TestEvidenceSnapshot:
         (tmp_path / "judge" / "evidence" / "extra.txt").write_text(
             "extra", encoding="utf-8"
         )
+        with pytest.raises(RuntimeError, match="evidence changed"):
+            verify_evidence_snapshot(snapshot)
+
+    def test_detects_added_task_file_in_evidence(self, tmp_path) -> None:
+        work = tmp_path / "work"
+        work.mkdir()
+        outputs = _outputs_after(
+            work, lambda: (work / "report.pdf").write_bytes(b"%PDF-1.4\n")
+        )
+        snapshot = create_evidence_snapshot(
+            str(work), outputs, str(tmp_path / "judge"), max_bytes=1024
+        )
+        evidence = tmp_path / "judge" / "evidence"
+        os.chmod(evidence, 0o755)
+        (evidence / "task.md").write_text("injected", encoding="utf-8")
+
+        with pytest.raises(RuntimeError, match="evidence changed"):
+            verify_evidence_snapshot(snapshot)
+
+    def test_detects_added_runtime_tree_in_evidence(self, tmp_path) -> None:
+        work = tmp_path / "work"
+        work.mkdir()
+        outputs = _outputs_after(
+            work, lambda: (work / "report.pdf").write_bytes(b"%PDF-1.4\n")
+        )
+        snapshot = create_evidence_snapshot(
+            str(work), outputs, str(tmp_path / "judge"), max_bytes=1024
+        )
+        evidence = tmp_path / "judge" / "evidence"
+        os.chmod(evidence, 0o755)
+        runtime = evidence / ".agents"
+        runtime.mkdir()
+        (runtime / "runtime.json").write_text("{}", encoding="utf-8")
+
+        with pytest.raises(RuntimeError, match="evidence changed"):
+            verify_evidence_snapshot(snapshot)
+
+    def test_detects_evidence_file_hard_link_mutation(self, tmp_path) -> None:
+        work = tmp_path / "work"
+        work.mkdir()
+        outputs = _outputs_after(
+            work, lambda: (work / "report.pdf").write_bytes(b"%PDF-1.4\n")
+        )
+        snapshot = create_evidence_snapshot(
+            str(work), outputs, str(tmp_path / "judge"), max_bytes=1024
+        )
+        os.link(
+            tmp_path / "judge" / "evidence" / "report.pdf",
+            tmp_path / "evidence-hard-link.pdf",
+        )
+
         with pytest.raises(RuntimeError, match="evidence changed"):
             verify_evidence_snapshot(snapshot)

@@ -4,7 +4,6 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
-import mimetypes
 import os
 import shutil
 import stat
@@ -108,20 +107,46 @@ def _normalized_mime(mime: str | None) -> str:
     return (mime or "").split(";", 1)[0].strip().lower()
 
 
-def _mime(path: str) -> str:
+def _directory_flags() -> int:
+    return os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _file_flags() -> int:
+    return os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+
+
+def _stat_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+        info.st_nlink,
+    )
+
+
+def _mime_from_descriptor(descriptor: int) -> str:
+    position = os.lseek(descriptor, 0, os.SEEK_CUR)
     try:
-        proc = subprocess.run(
-            ["file", "--brief", "--mime-type", "--", path],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        if proc.returncode == 0 and proc.stdout.strip():
-            return _normalized_mime(proc.stdout)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    return mimetypes.guess_type(path, strict=False)[0] or "application/octet-stream"
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        try:
+            proc = subprocess.run(
+                ["file", "--brief", "--mime-type", "-"],
+                stdin=descriptor,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                return _normalized_mime(proc.stdout)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return "application/octet-stream"
+    finally:
+        os.lseek(descriptor, position, os.SEEK_SET)
 
 
 def _safe_zip_member(name: str) -> bool:
@@ -131,27 +156,35 @@ def _safe_zip_member(name: str) -> bool:
     return not path.is_absolute() and ".." not in path.parts
 
 
-def _inspect_ooxml(path: str) -> str | None:
+def _inspect_ooxml_descriptor(descriptor: int) -> str | None:
+    position = os.lseek(descriptor, 0, os.SEEK_CUR)
     try:
-        with zipfile.ZipFile(path) as archive:
-            members = archive.infolist()
-            if len(members) > 10000:
-                return None
-            names: set[str] = set()
-            content_types_info = None
-            for info in members:
-                if not _safe_zip_member(info.filename) or info.filename in names:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        with os.fdopen(os.dup(descriptor), "rb") as source:
+            with zipfile.ZipFile(source) as archive:
+                members = archive.infolist()
+                if len(members) > 10000:
                     return None
-                names.add(info.filename)
-                if info.filename == "[Content_Types].xml":
-                    content_types_info = info
-            if content_types_info is None:
-                return None
-            if content_types_info.flag_bits & 0x1 or content_types_info.file_size > 2 * 1024 * 1024:
-                return None
-            content_types = archive.read(content_types_info).lower()
+                names: set[str] = set()
+                content_types_info = None
+                for info in members:
+                    if not _safe_zip_member(info.filename) or info.filename in names:
+                        return None
+                    names.add(info.filename)
+                    if info.filename == "[Content_Types].xml":
+                        content_types_info = info
+                if content_types_info is None:
+                    return None
+                if (
+                    content_types_info.flag_bits & 0x1
+                    or content_types_info.file_size > 2 * 1024 * 1024
+                ):
+                    return None
+                content_types = archive.read(content_types_info).lower()
     except (OSError, RuntimeError, ValueError, zipfile.BadZipFile, zipfile.LargeZipFile):
         return None
+    finally:
+        os.lseek(descriptor, position, os.SEEK_SET)
 
     matches = [
         kind
@@ -162,32 +195,30 @@ def _inspect_ooxml(path: str) -> str | None:
     return matches[0] if len(matches) == 1 else None
 
 
-def _read_signature(path: str) -> bytes:
+def _read_descriptor(descriptor: int, size: int, offset: int = 0) -> bytes:
+    if hasattr(os, "pread"):
+        return os.pread(descriptor, size, offset)
+    position = os.lseek(descriptor, 0, os.SEEK_CUR)
     try:
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(path, flags)
-        try:
-            return os.read(descriptor, 16)
-        finally:
-            os.close(descriptor)
-    except OSError:
-        return b""
+        os.lseek(descriptor, offset, os.SEEK_SET)
+        return os.read(descriptor, size)
+    finally:
+        os.lseek(descriptor, position, os.SEEK_SET)
 
 
-def detect_artifact_kind(path: str, mime: str | None = None) -> str | None:
-    """Return a supported normalized artifact kind, or ``None``.
-
-    A specific MIME type is authoritative. Generic MIME types are resolved by
-    safe signature/container inspection before a supported suffix is used.
-    """
-    detected_mime = _normalized_mime(_mime(path) if mime is None else mime)
+def _detect_artifact_kind_from_descriptor(
+    descriptor: int,
+    logical_path: str,
+    mime: str,
+) -> str | None:
+    detected_mime = _normalized_mime(mime)
     specific_kind = _SPECIFIC_MIME_KINDS.get(detected_mime)
     if specific_kind is not None:
         return specific_kind
     if detected_mime not in _GENERIC_MIMES:
         return None
 
-    signature = _read_signature(path)
+    signature = _read_descriptor(descriptor, 16)
     if signature.startswith(b"%PDF-"):
         return "pdf"
     if (
@@ -198,88 +229,192 @@ def detect_artifact_kind(path: str, mime: str | None = None) -> str | None:
     ):
         return "image"
 
-    suffix = os.path.splitext(os.fspath(path))[1].lower()
+    suffix = os.path.splitext(logical_path)[1].lower()
     is_zip = signature.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"))
     if is_zip or detected_mime in _ZIP_MIMES:
-        return _inspect_ooxml(path)
+        return _inspect_ooxml_descriptor(descriptor)
     if signature.startswith(_OLE_SIGNATURE):
         return _SUFFIX_KINDS.get(suffix) if suffix in {".xls", ".doc", ".ppt"} else None
     return _SUFFIX_KINDS.get(suffix)
 
 
-def _hash_regular_file(path: str) -> tuple[int, str]:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
+def detect_artifact_kind(path: str, mime: str | None = None) -> str | None:
+    """Return a supported normalized artifact kind, or ``None``.
+
+    A specific MIME type is authoritative. Generic MIME types are resolved by
+    safe signature/container inspection before a supported suffix is used.
+    """
+    detected_mime = _normalized_mime(mime)
+    if mime is not None:
+        specific_kind = _SPECIFIC_MIME_KINDS.get(detected_mime)
+        if specific_kind is not None:
+            return specific_kind
+        if detected_mime not in _GENERIC_MIMES:
+            return None
+
+    descriptor = os.open(os.fspath(path), _file_flags())
     try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
             raise ValueError(f"non-regular artifact is not allowed: {path}")
-        digest = hashlib.sha256()
-        size = 0
-        while True:
-            chunk = os.read(descriptor, _HASH_CHUNK_SIZE)
-            if not chunk:
-                break
-            digest.update(chunk)
-            size += len(chunk)
-        after = os.fstat(descriptor)
-        identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-        identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-        if identity_before != identity_after or size != after.st_size:
-            raise ValueError(f"artifact changed while manifest was built: {path}")
-        return size, digest.hexdigest()
+        if mime is None:
+            detected_mime = _mime_from_descriptor(descriptor)
+        return _detect_artifact_kind_from_descriptor(
+            descriptor,
+            os.fspath(path),
+            detected_mime,
+        )
     finally:
         os.close(descriptor)
 
 
-def _relative_posix(path: str, root: str) -> str:
-    return os.path.relpath(path, root).replace(os.sep, "/")
+def _hash_descriptor(descriptor: int) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    size = 0
+    while True:
+        chunk = _read_descriptor(descriptor, _HASH_CHUNK_SIZE, size)
+        if not chunk:
+            break
+        digest.update(chunk)
+        size += len(chunk)
+    return size, digest.hexdigest()
+
+
+def _open_absolute_directory(path: str) -> int:
+    path = os.path.abspath(path)
+    current = os.open(os.path.abspath(os.sep), _directory_flags())
+    try:
+        for part in path.split(os.sep)[1:]:
+            try:
+                next_descriptor = os.open(part, _directory_flags(), dir_fd=current)
+            except OSError as exc:
+                raise ValueError(f"directory path must not contain symlinks: {path}") from exc
+            os.close(current)
+            current = next_descriptor
+        return current
+    except Exception:
+        os.close(current)
+        raise
+
+
+def _manifest_entry_from_descriptor(
+    descriptor: int,
+    rel: str,
+    *,
+    require_single_link: bool,
+) -> ManifestEntry:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError(f"non-regular artifact is not allowed: {rel}")
+    if require_single_link and before.st_nlink != 1:
+        raise ValueError(f"artifact must be a single-link regular file: {rel}")
+    size, sha256 = _hash_descriptor(descriptor)
+    mime = _mime_from_descriptor(descriptor)
+    kind = _detect_artifact_kind_from_descriptor(descriptor, rel, mime)
+    after = os.fstat(descriptor)
+    if (
+        _stat_identity(before) != _stat_identity(after)
+        or size != after.st_size
+        or (require_single_link and after.st_nlink != 1)
+    ):
+        raise ValueError(f"artifact changed while manifest was built: {rel}")
+    return ManifestEntry(path=rel, size=size, sha256=sha256, mime=mime, kind=kind)
+
+
+def _scan_directory(
+    directory_descriptor: int,
+    rel_parts: tuple[str, ...],
+    rows: dict[str, ManifestEntry],
+    directories: set[str],
+    *,
+    skip_runtime: bool,
+    require_single_link: bool,
+) -> None:
+    with os.scandir(directory_descriptor) as entries:
+        names = sorted(entry.name for entry in entries)
+    for name in names:
+        rel = "/".join((*rel_parts, name))
+        info = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError(
+                f"symlink directory or file is not allowed in artifact workspace: {rel}"
+            )
+        if stat.S_ISDIR(info.st_mode):
+            if skip_runtime and name in _SKIP_ROOTS:
+                continue
+            try:
+                child_descriptor = os.open(name, _directory_flags(), dir_fd=directory_descriptor)
+            except OSError as exc:
+                raise ValueError(f"symlink directory is not allowed: {rel}") from exc
+            try:
+                opened = os.fstat(child_descriptor)
+                if _stat_identity(info) != _stat_identity(opened):
+                    raise ValueError(f"artifact directory changed while manifest was built: {rel}")
+                directories.add(rel)
+                _scan_directory(
+                    child_descriptor,
+                    (*rel_parts, name),
+                    rows,
+                    directories,
+                    skip_runtime=skip_runtime,
+                    require_single_link=require_single_link,
+                )
+            finally:
+                os.close(child_descriptor)
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"non-regular artifact is not allowed: {rel}")
+        if skip_runtime and (name in _SKIP_ROOTS or (not rel_parts and name == "task.md")):
+            continue
+        try:
+            descriptor = os.open(name, _file_flags(), dir_fd=directory_descriptor)
+        except OSError as exc:
+            raise ValueError(f"symlink is not allowed in artifact workspace: {rel}") from exc
+        try:
+            opened = os.fstat(descriptor)
+            if _stat_identity(info) != _stat_identity(opened):
+                raise ValueError(f"artifact changed while manifest was built: {rel}")
+            rows[rel] = _manifest_entry_from_descriptor(
+                descriptor,
+                rel,
+                require_single_link=require_single_link,
+            )
+        finally:
+            os.close(descriptor)
+
+
+def _scan_manifest(
+    root: str,
+    *,
+    skip_runtime: bool,
+    require_single_link: bool,
+) -> tuple[dict[str, ManifestEntry], set[str]]:
+    root = os.path.abspath(os.fspath(root))
+    root_descriptor = _open_absolute_directory(root)
+    rows: dict[str, ManifestEntry] = {}
+    directories: set[str] = set()
+    try:
+        _scan_directory(
+            root_descriptor,
+            (),
+            rows,
+            directories,
+            skip_runtime=skip_runtime,
+            require_single_link=require_single_link,
+        )
+    finally:
+        os.close(root_descriptor)
+    return {path: rows[path] for path in sorted(rows)}, directories
 
 
 def build_manifest(root: str) -> dict[str, ManifestEntry]:
     """Build a deterministic manifest of regular, non-runtime files in *root*."""
-    root = os.path.abspath(os.fspath(root))
-    root_info = os.lstat(root)
-    if stat.S_ISLNK(root_info.st_mode):
-        raise ValueError(f"artifact workspace root must not be a symlink: {root}")
-    if not stat.S_ISDIR(root_info.st_mode):
-        raise ValueError(f"artifact workspace root is not a directory: {root}")
-
-    rows: dict[str, ManifestEntry] = {}
-    for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
-        safe_dirs: list[str] = []
-        for name in sorted(dirs):
-            full = os.path.join(current, name)
-            info = os.lstat(full)
-            rel = _relative_posix(full, root)
-            if stat.S_ISLNK(info.st_mode):
-                raise ValueError(f"symlink directory is not allowed: {rel}")
-            if not stat.S_ISDIR(info.st_mode):
-                raise ValueError(f"non-directory artifact entry is not allowed: {rel}")
-            if name not in _SKIP_ROOTS:
-                safe_dirs.append(name)
-        dirs[:] = safe_dirs
-
-        for name in sorted(files):
-            full = os.path.join(current, name)
-            rel = _relative_posix(full, root)
-            info = os.lstat(full)
-            if stat.S_ISLNK(info.st_mode):
-                raise ValueError(f"symlink is not allowed in artifact workspace: {rel}")
-            if not stat.S_ISREG(info.st_mode):
-                raise ValueError(f"non-regular artifact is not allowed: {rel}")
-            if rel == "task.md":
-                continue
-            size, sha256 = _hash_regular_file(full)
-            mime = _mime(full)
-            rows[rel] = ManifestEntry(
-                path=rel,
-                size=size,
-                sha256=sha256,
-                mime=mime,
-                kind=detect_artifact_kind(full, mime),
-            )
-    return {path: rows[path] for path in sorted(rows)}
+    rows, _directories = _scan_manifest(
+        root,
+        skip_runtime=True,
+        require_single_link=False,
+    )
+    return rows
 
 
 def diff_manifests(
@@ -313,6 +448,15 @@ def _tree_hash(entries: list[ManifestEntry] | tuple[ManifestEntry, ...]) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _manifest_directories(entries: tuple[ManifestEntry, ...]) -> set[str]:
+    directories: set[str] = set()
+    for entry in entries:
+        parts = PurePosixPath(entry.path).parts[:-1]
+        for index in range(1, len(parts) + 1):
+            directories.add("/".join(parts[:index]))
+    return directories
 
 
 def _logical_parts(raw_path: object) -> tuple[str, ...]:
@@ -485,19 +629,12 @@ def _copy_validated_file(
         _write_all(destination_descriptor, chunk)
 
     final_info = os.fstat(source_descriptor)
-    initial_identity = (
-        initial_info.st_dev,
-        initial_info.st_ino,
-        initial_info.st_size,
-        initial_info.st_mtime_ns,
-    )
-    final_identity = (
-        final_info.st_dev,
-        final_info.st_ino,
-        final_info.st_size,
-        final_info.st_mtime_ns,
-    )
-    if final_identity != initial_identity or copied != initial_info.st_size:
+    if (
+        not stat.S_ISREG(final_info.st_mode)
+        or final_info.st_nlink != 1
+        or _stat_identity(final_info) != _stat_identity(initial_info)
+        or copied != initial_info.st_size
+    ):
         raise ValueError(f"artifact changed while evidence was copied: {rel}")
     source_hash = source_digest.hexdigest()
     if source_hash != expected_sha256:
@@ -518,6 +655,9 @@ def _copy_validated_file(
     if copied_size != copied or copied_digest.hexdigest() != source_hash:
         raise RuntimeError(f"copied evidence verification failed: {rel}")
     os.fchmod(destination_descriptor, 0o444)
+    destination_info = os.fstat(destination_descriptor)
+    if not stat.S_ISREG(destination_info.st_mode) or destination_info.st_nlink != 1:
+        raise ValueError(f"copied evidence must be a single-link regular file: {rel}")
 
 
 def _lock_evidence_directories(evidence: str) -> None:
@@ -596,7 +736,14 @@ def create_evidence_snapshot(
             finally:
                 os.close(destination_descriptor)
 
-        entries = tuple(build_manifest(evidence).values())
+        evidence_rows, evidence_directories = _scan_manifest(
+            evidence,
+            skip_runtime=False,
+            require_single_link=True,
+        )
+        entries = tuple(evidence_rows.values())
+        if evidence_directories != _manifest_directories(entries):
+            raise RuntimeError("unexpected directory in copied evidence")
         manifest_path = os.path.join(scratch, "artifact-manifest.json")
         with open(manifest_path, "w", encoding="utf-8") as handle:
             json.dump(
@@ -631,8 +778,17 @@ def create_evidence_snapshot(
 def verify_evidence_snapshot(snapshot: EvidenceSnapshot) -> None:
     """Raise if an evidence snapshot's path set or bytes have changed."""
     try:
-        current = tuple(build_manifest(snapshot.evidence_dir).values())
+        current_rows, current_directories = _scan_manifest(
+            snapshot.evidence_dir,
+            skip_runtime=False,
+            require_single_link=True,
+        )
+        current = tuple(current_rows.values())
     except Exception as exc:
         raise RuntimeError("evidence changed while judge was running") from exc
-    if current != snapshot.files or _tree_hash(current) != snapshot.tree_hash:
+    if (
+        current != snapshot.files
+        or current_directories != _manifest_directories(snapshot.files)
+        or _tree_hash(current) != snapshot.tree_hash
+    ):
         raise RuntimeError("evidence changed while judge was running")
