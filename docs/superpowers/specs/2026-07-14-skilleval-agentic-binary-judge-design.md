@@ -1,7 +1,7 @@
 # SkillEval Agentic Binary Judge Design
 
 - Date: 2026-07-14
-- Status: Pending review
+- Status: Accepted
 - Scope: `skillopt/envs/skilleval/`, `skillopt/model/`, and the SkillEval CLIs
 
 ## Background
@@ -55,8 +55,8 @@ accept/reject gate.
 | Evaluation dimensions | Evaluate deterministic structure/content and rendered visual quality |
 | Task contract | Keep free-form `rubric`; add optional structured `artifact_checks` |
 | Judge backends | Support independently configured `claude_code_exec` and `codex_exec` |
-| Evidence isolation | Judge reads a read-only copy, never the rollout `work_dir` |
-| Judge workspace | Separate read-only `evidence/` and writable `scratch/` directories |
+| Evidence isolation | Judge tools read a read-only copy, never the rollout `work_dir` |
+| Judge workspace | Separate read-only `evidence/` and writable `scratch/` directories, exposed only to the trusted artifact tool server |
 | Stability | Lowest supported effort, temperature zero where supported, strict final JSON, one parse retry |
 | Cache scope | Persist only inside the current `out_root`, including resumed runs |
 | Cache lookup | `(state_hash, task_id)` plus strict fingerprint validation; `state_hash` is the Skill hash in single-Skill mode |
@@ -153,10 +153,10 @@ EvidenceSnapshot
     +-- scratch/     inspector output only
     |
     v
-InspectorRegistry -> deterministic check results + inventory + renders
+Networkless Artifact MCP -> InspectorRegistry -> checks + inventory + renders
     |
     v
-AgenticJudgeRunner (Claude Code or Codex)
+Restricted AgenticJudgeRunner (Claude Code or Codex)
     |
     v
 VerdictValidator -> host-side hard/soft calculation
@@ -184,28 +184,44 @@ binary-routable when its detected MIME type or extension is one of:
 .xlsx .xls .docx .doc .pdf .png .jpg .jpeg .webp .tif .tiff .pptx .ppt
 ```
 
-MIME detection takes precedence over the extension. Symlinks, sockets, devices,
-and paths escaping the workspace are rejected.
+Specific MIME/signature detection takes precedence over the extension. Generic
+container MIME types such as `application/zip` are resolved by inspecting the
+container signature (for example, OOXML content types); the extension is used
+only as a fallback when detection is generic or unavailable. A conflicting
+specific MIME type is never overridden by the extension. Symlinks, sockets,
+devices, and paths escaping the workspace are rejected.
 
 ### 2. Evidence Snapshot
 
 The judge never receives the original rollout `work_dir`. Before judging:
 
-1. Copy only candidate outputs and the generated manifests into
-   `judge/<task_id>/evidence/`.
+1. Copy only candidate outputs into `judge/<task_id>/evidence/`; write generated
+   manifests under trusted scratch.
 2. Reject symlinks and revalidate every destination path.
 3. Make files mode `0444` and directories mode `0555`, then expose the tree
-   through an OS-enforced read-only sandbox mount. File modes are defense in
-   depth, not the security boundary: a same-user process could otherwise
-   change them.
+   only to the artifact tool server through an OS-enforced read-only sandbox
+   mount. File modes are defense in depth, not the security boundary: a
+   same-user process could otherwise change them.
 4. Record a content hash for every evidence file and the aggregate evidence
    tree.
 5. Create `judge/<task_id>/scratch/` as the only writable directory.
 
-The judge sandbox exposes evidence as a read-only mount and scratch as a
-separate writable mount, with no network. The backend's own sandbox setting is
-additional defense; it is not relied upon to express the mixed read-only/write
-layout. If the host cannot establish this boundary, agentic judging fails
+The model client does not receive the evidence or rollout directories as a
+normal workspace. It retains the control-plane network access required to reach
+Claude or Codex and receives only a required local Artifact MCP server. That
+server runs inside Bubblewrap with a minimal runtime filesystem, evidence
+mounted read-only, scratch mounted writable, and `--unshare-net`. It exposes
+only schema-validated artifact operations; no shell or arbitrary path tool is
+available to the model.
+
+Claude runs with all built-in tools disabled and only the named Artifact MCP
+tools enabled. Codex runs with `sandbox=read-only`, `approval_policy=never`,
+web search disabled, user config/rules ignored, and only the required Artifact
+MCP server configured. If a backend transport cannot express these controls,
+the agentic judge fails closed or selects a transport that can; it never
+silently weakens the policy.
+
+If the host cannot establish either sandbox boundary, agentic judging fails
 closed at startup. Renderers copy inputs into scratch when a third-party tool
 needs a writable source directory. After judging, hashes are checked again.
 Any evidence mutation is an evaluator security error, and the original rollout
@@ -213,17 +229,20 @@ tree remains untouched in all cases.
 
 ### 3. Inspector Registry
 
-The judge invokes a single trusted command surface:
+The judge invokes one trusted Artifact MCP surface:
 
 ```text
-artifactctl inventory <evidence-dir>
-artifactctl inspect <artifact>
-artifactctl render <artifact> [selectors]
-artifactctl extract <artifact> [selectors]
+artifact_inventory()
+artifact_inspect(path)
+artifact_render(path, selectors)
+artifact_extract(path, selectors)
 ```
 
-Commands emit JSON to stdout and write derived files only under scratch. They
-never execute artifact-provided code.
+The same operations are available as a host CLI for deterministic checks and
+tests. Tool arguments use logical evidence-relative paths, responses are
+bounded JSON or image content wrapped as untrusted evidence, and derived files
+are written only under scratch. The server rejects arbitrary commands and
+paths. It never executes artifact-provided code.
 
 Format behavior:
 
@@ -235,8 +254,10 @@ Format behavior:
 | PDF | `pdfinfo`, extracted text, page metadata | `pdftoppm` page PNGs |
 | Images | MIME, dimensions, color mode, transparency, animation/frame metadata | Original image or normalized PNG |
 
-LibreOffice uses a fresh temporary user profile, headless mode, disabled macros,
-disabled external links, no network, and a process timeout.
+LibreOffice uses a fresh temporary user profile, headless mode, maximum macro
+security, disabled link updates, no network, and a process timeout. ZIP-based
+formats are preflighted for entry count, uncompressed size, compression ratio,
+path traversal, and duplicate/colliding names before a parser opens them.
 
 ### 4. Large Artifact Strategy
 
@@ -272,6 +293,7 @@ env:
   judge_exec_timeout: 300
   judge_exec_effort: low
   judge_cache: true
+  judge_sandbox_command: ["bwrap"]
   judge_max_evidence_bytes: 536870912
   judge_max_scratch_bytes: 1073741824
   judge_max_render_pixels: 500000000
@@ -284,8 +306,10 @@ lowest-effort deterministic configuration available is used.
 
 ### Tool and Prompt Policy
 
-The judge may read, glob, grep, and invoke the trusted `artifactctl` interface.
-It has no write access outside scratch and no network access.
+The judge may invoke only the four Artifact MCP tools. Web, shell/Bash,
+general filesystem, edit/write, skill, plugin, and connector tools are not
+exposed. The Artifact MCP server has no outbound network access. The
+Claude/Codex client may still contact its configured model endpoint.
 
 The system prompt states, before any artifact-derived text:
 
@@ -301,8 +325,8 @@ similar instruction files if an evaluated artifact contains them.
 
 ### Verdict Contract
 
-The final response must contain only one JSON object, and the judge also writes
-the same object to `scratch/verdict.json`:
+The final response must contain only one JSON object. After validation, the host
+writes that exact object to `scratch/verdict.json`:
 
 ```json
 {
@@ -351,9 +375,11 @@ hard = 1 only when every required criterion passed
 soft = sum(criterion.score * criterion.weight) / sum(criterion.weight)
 ```
 
-Deterministic checks are executed and scored by inspectors. The agent cannot
-override a deterministic failure. It supplies semantic and visual criterion
-scores with cited evidence.
+Deterministic checks are executed and scored by inspectors. The agent never
+returns those criterion IDs and cannot override a deterministic failure. It
+supplies only semantic and visual criterion scores with cited evidence; the
+host merges the two disjoint criterion sets and verifies that the final set
+matches the task contract exactly.
 
 Outcomes are classified as:
 
@@ -390,10 +416,10 @@ identity. A hit is valid only when the record also matches:
 - inspector version
 - verdict schema version
 
-Writes are atomic. Concurrent evaluations of the same key use a lock. Malformed
-records or fingerprint mismatches are cache misses, not judge failures. Cached
-criteria and evidence references pass the same verdict validation as fresh
-output.
+Writes are atomic. One per-key lock covers lookup, model execution, and write so
+concurrent evaluations cannot duplicate a judgment. Malformed records or
+fingerprint mismatches are cache misses, not judge failures. Cached criteria
+and evidence references pass the same verdict validation as fresh output.
 
 The cache is intentionally scoped to `out_root`: it supports retries and
 training resume without reusing judgments across independent experiments.
@@ -477,7 +503,8 @@ coverage without requiring huge files in the repository.
 - The judge cannot modify evidence or the original rollout workspace.
 - Macros, external links, embedded scripts, and executable artifacts are never
   run.
-- Network access is unavailable.
+- Web tools are disabled, and artifact inspection tools cannot initiate network
+  requests; model control-plane traffic remains available.
 - A malicious artifact cannot escape evidence/scratch through symlinks or
   crafted archive paths.
 
