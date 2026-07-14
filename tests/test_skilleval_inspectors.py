@@ -1838,6 +1838,143 @@ class TestOfficeInspector:
                 selectors=["slide:1"],
             )
 
+    def test_docx_sections_are_compact_and_cursor_accessible(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from docx import Document
+        from docx.enum.section import WD_SECTION
+        from skillopt.envs.skilleval.inspectors import office
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "sections.docx"
+        document = Document()
+        document.add_section(WD_SECTION.NEW_PAGE)
+        document.add_section(WD_SECTION.NEW_PAGE)
+        document.sections[2].top_margin = 1_234_567
+        document.save(path)
+        monkeypatch.setattr(office, "_MAX_INDEX_ITEMS", 2)
+
+        inventory = inspect_artifact(
+            "sections.docx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+        detail = extract_artifact(
+            "sections.docx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["sections:cursor:2:limit:1"],
+        )
+
+        assert inventory["section_count"] == 3
+        assert inventory["sections"] == {
+            "items": [{"section": 1}, {"section": 2}],
+            "cursor": 0,
+            "limit": 2,
+            "total": 3,
+            "returned": 2,
+            "omitted": 1,
+            "next_cursor": 2,
+        }
+        assert detail["sections"]["items"][0]["section"] == 3
+        assert detail["sections"]["items"][0]["margins"]["top"] == 1_234_440
+        assert detail["sections"]["next_cursor"] is None
+
+    def test_docx_header_tables_have_count_and_cursor_pagination(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from docx import Document
+        from docx.shared import Inches
+        from skillopt.envs.skilleval.inspectors import office
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "header-tables.docx"
+        document = Document()
+        header = document.sections[0].header
+        for index in range(3):
+            table = header.add_table(rows=1, cols=1, width=Inches(1))
+            table.cell(0, 0).text = f"Header table {index + 1}"
+        document.save(path)
+        monkeypatch.setattr(office, "_TABLE_PAGE_SIZE", 2)
+
+        inventory = inspect_artifact(
+            "header-tables.docx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+        detail = extract_artifact(
+            "header-tables.docx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["header:1:tables:cursor:2:limit:1"],
+        )
+
+        header_inventory = inventory["headers"]["items"][0]
+        assert header_inventory["table_count"] == 3
+        assert header_inventory["table_page"]["omitted"] == 1
+        assert header_inventory["table_page"]["next_cursor"] == 2
+        assert header_inventory["table_page"]["next_selector"] == (
+            "header:1:tables:cursor:2:limit:2"
+        )
+        assert detail["details"][0]["tables"][0]["cells"] == [
+            ["Header table 3"],
+        ]
+        assert detail["details"][0]["table_page"]["next_cursor"] is None
+
+    def test_docx_table_pages_preserve_rows_and_offer_cell_cursor(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from docx import Document
+        from skillopt.envs.skilleval.inspectors import office
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "wide-table.docx"
+        document = Document()
+        table = document.add_table(rows=2, cols=5)
+        for row_index, row in enumerate(table.rows, start=1):
+            for column_index, cell in enumerate(row.cells, start=1):
+                cell.text = f"r{row_index}c{column_index}"
+        document.save(path)
+        monkeypatch.setattr(office, "_TABLE_CELL_PAGE_SIZE", 4)
+
+        inventory = inspect_artifact(
+            "wide-table.docx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+        second_row = extract_artifact(
+            "wide-table.docx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["table:1:rows:cursor:1:limit:1"],
+        )
+        first_row_tail = extract_artifact(
+            "wide-table.docx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["table:1:row:1:cells:cursor:4:limit:4"],
+        )
+
+        first_page = inventory["tables"]["items"][0]
+        assert first_page["cells"] == [
+            ["r1c1", "r1c2", "r1c3", "r1c4"],
+        ]
+        assert first_page["row_page"]["returned"] == 1
+        assert first_page["row_page"]["next_cursor"] == 1
+        assert first_page["row_page"]["next_selector"] == (
+            "table:1:rows:cursor:1:limit:16"
+        )
+        assert first_page["cell_page"]["row"] == 1
+        assert first_page["cell_page"]["next_cursor"] == 4
+        assert first_page["cell_page"]["next_selector"] == (
+            "table:1:row:1:cells:cursor:4:limit:4"
+        )
+        assert second_row["details"][0]["cells"] == [
+            ["r2c1", "r2c2", "r2c3", "r2c4"],
+        ]
+        assert first_row_tail["details"][0]["cells"] == [["r1c5"]]
+        assert first_row_tail["details"][0]["cell_page"]["next_cursor"] is None
+
     def test_docx_external_relationship_is_metadata_only(
         self, tmp_path, monkeypatch
     ) -> None:
@@ -2027,6 +2164,198 @@ class TestOfficeInspector:
             )
         assert parser_calls == []
 
+    @pytest.mark.parametrize(
+        ("member", "old_root", "new_root"),
+        [
+            ("ppt/presentation.xml", b"p:presentation", b"p:notPresentation"),
+            ("ppt/slides/slide1.xml", b"p:sld", b"p:notSlide"),
+            ("ppt/notesSlides/notesSlide1.xml", b"p:notes", b"p:notNotes"),
+        ],
+    )
+    def test_pptx_preflight_rejects_invalid_part_root_before_parser(
+        self, tmp_path, monkeypatch, member, old_root, new_root
+    ) -> None:
+        from pptx import Presentation
+        from skillopt.envs.skilleval.inspectors import office
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "invalid-root.pptx"
+        presentation = Presentation()
+        slide = presentation.slides.add_slide(presentation.slide_layouts[1])
+        slide.notes_slide.notes_text_frame.text = "note"
+        presentation.save(path)
+        self._rewrite_member(
+            path,
+            member,
+            lambda payload: payload.replace(
+                b"<" + old_root,
+                b"<" + new_root,
+                1,
+            ).replace(
+                b"</" + old_root + b">",
+                b"</" + new_root + b">",
+                1,
+            ),
+        )
+        parser_calls = []
+
+        def forbidden_parser(*args, **kwargs):
+            parser_calls.append((args, kwargs))
+            raise AssertionError("python-pptx must not see invalid OOXML")
+
+        monkeypatch.setattr(office, "Presentation", forbidden_parser)
+        with pytest.raises(InspectionError, match="PowerPoint"):
+            inspect_artifact(
+                "invalid-root.pptx",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+        assert parser_calls == []
+
+    def test_pptx_preflight_rejects_orphan_slide_relationship_before_parser(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from pptx import Presentation
+        from skillopt.envs.skilleval.inspectors import office
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "orphan-slide.pptx"
+        presentation = Presentation()
+        presentation.slides.add_slide(presentation.slide_layouts[1])
+        presentation.save(path)
+        relationship = (
+            b'<Relationship Id="rIdOrphan" '
+            b'Type="http://schemas.openxmlformats.org/officeDocument/'
+            b'2006/relationships/slide" Target="slides/slide1.xml"/>'
+        )
+        self._rewrite_member(
+            path,
+            "ppt/_rels/presentation.xml.rels",
+            lambda payload: payload.replace(
+                b"</Relationships>",
+                relationship + b"</Relationships>",
+                1,
+            ),
+        )
+        parser_calls = []
+        monkeypatch.setattr(
+            office,
+            "Presentation",
+            lambda *args, **kwargs: parser_calls.append((args, kwargs)),
+        )
+
+        with pytest.raises(InspectionError, match="slide relationship graph"):
+            inspect_artifact(
+                "orphan-slide.pptx",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+        assert parser_calls == []
+
+    @pytest.mark.parametrize("mode", ["type", "external"])
+    def test_pptx_preflight_validates_slide_part_relationships(
+        self, tmp_path, monkeypatch, mode
+    ) -> None:
+        from pptx import Presentation
+        from skillopt.envs.skilleval.inspectors import office
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / f"invalid-slide-{mode}.pptx"
+        presentation = Presentation()
+        presentation.slides.add_slide(presentation.slide_layouts[1])
+        presentation.save(path)
+
+        def invalidate(payload: bytes) -> bytes:
+            if mode == "type":
+                return payload.replace(
+                    b"/relationships/slideLayout",
+                    b"/relationships/notesSlide",
+                    1,
+                )
+            return payload.replace(
+                b'Target="../slideLayouts/slideLayout2.xml"',
+                (
+                    b'Target="https://example.invalid/layout.xml" '
+                    b'TargetMode="External"'
+                ),
+                1,
+            )
+
+        self._rewrite_member(
+            path,
+            "ppt/slides/_rels/slide1.xml.rels",
+            invalidate,
+        )
+        parser_calls = []
+        monkeypatch.setattr(
+            office,
+            "Presentation",
+            lambda *args, **kwargs: parser_calls.append((args, kwargs)),
+        )
+
+        with pytest.raises(InspectionError, match="slide relationship"):
+            inspect_artifact(
+                path.name,
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+        assert parser_calls == []
+
+    @pytest.mark.parametrize("relationship_kind", ["image", "chart"])
+    def test_pptx_preflight_rejects_slide_relationship_content_mismatch(
+        self, tmp_path, monkeypatch, relationship_kind
+    ) -> None:
+        from pptx import Presentation
+        from pptx.chart.data import ChartData
+        from pptx.enum.chart import XL_CHART_TYPE
+        from pptx.util import Inches
+        from skillopt.envs.skilleval.inspectors import office
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / f"invalid-{relationship_kind}.pptx"
+        presentation = Presentation()
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        if relationship_kind == "image":
+            image_path = tmp_path / "relationship.png"
+            PillowImage.new("RGB", (2, 2), color=(1, 2, 3)).save(image_path)
+            slide.shapes.add_picture(str(image_path), 0, 0)
+            old_type = b"/relationships/image"
+            new_type = b"/relationships/chart"
+        else:
+            chart_data = ChartData()
+            chart_data.categories = ["One"]
+            chart_data.add_series("Series", (1,))
+            slide.shapes.add_chart(
+                XL_CHART_TYPE.COLUMN_CLUSTERED,
+                0,
+                0,
+                Inches(2),
+                Inches(2),
+                chart_data,
+            )
+            old_type = b"/relationships/chart"
+            new_type = b"/relationships/image"
+        presentation.save(path)
+        self._rewrite_member(
+            path,
+            "ppt/slides/_rels/slide1.xml.rels",
+            lambda payload: payload.replace(old_type, new_type, 1),
+        )
+        parser_calls = []
+        monkeypatch.setattr(
+            office,
+            "Presentation",
+            lambda *args, **kwargs: parser_calls.append((args, kwargs)),
+        )
+
+        with pytest.raises(InspectionError, match="slide relationship"):
+            inspect_artifact(
+                path.name,
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+        assert parser_calls == []
+
     def test_pptx_extract_reports_notes_shape_type_and_bounds(
         self, tmp_path
     ) -> None:
@@ -2059,6 +2388,172 @@ class TestOfficeInspector:
             "width",
             "height",
         }
+
+    def test_pptx_group_children_have_independent_cursor_window(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from pptx import Presentation
+        from pptx.util import Inches
+        from skillopt.envs.skilleval.inspectors import office
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "grouped.pptx"
+        presentation = Presentation()
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        group = slide.shapes.add_group_shape()
+        for index in range(3):
+            child = group.shapes.add_textbox(
+                Inches(index),
+                Inches(0),
+                Inches(1),
+                Inches(1),
+            )
+            child.name = f"Child {index + 1}"
+            child.text_frame.text = f"Child text {index + 1}"
+        trailing = slide.shapes.add_textbox(
+            Inches(0),
+            Inches(2),
+            Inches(1),
+            Inches(1),
+        )
+        trailing.name = "Trailing top-level"
+        later = slide.shapes.add_textbox(
+            Inches(2),
+            Inches(2),
+            Inches(1),
+            Inches(1),
+        )
+        later.name = "Later top-level"
+        presentation.save(path)
+        monkeypatch.setattr(office, "_SHAPE_PAGE_SIZE", 2)
+
+        inventory = inspect_artifact(
+            "grouped.pptx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+        child_page = extract_artifact(
+            "grouped.pptx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["slide:1:shape:1:children:cursor:2:limit:1"],
+        )
+        top_level_page = extract_artifact(
+            "grouped.pptx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["slide:1:shapes:cursor:2:limit:1"],
+        )
+
+        slide_inventory = inventory["slides"]["items"][0]
+        assert [shape["name"] for shape in slide_inventory["shapes"]] == [
+            "Group 1",
+            "Trailing top-level",
+        ]
+        assert slide_inventory["shape_page"]["returned"] == 2
+        assert slide_inventory["shape_page"]["omitted"] == 1
+        assert slide_inventory["shape_page"]["next_selector"] == (
+            "slide:1:shapes:cursor:2:limit:2"
+        )
+        assert top_level_page["slides"]["items"][0]["shapes"][0]["name"] == (
+            "Later top-level"
+        )
+        assert slide_inventory["shapes"][0]["children_page"]["omitted"] == 1
+        selected_group = child_page["slides"]["items"][0]["shapes"][0]
+        assert [child["name"] for child in selected_group["children"]] == [
+            "Child 3",
+        ]
+        assert selected_group["children_page"]["next_cursor"] is None
+
+    def test_pptx_notes_use_character_cursor_without_silent_truncation(
+        self, tmp_path
+    ) -> None:
+        from pptx import Presentation
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "long-notes.pptx"
+        presentation = Presentation()
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        slide.notes_slide.notes_text_frame.text = "n" * 5_000
+        presentation.save(path)
+
+        inventory = inspect_artifact(
+            "long-notes.pptx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+        tail = extract_artifact(
+            "long-notes.pptx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["slide:1:notes:cursor:4096:limit:4096"],
+        )
+
+        notes_page = inventory["slides"]["items"][0]["notes_page"]
+        assert len(inventory["slides"]["items"][0]["notes_text"]) == 4_096
+        assert notes_page["truncated"] is True
+        assert notes_page["omitted"] == 904
+        assert notes_page["next_cursor"] == 4_096
+        assert notes_page["next_selector"] == (
+            "slide:1:notes:cursor:4096:limit:4096"
+        )
+        tail_slide = tail["slides"]["items"][0]
+        assert tail_slide["notes_text"] == "n" * 904
+        assert tail_slide["notes_page"]["truncated"] is False
+        assert tail_slide["notes_page"]["next_cursor"] is None
+
+    def test_office_empty_paragraphs_do_not_consume_effective_indexes(
+        self, tmp_path
+    ) -> None:
+        from docx import Document
+        from pptx import Presentation
+
+        evidence, scratch = _roots(tmp_path)
+        document = Document()
+        document.add_paragraph("")
+        document.add_paragraph("   ")
+        document.add_paragraph("Body")
+        header = document.sections[0].header
+        header.add_paragraph("  ")
+        header.add_paragraph("Header")
+        footer = document.sections[0].footer
+        footer.add_paragraph("")
+        footer.add_paragraph("Footer")
+        document.save(evidence / "empty.docx")
+
+        presentation = Presentation()
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        notes = slide.notes_slide.notes_text_frame
+        notes.text = ""
+        notes.add_paragraph().text = "  "
+        notes.add_paragraph().text = "First"
+        notes.add_paragraph().text = ""
+        notes.add_paragraph().text = "Second"
+        presentation.save(evidence / "empty-notes.pptx")
+
+        document_result = inspect_artifact(
+            "empty.docx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+        presentation_result = inspect_artifact(
+            "empty-notes.pptx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        assert document_result["paragraphs"]["total"] == 1
+        assert document_result["paragraphs"]["items"][0]["paragraph"] == 1
+        assert document_result["headers"]["items"][0]["paragraphs"] == [
+            "Header",
+        ]
+        assert document_result["footers"]["items"][0]["paragraphs"] == [
+            "Footer",
+        ]
+        assert (
+            presentation_result["slides"]["items"][0]["notes_text"]
+            == "First\nSecond"
+        )
 
     def test_docx_relationship_traversal_is_rejected(
         self, tmp_path
@@ -2348,7 +2843,7 @@ class TestOfficeInspector:
             scratch_dir=str(scratch),
         )
 
-        assert result["converted_from"] == "doc"
+        assert result["converted_from"] == ".doc"
         assert result["paragraphs"]["items"][0]["text"] == (
             "Converted legacy document"
         )
@@ -2513,7 +3008,7 @@ class TestOfficeInspector:
             scratch_dir=str(scratch),
         )
 
-        assert result["converted_from"] == "ppt"
+        assert result["converted_from"] == ".ppt"
         assert result["slide_count"] == 1
         assert result["slides"]["items"][0]["text"] == [
             "Converted legacy deck",
@@ -2559,29 +3054,43 @@ class TestOfficeInspector:
             office._write_libreoffice_profile(profile)
             descriptor = os.open(source, os.O_RDONLY)
             try:
-                safe_run(
-                    [
-                        env_executable,
-                        f"FONTCONFIG_FILE={profile / 'fontconfig.xml'}",
-                        libreoffice,
-                        "--headless",
-                        "--invisible",
-                        "--nologo",
-                        "--nodefault",
-                        "--nolockcheck",
-                        "--norestore",
-                        f"-env:UserInstallation={profile.as_uri()}",
-                        "--convert-to",
-                        "doc",
-                        "--outdir",
-                        str(output_dir),
-                        f"/proc/self/fd/{descriptor}",
-                    ],
-                    timeout=180,
-                    cwd=transaction.proc_path,
-                    home=transaction.proc_path,
-                    pass_fds=(descriptor,),
+                command = [
+                    env_executable,
+                    f"FONTCONFIG_FILE={profile / 'fontconfig.xml'}",
+                    libreoffice,
+                    "--headless",
+                    "--invisible",
+                    "--nologo",
+                    "--nodefault",
+                    "--nolockcheck",
+                    "--norestore",
+                    f"-env:UserInstallation={profile.as_uri()}",
+                    "--convert-to",
+                    "doc",
+                    "--outdir",
+                    str(output_dir),
+                    f"/proc/self/fd/{descriptor}",
+                ]
+                deadline = time.monotonic() + 180
+                is_transient = (
+                    office.ooxml._is_transient_libreoffice_scratch_error
                 )
+                for attempt in range(3):
+                    try:
+                        safe_run(
+                            command,
+                            timeout=deadline - time.monotonic(),
+                            cwd=transaction.proc_path,
+                            home=transaction.proc_path,
+                            pass_fds=(descriptor,),
+                        )
+                        break
+                    except InspectionError as exc:
+                        if (
+                            attempt == 2
+                            or not is_transient(exc, profile)
+                        ):
+                            raise
             finally:
                 os.close(descriptor)
             outputs = list(output_dir.iterdir())
@@ -2598,7 +3107,7 @@ class TestOfficeInspector:
             scratch_dir=str(scratch),
         )
 
-        assert result["converted_from"] == "doc"
+        assert result["converted_from"] == ".doc"
         assert result["paragraphs"]["items"][0]["text"] == (
             "Legacy conversion smoke"
         )

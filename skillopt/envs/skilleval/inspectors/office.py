@@ -64,10 +64,35 @@ _PRESENTATION_NAMESPACE = (
     "http://schemas.openxmlformats.org/presentationml/2006/main"
 )
 _SLIDE_RELATIONSHIP = f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/slide"
+_SLIDE_LAYOUT_RELATIONSHIP = (
+    f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/slideLayout"
+)
+_NOTES_SLIDE_RELATIONSHIP = (
+    f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/notesSlide"
+)
+_IMAGE_RELATIONSHIP = f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/image"
+_AUDIO_RELATIONSHIP = f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/audio"
+_VIDEO_RELATIONSHIP = f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/video"
+_CHART_RELATIONSHIP = f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/chart"
+_MEDIA_RELATIONSHIP = (
+    "http://schemas.microsoft.com/office/2007/relationships/media"
+)
 _SLIDE_CONTENT_TYPE = (
     "application/vnd.openxmlformats-officedocument."
     "presentationml.slide+xml"
 )
+_SLIDE_LAYOUT_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument."
+    "presentationml.slideLayout+xml"
+)
+_NOTES_SLIDE_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument."
+    "presentationml.notesSlide+xml"
+)
+_CHART_CONTENT_TYPES = {
+    "application/vnd.openxmlformats-officedocument.drawingml.chart+xml",
+    "application/vnd.ms-office.chartex+xml",
+}
 _RELATIONSHIPS_CONTENT_TYPE = (
     "application/vnd.openxmlformats-package.relationships+xml"
 )
@@ -90,6 +115,7 @@ _TABLE_PAGE_SIZE = 16
 _HEADER_PAGE_SIZE = 16
 _SHAPE_PAGE_SIZE = 64
 _TABLE_CELL_PAGE_SIZE = 64
+_TABLE_ROW_PAGE_SIZE = 16
 _LIBREOFFICE_TIMEOUT_SECONDS = 180
 _LIBREOFFICE_MAX_TRANSIENT_ATTEMPTS = 3
 _ZIP_STREAM_CHUNK = 1024 * 1024
@@ -98,11 +124,39 @@ _DOC_PAGE_SELECTOR_RE = re.compile(
     r"^(paragraphs|tables|headers|footers):page:([1-9][0-9]*)$"
 )
 _DOC_ITEM_SELECTOR_RE = re.compile(
-    r"^(paragraph|table|header|footer):([1-9][0-9]*)"
+    r"^(paragraph|table|header|footer|section):([1-9][0-9]*)"
     r"(?::page:([1-9][0-9]*))?$"
+)
+_DOC_SECTIONS_CURSOR_RE = re.compile(
+    r"^sections:cursor:(0|[1-9][0-9]*):limit:([1-9][0-9]*)$"
+)
+_DOC_HEADER_TABLES_CURSOR_RE = re.compile(
+    r"^(header|footer):([1-9][0-9]*):tables:"
+    r"cursor:(0|[1-9][0-9]*):limit:([1-9][0-9]*)$"
+)
+_DOC_TABLE_ROWS_CURSOR_RE = re.compile(
+    r"^table:([1-9][0-9]*):rows:"
+    r"cursor:(0|[1-9][0-9]*):limit:([1-9][0-9]*)$"
+)
+_DOC_TABLE_CELLS_CURSOR_RE = re.compile(
+    r"^table:([1-9][0-9]*):row:([1-9][0-9]*):cells:"
+    r"cursor:(0|[1-9][0-9]*):limit:([1-9][0-9]*)$"
 )
 _SLIDE_SELECTOR_RE = re.compile(
     r"^slide:([1-9][0-9]*)(?::page:([1-9][0-9]*))?$"
+)
+_SLIDE_SHAPES_CURSOR_RE = re.compile(
+    r"^slide:([1-9][0-9]*):shapes:"
+    r"cursor:(0|[1-9][0-9]*):limit:([1-9][0-9]*)$"
+)
+_SLIDE_CHILDREN_CURSOR_RE = re.compile(
+    r"^slide:([1-9][0-9]*):shape:"
+    r"([1-9][0-9]*(?:\.[1-9][0-9]*)*):children:"
+    r"cursor:(0|[1-9][0-9]*):limit:([1-9][0-9]*)$"
+)
+_SLIDE_NOTES_CURSOR_RE = re.compile(
+    r"^slide:([1-9][0-9]*):notes:"
+    r"cursor:(0|[1-9][0-9]*):limit:([1-9][0-9]*)$"
 )
 _OLE_FREESECT = 0xFFFFFFFF
 _OLE_ENDOFCHAIN = 0xFFFFFFFE
@@ -417,6 +471,8 @@ def _validate_main_part_graph(
         return
 
     presentation_tag = f"{{{_PRESENTATION_NAMESPACE}}}presentation"
+    slide_tag = f"{{{_PRESENTATION_NAMESPACE}}}sld"
+    notes_tag = f"{{{_PRESENTATION_NAMESPACE}}}notes"
     slide_list_tag = f"{{{_PRESENTATION_NAMESPACE}}}sldIdLst"
     slide_id_tag = f"{{{_PRESENTATION_NAMESPACE}}}sldId"
     relationship_id = f"{{{_OFFICE_RELATIONSHIPS_NAMESPACE}}}id"
@@ -434,6 +490,14 @@ def _validate_main_part_graph(
         row["id"]: row
         for row in relationships
         if row["source"] == main_part
+    }
+    main_slide_relationships = {
+        row["id"]: row
+        for row in relationships
+        if (
+            row["source"] == main_part
+            and row["type"] == _SLIDE_RELATIONSHIP
+        )
     }
     targets: set[str] = set()
     ids: set[str] = set()
@@ -467,6 +531,121 @@ def _validate_main_part_graph(
                 "OOXML PowerPoint slide relationship content type is invalid"
             )
         targets.add(target)
+
+    slide_parts = {
+        part
+        for part, content_type in part_content_types.items()
+        if content_type == _SLIDE_CONTENT_TYPE
+    }
+    if ids != set(main_slide_relationships) or targets != slide_parts:
+        raise InspectionError(
+            "OOXML PowerPoint slide relationship graph is incomplete"
+        )
+
+    notes_parts = {
+        part
+        for part, content_type in part_content_types.items()
+        if content_type == _NOTES_SLIDE_CONTENT_TYPE
+    }
+    linked_notes: set[str] = set()
+    typed_relationships = {
+        _SLIDE_LAYOUT_RELATIONSHIP: (
+            "slide layout",
+            lambda content_type: content_type
+            == _SLIDE_LAYOUT_CONTENT_TYPE,
+        ),
+        _NOTES_SLIDE_RELATIONSHIP: (
+            "notes slide",
+            lambda content_type: content_type
+            == _NOTES_SLIDE_CONTENT_TYPE,
+        ),
+        _IMAGE_RELATIONSHIP: (
+            "image",
+            lambda content_type: content_type.startswith("image/"),
+        ),
+        _AUDIO_RELATIONSHIP: (
+            "audio",
+            lambda content_type: content_type.startswith("audio/"),
+        ),
+        _VIDEO_RELATIONSHIP: (
+            "video",
+            lambda content_type: content_type.startswith("video/"),
+        ),
+        _MEDIA_RELATIONSHIP: (
+            "media",
+            lambda content_type: content_type.startswith(
+                ("image/", "audio/", "video/")
+            ),
+        ),
+        _CHART_RELATIONSHIP: (
+            "chart",
+            lambda content_type: content_type in _CHART_CONTENT_TYPES,
+        ),
+    }
+    for slide_part in sorted(slide_parts):
+        slide_root = ooxml._parse_graph_xml(
+            archive,
+            members,
+            slide_part,
+            "PowerPoint slide",
+        )
+        if slide_root.tag != slide_tag:
+            raise InspectionError(
+                "OOXML PowerPoint slide root is invalid"
+            )
+        slide_relationships = [
+            row for row in relationships if row["source"] == slide_part
+        ]
+        layout_count = 0
+        for relationship in slide_relationships:
+            relationship_type = relationship["type"]
+            validation = typed_relationships.get(relationship_type)
+            if validation is None:
+                continue
+            label, accepts_content_type = validation
+            target = relationship.get("_normalized_target")
+            content_type = (
+                part_content_types.get(target, "")
+                if isinstance(target, str)
+                else ""
+            )
+            if (
+                relationship["external"]
+                or not isinstance(target, str)
+                or not accepts_content_type(content_type)
+            ):
+                raise InspectionError(
+                    "OOXML PowerPoint slide relationship "
+                    f"for {label} is invalid"
+                )
+            if relationship_type == _SLIDE_LAYOUT_RELATIONSHIP:
+                layout_count += 1
+            elif relationship_type == _NOTES_SLIDE_RELATIONSHIP:
+                if target in linked_notes:
+                    raise InspectionError(
+                        "OOXML PowerPoint notes slide relationship is invalid"
+                    )
+                linked_notes.add(target)
+        if layout_count != 1:
+            raise InspectionError(
+                "OOXML PowerPoint slide relationship to layout is invalid"
+            )
+
+    if linked_notes != notes_parts:
+        raise InspectionError(
+            "OOXML PowerPoint notes slide relationship graph is incomplete"
+        )
+    for notes_part in sorted(notes_parts):
+        notes_root = ooxml._parse_graph_xml(
+            archive,
+            members,
+            notes_part,
+            "PowerPoint notes slide",
+        )
+        if notes_root.tag != notes_tag:
+            raise InspectionError(
+                "OOXML PowerPoint notes slide root is invalid"
+            )
 
 
 def preflight_office(path: str, expected_kind: str | None = None) -> _PackageInfo:
@@ -950,10 +1129,10 @@ def _convert_with_libreoffice(
 
 def _prepare_office(path: str, scratch_dir: str) -> tuple[str, _PackageInfo, str | None]:
     if _is_ole(path):
-        converted_from = _legacy_kind(path)
-        target = "docx" if converted_from == "doc" else "pptx"
+        legacy_kind = _legacy_kind(path)
+        target = "docx" if legacy_kind == "doc" else "pptx"
         converted = _convert_with_libreoffice(path, scratch_dir, target)
-        return converted, preflight_office(converted, target), converted_from
+        return converted, preflight_office(converted, target), f".{legacy_kind}"
     info = preflight_office(path)
     return path, info, None
 
@@ -1032,33 +1211,193 @@ def _paragraph_detail(paragraph, index: int) -> dict:
     }
 
 
-def _table_detail(table, index: int, cell_page: int = 1) -> dict:
-    cells = [
-        cell
-        for row in table.rows
-        for cell in row.cells
+def _nonempty_paragraphs(paragraphs) -> list[object]:
+    return [
+        paragraph
+        for paragraph in paragraphs
+        if str(getattr(paragraph, "text", "")).strip()
     ]
-    start = (cell_page - 1) * _TABLE_CELL_PAGE_SIZE
-    if start >= len(cells) and (cells or cell_page > 1):
-        raise InspectionError("document table cell page exceeds cell count")
-    selected = cells[start:start + _TABLE_CELL_PAGE_SIZE]
-    values = [_bounded_text(cell.text) for cell in selected]
+
+
+def _window_metadata(
+    total: int,
+    cursor: int,
+    limit: int,
+    returned: int,
+) -> dict:
+    next_cursor = cursor + returned
+    if next_cursor >= total:
+        next_cursor = None
+    return {
+        "cursor": cursor,
+        "limit": limit,
+        "total": total,
+        "returned": returned,
+        "omitted": max(0, total - cursor - returned),
+        "next_cursor": next_cursor,
+    }
+
+
+def _validate_cursor(total: int, cursor: int, label: str) -> None:
+    if cursor < 0 or cursor > total or (cursor == total and total > 0):
+        raise InspectionError(f"{label} cursor exceeds item count")
+
+
+def _cursor_items(
+    items: list[object],
+    cursor: int,
+    limit: int,
+    max_limit: int,
+    build,
+    budget: ResponseBudget,
+    *,
+    enforce_extract_chars: bool = False,
+) -> dict:
+    _validate_cursor(len(items), cursor, "Office selector")
+    bounded_limit = min(limit, max_limit)
+    result = {
+        "items": [],
+        **_window_metadata(len(items), cursor, bounded_limit, 0),
+    }
+    for index in range(cursor, min(len(items), cursor + bounded_limit)):
+        item = build(index)
+        returned = result["returned"] + 1
+        candidate = {
+            "items": [*result["items"], item],
+            **_window_metadata(
+                len(items),
+                cursor,
+                bounded_limit,
+                returned,
+            ),
+        }
+        if (
+            _json_bytes(candidate) > max(0, budget.max_bytes // 2)
+            or (
+                enforce_extract_chars
+                and _text_chars(candidate) > budget.max_extract_chars
+            )
+        ):
+            break
+        result = candidate
+    return result
+
+
+def _table_detail(
+    table,
+    index: int,
+    *,
+    row_cursor: int = 0,
+    row_limit: int = _TABLE_ROW_PAGE_SIZE,
+    cell_row: int | None = None,
+    cell_cursor: int = 0,
+    cell_limit: int = _TABLE_CELL_PAGE_SIZE,
+) -> dict:
+    rows = list(table.rows)
+    bounded_row_limit = min(row_limit, _TABLE_ROW_PAGE_SIZE)
+    bounded_cell_limit = min(cell_limit, _TABLE_CELL_PAGE_SIZE)
+    _validate_cursor(len(rows), row_cursor, "document table row")
     columns = len(table.columns)
-    matrix = [
-        values[offset:offset + columns]
-        for offset in range(0, len(values), columns)
-    ] if columns else []
+    matrix: list[list[str]] = []
+    cell_page = None
+    if cell_row is not None:
+        if cell_row > len(rows):
+            raise InspectionError(
+                "document table cell selector exceeds row count"
+            )
+        row_cursor = cell_row - 1
+        row_cells = list(rows[row_cursor].cells)
+        _validate_cursor(
+            len(row_cells),
+            cell_cursor,
+            "document table cell",
+        )
+        selected_cells = row_cells[
+            cell_cursor:cell_cursor + bounded_cell_limit
+        ]
+        matrix = [
+            [_bounded_text(cell.text) for cell in selected_cells]
+        ]
+        cell_page = {
+            "row": cell_row,
+            **_window_metadata(
+                len(row_cells),
+                cell_cursor,
+                bounded_cell_limit,
+                len(selected_cells),
+            ),
+        }
+        returned_rows = 1
+        effective_row_limit = 1
+    else:
+        cell_count = 0
+        returned_rows = 0
+        for row in rows[
+            row_cursor:row_cursor + bounded_row_limit
+        ]:
+            row_cells = list(row.cells)
+            if cell_count + len(row_cells) > _TABLE_CELL_PAGE_SIZE:
+                if returned_rows:
+                    break
+                selected_cells = row_cells[:_TABLE_CELL_PAGE_SIZE]
+                matrix.append(
+                    [
+                        _bounded_text(cell.text)
+                        for cell in selected_cells
+                    ]
+                )
+                returned_rows = 1
+                cell_page = {
+                    "row": row_cursor + 1,
+                    **_window_metadata(
+                        len(row_cells),
+                        0,
+                        _TABLE_CELL_PAGE_SIZE,
+                        len(selected_cells),
+                    ),
+                }
+                break
+            matrix.append(
+                [_bounded_text(cell.text) for cell in row_cells]
+            )
+            cell_count += len(row_cells)
+            returned_rows += 1
+        effective_row_limit = bounded_row_limit
+        if cell_page is None:
+            returned_cells = sum(len(row) for row in matrix)
+            cell_page = {
+                "row": None,
+                **_window_metadata(
+                    returned_cells,
+                    0,
+                    _TABLE_CELL_PAGE_SIZE,
+                    returned_cells,
+                ),
+            }
+    row_page = _window_metadata(
+        len(rows),
+        row_cursor,
+        effective_row_limit,
+        returned_rows,
+    )
+    if row_page["next_cursor"] is not None:
+        row_page["next_selector"] = (
+            f"table:{index}:rows:cursor:{row_page['next_cursor']}:"
+            f"limit:{effective_row_limit}"
+        )
+    if cell_page["next_cursor"] is not None:
+        cell_page["next_selector"] = (
+            f"table:{index}:row:{cell_page['row']}:cells:"
+            f"cursor:{cell_page['next_cursor']}:"
+            f"limit:{cell_page['limit']}"
+        )
     return {
         "table": index,
-        "rows": len(table.rows),
+        "rows": len(rows),
         "columns": columns,
         "cells": matrix,
-        "cell_page": {
-            "page": cell_page,
-            "total": len(cells),
-            "returned": len(selected),
-            "omitted": len(cells) - len(selected),
-        },
+        "row_page": row_page,
+        "cell_page": cell_page,
     }
 
 
@@ -1088,9 +1427,9 @@ def _header_footer_parts(document, header: bool) -> list[object]:
     for section in document.sections:
         for attribute in attributes:
             item = getattr(section, attribute)
-            paragraphs = list(item.paragraphs)
+            paragraphs = _nonempty_paragraphs(item.paragraphs)
             tables = list(item.tables)
-            if not any(paragraph.text for paragraph in paragraphs) and not tables:
+            if not paragraphs and not tables:
                 continue
             key = str(item.part.partname)
             if key in seen:
@@ -1100,23 +1439,51 @@ def _header_footer_parts(document, header: bool) -> list[object]:
     return parts
 
 
-def _header_footer_detail(item, index: int, page: int, label: str) -> dict:
-    paragraphs = list(item.paragraphs)
+def _header_footer_detail(
+    item,
+    index: int,
+    page: int,
+    label: str,
+    *,
+    table_cursor: int = 0,
+    table_limit: int = _TABLE_PAGE_SIZE,
+) -> dict:
+    paragraphs = _nonempty_paragraphs(item.paragraphs)
     start = (page - 1) * _PARAGRAPH_PAGE_SIZE
     if start >= len(paragraphs) and (paragraphs or page > 1):
         raise InspectionError(
             f"document {label} page exceeds paragraph count"
         )
     selected = paragraphs[start:start + _PARAGRAPH_PAGE_SIZE]
+    tables = list(item.tables)
+    _validate_cursor(len(tables), table_cursor, f"document {label} table")
+    bounded_table_limit = min(table_limit, _TABLE_PAGE_SIZE)
+    selected_tables = tables[
+        table_cursor:table_cursor + bounded_table_limit
+    ]
+    table_page = _window_metadata(
+        len(tables),
+        table_cursor,
+        bounded_table_limit,
+        len(selected_tables),
+    )
+    if table_page["next_cursor"] is not None:
+        table_page["next_selector"] = (
+            f"{label}:{index}:tables:"
+            f"cursor:{table_page['next_cursor']}:"
+            f"limit:{bounded_table_limit}"
+        )
     return {
         label: index,
         "paragraphs": [_bounded_text(paragraph.text) for paragraph in selected],
         "tables": [
-            _table_detail(table, table_index)
-            for table_index, table in enumerate(
-                list(item.tables)[:_TABLE_PAGE_SIZE], start=1
+            _table_detail(table, table_cursor + offset)
+            for offset, table in enumerate(
+                selected_tables, start=1
             )
         ],
+        "table_count": len(tables),
+        "table_page": table_page,
         "paragraph_page": {
             "page": page,
             "total": len(paragraphs),
@@ -1200,8 +1567,9 @@ def _document_structure(
     *,
     enforce_extract_chars: bool = False,
 ) -> dict:
-    paragraphs = list(document.paragraphs)
+    paragraphs = _nonempty_paragraphs(document.paragraphs)
     tables = list(document.tables)
+    sections = list(document.sections)
     headers = _header_footer_parts(document, True)
     footers = _header_footer_parts(document, False)
     collections = {
@@ -1262,11 +1630,15 @@ def _document_structure(
         "kind": "document",
         "format": "docx",
         "opens": True,
-        "section_count": len(document.sections),
-        "sections": [
-            _section_detail(section, index)
-            for index, section in enumerate(document.sections, start=1)
-        ],
+        "section_count": len(sections),
+        "sections": _cursor_items(
+            sections,
+            0,
+            _MAX_INDEX_ITEMS,
+            _MAX_INDEX_ITEMS,
+            lambda index: {"section": index + 1},
+            budget,
+        ),
         "core_properties": _core_properties(document),
         "paragraphs": _paged_items(
             len(paragraphs),
@@ -1335,13 +1707,13 @@ def _shape_text(shape) -> list[str]:
             for paragraph in shape.text_frame.paragraphs[
                 :_MAX_SHAPE_TEXT_ITEMS
             ]
-            if paragraph.text
+            if paragraph.text.strip()
         ]
     if getattr(shape, "has_table", False):
         text = []
         for row in shape.table.rows:
             for cell in row.cells:
-                if cell.text:
+                if cell.text.strip():
                     text.append(_bounded_text(cell.text))
                 if len(text) >= _MAX_SHAPE_TEXT_ITEMS:
                     return text
@@ -1352,12 +1724,13 @@ def _shape_text(shape) -> list[str]:
 def _shape_detail(
     shape,
     index: int,
-    depth: int = 0,
-    counter: list[int] | None = None,
+    *,
+    slide_index: int,
+    path: tuple[int, ...],
+    children_cursor: int = 0,
+    children_limit: int = _SHAPE_PAGE_SIZE,
+    expand_children: bool = True,
 ) -> dict:
-    if counter is None:
-        counter = [0]
-    counter[0] += 1
     result = {
         "shape": index,
         "type": _shape_type_name(shape),
@@ -1378,26 +1751,56 @@ def _shape_detail(
             ),
             "series_count": len(chart.series),
         }
-    if (
-        getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.GROUP
-        and depth < 32
-        and counter[0] < _SHAPE_PAGE_SIZE
-    ):
+    if getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.GROUP:
         children = list(shape.shapes)
-        nested = []
-        for child_index, child in enumerate(children, start=1):
-            if counter[0] >= _SHAPE_PAGE_SIZE:
-                break
-            nested.append(
-                _shape_detail(
-                    child,
-                    child_index,
-                    depth + 1,
-                    counter,
-                )
+        bounded_limit = min(children_limit, _SHAPE_PAGE_SIZE)
+        if expand_children:
+            _validate_cursor(
+                len(children),
+                children_cursor,
+                "presentation group child",
+            )
+            selected = children[
+                children_cursor:children_cursor + bounded_limit
+            ]
+        else:
+            selected = []
+        nested = [
+            _shape_detail(
+                child,
+                children_cursor + child_offset,
+                slide_index=slide_index,
+                path=(*path, children_cursor + child_offset),
+                expand_children=False,
+            )
+            for child_offset, child in enumerate(selected, start=1)
+        ]
+        returned = len(nested)
+        child_page = _window_metadata(
+            len(children),
+            children_cursor,
+            bounded_limit,
+            returned,
+        )
+        if not expand_children and children:
+            child_page.update(
+                {
+                    "cursor": 0,
+                    "returned": 0,
+                    "omitted": len(children),
+                    "next_cursor": 0,
+                }
+            )
+        next_cursor = child_page["next_cursor"]
+        if next_cursor is not None:
+            shape_path = ".".join(str(part) for part in path)
+            child_page["next_selector"] = (
+                f"slide:{slide_index}:shape:{shape_path}:children:"
+                f"cursor:{next_cursor}:limit:{bounded_limit}"
             )
         result["children"] = nested
-        result["children_omitted"] = max(0, len(children) - len(nested))
+        result["children_page"] = child_page
+        result["children_omitted"] = child_page["omitted"]
     return result
 
 
@@ -1418,36 +1821,156 @@ def _notes_text(slide) -> str:
     if not slide.has_notes_slide:
         return ""
     frame = slide.notes_slide.notes_text_frame
-    return _bounded_text(frame.text if frame is not None else "")
+    if frame is None:
+        return ""
+    return "\n".join(
+        paragraph.text
+        for paragraph in frame.paragraphs
+        if paragraph.text.strip()
+    )
 
 
-def _slide_detail(slide, index: int, shape_page: int) -> dict:
+def _notes_page(
+    slide,
+    cursor: int = 0,
+    limit: int = _MAX_TEXT_CHARS,
+) -> tuple[str, dict]:
+    text = _notes_text(slide)
+    _validate_cursor(len(text), cursor, "presentation notes")
+    bounded_limit = min(limit, _MAX_TEXT_CHARS)
+    selected = text[cursor:cursor + bounded_limit]
+    page = _window_metadata(
+        len(text),
+        cursor,
+        bounded_limit,
+        len(selected),
+    )
+    page["truncated"] = page["omitted"] > 0
+    return selected, page
+
+
+def _shape_at_path(slide, path: tuple[int, ...]):
     shapes = list(slide.shapes)
-    start = (shape_page - 1) * _SHAPE_PAGE_SIZE
-    if start >= len(shapes) and (shapes or shape_page > 1):
-        raise InspectionError(
-            "presentation shape page exceeds shape count"
+    shape = None
+    for depth, number in enumerate(path):
+        if number > len(shapes):
+            raise InspectionError(
+                "presentation shape selector exceeds shape count"
+            )
+        shape = shapes[number - 1]
+        if depth + 1 < len(path):
+            if getattr(shape, "shape_type", None) != MSO_SHAPE_TYPE.GROUP:
+                raise InspectionError(
+                    "presentation shape selector traverses a non-group shape"
+                )
+            shapes = list(shape.shapes)
+    return shape
+
+
+def _slide_detail(
+    slide,
+    index: int,
+    selection: dict | None = None,
+) -> dict:
+    selection = selection or {"mode": "shapes"}
+    shapes = list(slide.shapes)
+    mode = selection.get("mode", "shapes")
+    if mode == "children":
+        path = selection["path"]
+        shape = _shape_at_path(slide, path)
+        if getattr(shape, "shape_type", None) != MSO_SHAPE_TYPE.GROUP:
+            raise InspectionError(
+                "presentation children selector requires a group shape"
+            )
+        details = [
+            _shape_detail(
+                shape,
+                path[-1],
+                slide_index=index,
+                path=path,
+                children_cursor=selection["children_cursor"],
+                children_limit=selection["children_limit"],
+            )
+        ]
+        shape_window = _window_metadata(
+            len(shapes),
+            path[0] - 1,
+            1,
+            1,
         )
-    selected = shapes[start:start + _SHAPE_PAGE_SIZE]
-    counter = [0]
-    details = []
-    for offset, shape in enumerate(selected, start=1):
-        if counter[0] >= _SHAPE_PAGE_SIZE:
-            break
-        details.append(
-            _shape_detail(shape, start + offset, counter=counter)
+    elif mode == "notes":
+        details = []
+        shape_window = _window_metadata(
+            len(shapes),
+            0,
+            _SHAPE_PAGE_SIZE,
+            0,
+        )
+    else:
+        shape_cursor = selection.get("shape_cursor", 0)
+        shape_limit = min(
+            selection.get("shape_limit", _SHAPE_PAGE_SIZE),
+            _SHAPE_PAGE_SIZE,
+        )
+        _validate_cursor(
+            len(shapes),
+            shape_cursor,
+            "presentation shape",
+        )
+        selected = shapes[
+            shape_cursor:shape_cursor + shape_limit
+        ]
+        details = [
+            _shape_detail(
+                shape,
+                shape_cursor + offset,
+                slide_index=index,
+                path=(shape_cursor + offset,),
+            )
+            for offset, shape in enumerate(selected, start=1)
+        ]
+        shape_window = _window_metadata(
+            len(shapes),
+            shape_cursor,
+            shape_limit,
+            len(details),
+        )
+        if shape_window["next_cursor"] is not None:
+            shape_window["next_selector"] = (
+                f"slide:{index}:shapes:"
+                f"cursor:{shape_window['next_cursor']}:"
+                f"limit:{shape_limit}"
+            )
+        if "shape_page" in selection:
+            shape_window["page"] = selection["shape_page"]
+    notes_cursor = (
+        selection.get("notes_cursor", 0)
+        if mode == "notes"
+        else 0
+    )
+    notes_limit = (
+        selection.get("notes_limit", _MAX_TEXT_CHARS)
+        if mode == "notes"
+        else _MAX_TEXT_CHARS
+    )
+    notes_text, notes_window = _notes_page(
+        slide,
+        notes_cursor,
+        notes_limit,
+    )
+    if notes_window["next_cursor"] is not None:
+        notes_window["next_selector"] = (
+            f"slide:{index}:notes:"
+            f"cursor:{notes_window['next_cursor']}:"
+            f"limit:{notes_window['limit']}"
         )
     return {
         "slide": index,
-        "text": _slide_text(slide),
-        "notes_text": _notes_text(slide),
+        "text": _slide_text(slide) if mode == "shapes" else [],
+        "notes_text": notes_text,
+        "notes_page": notes_window,
         "shapes": details,
-        "shape_page": {
-            "page": shape_page,
-            "total": len(shapes),
-            "returned": len(details),
-            "omitted": len(shapes) - len(details),
-        },
+        "shape_page": shape_window,
     }
 
 
@@ -1456,7 +1979,7 @@ def _presentation_structure(
     package: _PackageInfo,
     budget: ResponseBudget,
     converted_from: str | None,
-    selections: dict[int, int] | None,
+    selections: dict[int, dict] | None,
     *,
     enforce_extract_chars: bool = False,
 ) -> dict:
@@ -1496,8 +2019,14 @@ def _presentation_structure(
             }
         )
     for slide_index in selected:
-        page = 1 if selections is None else selections[slide_index + 1]
-        item = _slide_detail(slides[slide_index], slide_index + 1, page)
+        selection = (
+            None if selections is None else selections[slide_index + 1]
+        )
+        item = _slide_detail(
+            slides[slide_index],
+            slide_index + 1,
+            selection,
+        )
         candidate = {
             **result["slides"],
             "items": [*result["slides"]["items"], item],
@@ -1508,7 +2037,7 @@ def _presentation_structure(
         if enforce_extract_chars:
             draft["units_inspected"] = [
                 *result["units_inspected"],
-                f"slide:{slide_index + 1}:page:{page}",
+                selection["selector"],
             ]
         if (
             _json_bytes(draft) > budget.max_bytes
@@ -1528,18 +2057,37 @@ def _presentation_structure(
     )
 
 
-def _doc_extract_pages(selectors: list[str]) -> tuple[dict[str, int], list[tuple[str, int, int]]]:
+def _doc_extract_pages(
+    selectors: list[str],
+) -> tuple[dict[str, int], list[dict], dict | None]:
     pages: dict[str, int] = {}
-    exact: list[tuple[str, int, int]] = []
-    exact_keys: set[tuple[str, int, int]] = set()
+    exact: list[dict] = []
+    exact_keys: set[str] = set()
+    section_window = None
     if not selectors:
         return {
             "paragraphs": 1,
             "tables": 1,
             "headers": 1,
             "footers": 1,
-        }, exact
+        }, exact, section_window
     for selector in selectors:
+        if selector in exact_keys:
+            raise InspectionError(
+                f"document selector repeats item {selector!r}"
+            )
+        section_match = _DOC_SECTIONS_CURSOR_RE.fullmatch(selector)
+        if section_match is not None:
+            if section_window is not None:
+                raise InspectionError(
+                    "Office selector repeats category 'sections'"
+                )
+            section_window = {
+                "cursor": int(section_match.group(1)),
+                "limit": int(section_match.group(2)),
+                "selector": selector,
+            }
+            continue
         page_match = _DOC_PAGE_SELECTOR_RE.fullmatch(selector)
         if page_match is not None:
             category = page_match.group(1)
@@ -1549,28 +2097,85 @@ def _doc_extract_pages(selectors: list[str]) -> tuple[dict[str, int], list[tuple
                 )
             pages[category] = int(page_match.group(2))
             continue
+        header_tables_match = _DOC_HEADER_TABLES_CURSOR_RE.fullmatch(
+            selector
+        )
+        if header_tables_match is not None:
+            exact.append(
+                {
+                    "label": header_tables_match.group(1),
+                    "number": int(header_tables_match.group(2)),
+                    "page": 1,
+                    "table_cursor": int(header_tables_match.group(3)),
+                    "table_limit": int(header_tables_match.group(4)),
+                    "selector": selector,
+                }
+            )
+            exact_keys.add(selector)
+            continue
+        table_rows_match = _DOC_TABLE_ROWS_CURSOR_RE.fullmatch(selector)
+        if table_rows_match is not None:
+            exact.append(
+                {
+                    "label": "table",
+                    "number": int(table_rows_match.group(1)),
+                    "row_cursor": int(table_rows_match.group(2)),
+                    "row_limit": int(table_rows_match.group(3)),
+                    "selector": selector,
+                }
+            )
+            exact_keys.add(selector)
+            continue
+        table_cells_match = _DOC_TABLE_CELLS_CURSOR_RE.fullmatch(selector)
+        if table_cells_match is not None:
+            exact.append(
+                {
+                    "label": "table",
+                    "number": int(table_cells_match.group(1)),
+                    "cell_row": int(table_cells_match.group(2)),
+                    "cell_cursor": int(table_cells_match.group(3)),
+                    "cell_limit": int(table_cells_match.group(4)),
+                    "selector": selector,
+                }
+            )
+            exact_keys.add(selector)
+            continue
         item_match = _DOC_ITEM_SELECTOR_RE.fullmatch(selector)
         if item_match is None:
             raise InspectionError(
                 "document selector must be '<category>:page:<n>' or "
-                "'<item>:<n>[:page:<n>]'"
+                "'<item>:<n>[:page:<n>]' or a cursor/limit selector"
             )
-        key = (
-            item_match.group(1),
-            int(item_match.group(2)),
-            int(item_match.group(3) or 1),
-        )
-        if key in exact_keys:
+        exact_keys.add(selector)
+        label = item_match.group(1)
+        page = int(item_match.group(3) or 1)
+        if label == "section" and page != 1:
             raise InspectionError(
-                f"document selector repeats item {selector!r}"
+                "document section selector does not accept a page"
             )
-        exact_keys.add(key)
-        exact.append(key)
-    if pages and exact:
+        selection = {
+            "label": label,
+            "number": int(item_match.group(2)),
+            "page": page,
+            "selector": selector,
+        }
+        if label == "table":
+            selection.update(
+                {
+                    "row_cursor": (page - 1) * _TABLE_ROW_PAGE_SIZE,
+                    "row_limit": _TABLE_ROW_PAGE_SIZE,
+                }
+            )
+        exact.append(selection)
+    if pages and (exact or section_window is not None):
         raise InspectionError(
             "document category and item selectors cannot be mixed"
         )
-    return pages, exact
+    if exact and section_window is not None:
+        raise InspectionError(
+            "document section and item selectors cannot be mixed"
+        )
+    return pages, exact, section_window
 
 
 class OfficeInspector:
@@ -1612,17 +2217,68 @@ class OfficeInspector:
         if package.kind == "pptx":
             presentation = _open_presentation(prepared)
             slide_count = len(presentation.slides)
-            selected: dict[int, int] = {}
+            selected: dict[int, dict] = {}
             if not selectors:
                 selectors = ["slide:1"] if slide_count else []
             for selector in selectors:
                 match = _SLIDE_SELECTOR_RE.fullmatch(selector)
-                if match is None:
+                if match is not None:
+                    slide = int(match.group(1))
+                    page = int(match.group(2) or 1)
+                    selection = {
+                        "mode": "shapes",
+                        "shape_cursor": (page - 1) * _SHAPE_PAGE_SIZE,
+                        "shape_limit": _SHAPE_PAGE_SIZE,
+                        "shape_page": page,
+                        "selector": selector,
+                    }
+                else:
+                    match = _SLIDE_SHAPES_CURSOR_RE.fullmatch(selector)
+                    if match is not None:
+                        slide = int(match.group(1))
+                        selection = {
+                            "mode": "shapes",
+                            "shape_cursor": int(match.group(2)),
+                            "shape_limit": int(match.group(3)),
+                            "selector": selector,
+                        }
+                    else:
+                        match = _SLIDE_CHILDREN_CURSOR_RE.fullmatch(
+                            selector
+                        )
+                        if match is not None:
+                            slide = int(match.group(1))
+                            selection = {
+                                "mode": "children",
+                                "path": tuple(
+                                    int(part)
+                                    for part in match.group(2).split(".")
+                                ),
+                                "children_cursor": int(match.group(3)),
+                                "children_limit": int(match.group(4)),
+                                "selector": selector,
+                            }
+                        else:
+                            match = _SLIDE_NOTES_CURSOR_RE.fullmatch(
+                                selector
+                            )
+                            if match is not None:
+                                slide = int(match.group(1))
+                                selection = {
+                                    "mode": "notes",
+                                    "notes_cursor": int(match.group(2)),
+                                    "notes_limit": int(match.group(3)),
+                                    "selector": selector,
+                                }
+                            else:
+                                slide = 0
+                                selection = {}
+                if not selection:
                     raise InspectionError(
                         "presentation selector must be "
-                        "'slide:<n>[:page:<n>]'"
+                        "'slide:<n>[:page:<n>]' or a supported "
+                        "cursor/limit selector"
                     )
-                slide = int(match.group(1))
                 if slide > slide_count:
                     raise InspectionError(
                         "presentation selector exceeds slide count"
@@ -1631,7 +2287,7 @@ class OfficeInspector:
                     raise InspectionError(
                         f"presentation selector repeats slide {slide}"
                     )
-                selected[slide] = int(match.group(2) or 1)
+                selected[slide] = selection
             return _presentation_structure(
                 presentation,
                 package,
@@ -1642,17 +2298,45 @@ class OfficeInspector:
             )
 
         document = _open_document(prepared)
-        pages, exact = _doc_extract_pages(selectors)
+        pages, exact, section_window = _doc_extract_pages(selectors)
+        if section_window is not None:
+            sections = list(document.sections)
+            result = {
+                "kind": "document",
+                "format": "docx",
+                "opens": True,
+                "sections": _cursor_items(
+                    sections,
+                    section_window["cursor"],
+                    section_window["limit"],
+                    _MAX_INDEX_ITEMS,
+                    lambda index: _section_detail(
+                        sections[index], index + 1
+                    ),
+                    response_budget,
+                    enforce_extract_chars=True,
+                ),
+                "units_inspected": [section_window["selector"]],
+            }
+            if converted_from is not None:
+                result["converted_from"] = converted_from
+            return validate_json_result(
+                result,
+                response_budget,
+                enforce_extract_chars=True,
+            )
         if exact:
-            paragraphs = list(document.paragraphs)
+            paragraphs = _nonempty_paragraphs(document.paragraphs)
             tables = list(document.tables)
             headers = _header_footer_parts(document, True)
             footers = _header_footer_parts(document, False)
+            sections = list(document.sections)
             collections = {
                 "paragraph": paragraphs,
                 "table": tables,
                 "header": headers,
                 "footer": footers,
+                "section": sections,
             }
             result = {
                 "kind": "document",
@@ -1662,7 +2346,10 @@ class OfficeInspector:
                 "units_inspected": [],
                 "omitted": 0,
             }
-            for label, number, page in exact:
+            for selection in exact:
+                label = selection["label"]
+                number = selection["number"]
+                page = selection.get("page", 1)
                 collection = collections[label]
                 if number > len(collection):
                     raise InspectionError(
@@ -1672,17 +2359,38 @@ class OfficeInspector:
                 if label == "paragraph":
                     detail = _paragraph_detail(item, number)
                 elif label == "table":
-                    detail = _table_detail(item, number, page)
+                    detail = _table_detail(
+                        item,
+                        number,
+                        row_cursor=selection.get("row_cursor", 0),
+                        row_limit=selection.get(
+                            "row_limit", _TABLE_ROW_PAGE_SIZE
+                        ),
+                        cell_row=selection.get("cell_row"),
+                        cell_cursor=selection.get("cell_cursor", 0),
+                        cell_limit=selection.get(
+                            "cell_limit", _TABLE_CELL_PAGE_SIZE
+                        ),
+                    )
+                elif label == "section":
+                    detail = _section_detail(item, number)
                 else:
                     detail = _header_footer_detail(
-                        item, number, page, label
+                        item,
+                        number,
+                        page,
+                        label,
+                        table_cursor=selection.get("table_cursor", 0),
+                        table_limit=selection.get(
+                            "table_limit", _TABLE_PAGE_SIZE
+                        ),
                     )
                 candidate = {
                     **result,
                     "details": [*result["details"], detail],
                     "units_inspected": [
                         *result["units_inspected"],
-                        f"{label}:{number}:page:{page}",
+                        selection["selector"],
                     ],
                 }
                 if (
