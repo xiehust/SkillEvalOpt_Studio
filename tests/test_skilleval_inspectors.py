@@ -5318,6 +5318,30 @@ class TestPdfImageInspectors:
                 selectors=["frame:0"],
             )
 
+    @pytest.mark.parametrize(
+        ("image_format", "suffix"),
+        [("PNG", "png"), ("GIF", "gif")],
+    )
+    def test_truncated_image_never_leaks_pillow_format_errors(
+        self, tmp_path, image_format, suffix
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors.pdf_image import ImageInspector
+
+        complete = tmp_path / f"complete.{suffix}"
+        PillowImage.new("RGBA", (12, 9), (1, 2, 3, 4)).save(
+            complete,
+            format=image_format,
+        )
+        truncated = tmp_path / f"truncated.{suffix}"
+        truncated.write_bytes(complete.read_bytes()[:-5])
+
+        with pytest.raises(InspectionError, match="decoded safely"):
+            ImageInspector().inspect(
+                str(truncated),
+                str(tmp_path),
+                response_budget=ResponseBudget(),
+            )
+
     def test_image_render_applies_exif_orientation_and_strips_icc(
         self, tmp_path
     ) -> None:
@@ -5395,6 +5419,60 @@ class TestPdfImageInspectors:
 
         assert list(scratch.iterdir()) == []
         assert [path.name for path in evidence.iterdir()] == [filename]
+
+    def test_pdf_render_checks_png_budget_before_verify_or_load(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from PIL import PngImagePlugin
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "large.pdf")
+        verify_calls = []
+        load_calls = []
+        real_verify = PngImagePlugin.PngImageFile.verify
+
+        def recording_verify(image):
+            verify_calls.append(image.size)
+            return real_verify(image)
+
+        def forbidden_load(image, *args, **kwargs):
+            load_calls.append(image.size)
+            raise AssertionError("over-budget PNG must not be decoded")
+
+        def fake_run(command, **kwargs):
+            if command[0] == "pdfinfo":
+                stdout = "Pages: 1\n"
+            else:
+                image = PillowImage.new("RGB", (100, 100))
+                image.save(f"{command[-1]}.png")
+                image.close()
+                stdout = ""
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        monkeypatch.setattr(pdf_image, "safe_run", fake_run)
+        monkeypatch.setattr(
+            PngImagePlugin.PngImageFile,
+            "verify",
+            recording_verify,
+        )
+        monkeypatch.setattr(
+            PngImagePlugin.PngImageFile,
+            "load",
+            forbidden_load,
+        )
+
+        with pytest.raises(InspectionError, match="pixel budget"):
+            render_artifact(
+                "large.pdf",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+                max_pixels=99,
+            )
+
+        assert verify_calls == []
+        assert load_calls == []
+        assert list(scratch.iterdir()) == []
 
     def test_pdf_tool_receives_live_stable_evidence_descriptor(
         self, tmp_path, monkeypatch
@@ -5579,6 +5657,32 @@ class TestPdfImageInspectors:
                     scratch_dir=str(scratch),
                     selectors=[selector],
                 )
+        with pytest.raises(InspectionError, match="control characters"):
+            extract_artifact(
+                "report.pdf",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+                selectors=["page:1"],
+            )
+
+    @pytest.mark.parametrize("control", ["\x7f", "\x85"])
+    def test_pdf_extract_rejects_del_and_c1_controls(
+        self, tmp_path, monkeypatch, control
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        def fake_run(command, **kwargs):
+            stdout = (
+                "Pages: 1\n"
+                if command[0] == "pdfinfo"
+                else f"safe{control}unsafe\f"
+            )
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        monkeypatch.setattr(pdf_image, "safe_run", fake_run)
+
         with pytest.raises(InspectionError, match="control characters"):
             extract_artifact(
                 "report.pdf",

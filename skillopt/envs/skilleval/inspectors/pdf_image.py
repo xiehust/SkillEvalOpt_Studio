@@ -44,6 +44,17 @@ _FRAME_SELECTOR_RE = re.compile(
     r"^frame:([1-9][0-9]*)(?:-([1-9][0-9]*))?$"
 )
 _TRUNCATED_OUTPUT_MARKER = "\n...[truncated "
+_PILLOW_FORMAT_ERRORS = (
+    OSError,
+    ValueError,
+    TypeError,
+    SyntaxError,
+    EOFError,
+    IndexError,
+    UnidentifiedImageError,
+    PillowImage.DecompressionBombWarning,
+    PillowImage.DecompressionBombError,
+)
 
 
 def _json_bytes(value: object) -> int:
@@ -113,7 +124,14 @@ def _reject_controls(text: str, *, allow_form_feed: bool = False) -> str:
     allowed = {"\n", "\r", "\t"}
     if allow_form_feed:
         allowed.add("\f")
-    if any(ord(char) < 32 and char not in allowed for char in text):
+    if any(
+        (
+            ord(char) < 0x20
+            and char not in allowed
+        )
+        or 0x7F <= ord(char) <= 0x9F
+        for char in text
+    ):
         raise InspectionError("PDF tool output contains disallowed control characters")
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
@@ -393,7 +411,11 @@ def _remove_outputs(outputs: list[str]) -> None:
             pass
 
 
-def _verify_rendered_png(path: str) -> tuple[int, int]:
+def _verify_rendered_png(
+    path: str,
+    *,
+    remaining_pixels: int,
+) -> tuple[int, int]:
     try:
         info = os.lstat(path)
         if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
@@ -405,25 +427,20 @@ def _verify_rendered_png(path: str) -> tuple[int, int]:
             with PillowImage.open(path) as image:
                 if image.format != "PNG":
                     raise InspectionError("rendered image must be PNG")
-                image.verify()
-            with PillowImage.open(path) as image:
                 width, height = image.size
-                image.load()
-        if width <= 0 or height <= 0:
-            raise InspectionError(
-                "rendered image dimensions must be positive"
-            )
+                if width <= 0 or height <= 0:
+                    raise InspectionError(
+                        "rendered image dimensions must be positive"
+                    )
+                if width * height > remaining_pixels:
+                    raise InspectionError(
+                        "rendered image pixel budget exceeded"
+                    )
+                image.verify()
         return width, height
     except InspectionError:
         raise
-    except (
-        OSError,
-        ValueError,
-        EOFError,
-        UnidentifiedImageError,
-        PillowImage.DecompressionBombWarning,
-        PillowImage.DecompressionBombError,
-    ) as exc:
+    except _PILLOW_FORMAT_ERRORS as exc:
         raise InspectionError(
             f"rendered PNG is invalid: {bounded_diagnostic(exc)}"
         ) from exc
@@ -507,14 +524,7 @@ def _inspect_image_metadata(path: str) -> tuple[dict, list[dict]]:
         return result, frames
     except InspectionError:
         raise
-    except (
-        OSError,
-        ValueError,
-        EOFError,
-        UnidentifiedImageError,
-        PillowImage.DecompressionBombWarning,
-        PillowImage.DecompressionBombError,
-    ) as exc:
+    except _PILLOW_FORMAT_ERRORS as exc:
         raise _image_error(exc) from exc
 
 
@@ -583,14 +593,7 @@ def _image_metadata_fields(path: str, summary: dict) -> dict:
         return metadata
     except InspectionError:
         raise
-    except (
-        OSError,
-        ValueError,
-        EOFError,
-        UnidentifiedImageError,
-        PillowImage.DecompressionBombWarning,
-        PillowImage.DecompressionBombError,
-    ) as exc:
+    except _PILLOW_FORMAT_ERRORS as exc:
         raise _image_error(exc) from exc
 
 
@@ -814,7 +817,10 @@ class ImageInspector:
 
             rendered_pixels = 0
             for output in outputs:
-                width, height = _verify_rendered_png(output)
+                width, height = _verify_rendered_png(
+                    output,
+                    remaining_pixels=budget.max_pixels - rendered_pixels,
+                )
                 rendered_pixels += width * height
                 if rendered_pixels > budget.max_pixels:
                     raise InspectionError(
@@ -825,14 +831,7 @@ class ImageInspector:
         except InspectionError:
             _remove_outputs(outputs)
             raise
-        except (
-            OSError,
-            ValueError,
-            EOFError,
-            UnidentifiedImageError,
-            PillowImage.DecompressionBombWarning,
-            PillowImage.DecompressionBombError,
-        ) as exc:
+        except _PILLOW_FORMAT_ERRORS as exc:
             _remove_outputs(outputs)
             raise _image_error(exc) from exc
         finally:
@@ -1133,7 +1132,10 @@ class PdfInspector:
                     scratch_dir=scratch_dir,
                 )
                 outputs.append(output)
-                width, height = _verify_rendered_png(output)
+                width, height = _verify_rendered_png(
+                    output,
+                    remaining_pixels=budget.max_pixels - rendered_pixels,
+                )
                 rendered_pixels += width * height
                 if rendered_pixels > budget.max_pixels:
                     raise InspectionError(
