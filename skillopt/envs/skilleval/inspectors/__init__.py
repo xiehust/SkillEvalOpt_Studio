@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib
 import os
+from contextlib import contextmanager
 from dataclasses import asdict
 
 from skillopt.envs.skilleval.artifacts import (
@@ -13,17 +14,20 @@ from skillopt.envs.skilleval.artifacts import (
 from .base import (
     DEFAULT_EXTRACT_CHARS,
     DEFAULT_RESPONSE_BYTES,
+    DEFAULT_SCRATCH_BYTES,
     InspectionError,
     MAX_RENDER_PIXELS,
     RenderBudget,
     ResponseBudget,
     bounded_diagnostic,
     normalize_selectors,
-    resolve_evidence_path,
     resolve_scratch_path,
     validate_json_result,
+    validate_logical_path,
     validate_roots,
 )
+from ._scratch import enforce_scratch_budget
+from ._secure_files import staged_evidence_path
 
 _INSPECTOR_SPECS = {
     "xlsx": (".spreadsheet", "SpreadsheetInspector"),
@@ -56,10 +60,12 @@ _MAX_RENDER_FILES = 256
 def _response_budget(
     max_response_bytes: int,
     max_extract_chars: int = DEFAULT_EXTRACT_CHARS,
+    max_scratch_bytes: int = DEFAULT_SCRATCH_BYTES,
 ) -> ResponseBudget:
     return ResponseBudget(
         max_bytes=max_response_bytes,
         max_extract_chars=max_extract_chars,
+        max_scratch_bytes=max_scratch_bytes,
     )
 
 
@@ -99,15 +105,26 @@ def _load_inspector(kind: str):
         ) from exc
 
 
+@contextmanager
 def _operation_context(
     logical_path: str,
     evidence_dir: str,
     scratch_dir: str,
+    max_scratch_bytes: int,
 ):
     evidence, scratch = validate_roots(evidence_dir, scratch_dir)
-    path = resolve_evidence_path(evidence, logical_path)
-    kind = _artifact_kind(path, logical_path)
-    return path, scratch, _load_inspector(kind)
+    with enforce_scratch_budget(scratch, max_scratch_bytes) as scratch_guard:
+        with staged_evidence_path(
+            evidence,
+            logical_path,
+            scratch,
+            scratch_guard,
+        ) as path:
+            try:
+                kind = _artifact_kind(path, logical_path)
+                yield path, scratch, _load_inspector(kind)
+            finally:
+                scratch_guard.check()
 
 
 def inventory_artifacts(
@@ -115,18 +132,24 @@ def inventory_artifacts(
     scratch_dir: str,
     *,
     max_response_bytes: int = DEFAULT_RESPONSE_BYTES,
+    max_scratch_bytes: int = DEFAULT_SCRATCH_BYTES,
 ) -> list[dict]:
     """Return a deterministic compact manifest for all evidence files."""
     evidence, _scratch = validate_roots(evidence_dir, scratch_dir)
-    budget = _response_budget(max_response_bytes)
-    try:
-        manifest = build_manifest(evidence)
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise InspectionError(
-            f"evidence inventory failed: {bounded_diagnostic(exc)}"
-        ) from exc
+    budget = _response_budget(
+        max_response_bytes,
+        max_scratch_bytes=max_scratch_bytes,
+    )
+    with enforce_scratch_budget(_scratch, budget.max_scratch_bytes):
+        try:
+            manifest = build_manifest(evidence)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise InspectionError(
+                f"evidence inventory failed: {bounded_diagnostic(exc)}"
+            ) from exc
     rows = []
     for entry in manifest.values():
+        validate_logical_path(entry.path)
         row = asdict(entry)
         row["unit_summary"] = {
             "status": "not_inspected",
@@ -143,26 +166,31 @@ def inspect_artifact(
     evidence_dir: str,
     scratch_dir: str,
     max_response_bytes: int = DEFAULT_RESPONSE_BYTES,
+    max_scratch_bytes: int = DEFAULT_SCRATCH_BYTES,
 ):
     """Inspect one evidence-relative artifact through its content handler."""
-    budget = _response_budget(max_response_bytes)
-    path, scratch, inspector = _operation_context(
+    budget = _response_budget(
+        max_response_bytes,
+        max_scratch_bytes=max_scratch_bytes,
+    )
+    with _operation_context(
         logical_path,
         evidence_dir,
         scratch_dir,
-    )
-    try:
-        result = inspector.inspect(
-            path,
-            scratch,
-            response_budget=budget,
-        )
-    except InspectionError:
-        raise
-    except Exception as exc:
-        raise InspectionError(
-            f"artifact inspection failed: {bounded_diagnostic(exc)}"
-        ) from exc
+        budget.max_scratch_bytes,
+    ) as (path, scratch, inspector):
+        try:
+            result = inspector.inspect(
+                path,
+                scratch,
+                response_budget=budget,
+            )
+        except InspectionError:
+            raise
+        except Exception as exc:
+            raise InspectionError(
+                f"artifact inspection failed: {bounded_diagnostic(exc)}"
+            ) from exc
     return validate_json_result(result, budget)
 
 
@@ -174,40 +202,48 @@ def render_artifact(
     selectors: list[str] | None = None,
     max_pixels: int = MAX_RENDER_PIXELS,
     max_response_bytes: int = DEFAULT_RESPONSE_BYTES,
+    max_scratch_bytes: int = DEFAULT_SCRATCH_BYTES,
 ) -> list[str]:
     """Render selected units and return validated scratch-local file paths."""
     normalized = normalize_selectors(selectors)
-    render_budget = RenderBudget(max_pixels=max_pixels)
-    response_budget = _response_budget(max_response_bytes)
-    path, scratch, inspector = _operation_context(
+    render_budget = RenderBudget(
+        max_pixels=max_pixels,
+        max_scratch_bytes=max_scratch_bytes,
+    )
+    response_budget = _response_budget(
+        max_response_bytes,
+        max_scratch_bytes=max_scratch_bytes,
+    )
+    with _operation_context(
         logical_path,
         evidence_dir,
         scratch_dir,
-    )
-    try:
-        outputs = inspector.render(
-            path,
-            scratch,
-            normalized,
-            render_budget,
-        )
-    except InspectionError:
-        raise
-    except Exception as exc:
-        raise InspectionError(
-            f"artifact render failed: {bounded_diagnostic(exc)}"
-        ) from exc
-    if not isinstance(outputs, list) or len(outputs) > _MAX_RENDER_FILES:
-        raise InspectionError(
-            f"renderer must return at most {_MAX_RENDER_FILES} paths"
-        )
-    validated: list[str] = []
-    for output in outputs:
-        if not isinstance(output, str):
-            raise InspectionError("renderer returned a non-string path")
-        validated.append(resolve_scratch_path(scratch, output))
-    validate_json_result(validated, response_budget)
-    return validated
+        render_budget.max_scratch_bytes,
+    ) as (path, scratch, inspector):
+        try:
+            outputs = inspector.render(
+                path,
+                scratch,
+                normalized,
+                render_budget,
+            )
+        except InspectionError:
+            raise
+        except Exception as exc:
+            raise InspectionError(
+                f"artifact render failed: {bounded_diagnostic(exc)}"
+            ) from exc
+        if not isinstance(outputs, list) or len(outputs) > _MAX_RENDER_FILES:
+            raise InspectionError(
+                f"renderer must return at most {_MAX_RENDER_FILES} paths"
+            )
+        validated: list[str] = []
+        for output in outputs:
+            if not isinstance(output, str):
+                raise InspectionError("renderer returned a non-string path")
+            validated.append(resolve_scratch_path(scratch, output))
+        validate_json_result(validated, response_budget)
+        return validated
 
 
 def extract_artifact(
@@ -218,28 +254,34 @@ def extract_artifact(
     selectors: list[str] | None = None,
     max_extract_chars: int = DEFAULT_EXTRACT_CHARS,
     max_response_bytes: int = DEFAULT_RESPONSE_BYTES,
+    max_scratch_bytes: int = DEFAULT_SCRATCH_BYTES,
 ):
     """Extract bounded content from selected artifact units."""
     normalized = normalize_selectors(selectors)
-    budget = _response_budget(max_response_bytes, max_extract_chars)
-    path, scratch, inspector = _operation_context(
+    budget = _response_budget(
+        max_response_bytes,
+        max_extract_chars,
+        max_scratch_bytes,
+    )
+    with _operation_context(
         logical_path,
         evidence_dir,
         scratch_dir,
-    )
-    try:
-        result = inspector.extract(
-            path,
-            scratch,
-            normalized,
-            response_budget=budget,
-        )
-    except InspectionError:
-        raise
-    except Exception as exc:
-        raise InspectionError(
-            f"artifact extraction failed: {bounded_diagnostic(exc)}"
-        ) from exc
+        budget.max_scratch_bytes,
+    ) as (path, scratch, inspector):
+        try:
+            result = inspector.extract(
+                path,
+                scratch,
+                normalized,
+                response_budget=budget,
+            )
+        except InspectionError:
+            raise
+        except Exception as exc:
+            raise InspectionError(
+                f"artifact extraction failed: {bounded_diagnostic(exc)}"
+            ) from exc
     return validate_json_result(
         result,
         budget,

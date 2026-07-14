@@ -4,17 +4,22 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import sys
+import time
 import types
 from pathlib import Path
 
 import pytest
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import ImageContent, TextContent
 from PIL import Image as PillowImage
 
 from skillopt.envs.skilleval import artifact_mcp
 from skillopt.envs.skilleval import inspectors as inspectors_mod
+from skillopt.envs.skilleval.inspectors import base as inspector_base
 from skillopt.envs.skilleval.inspectors import (
     InspectionError,
     extract_artifact,
@@ -75,9 +80,17 @@ class _FakePdfInspector:
     extract_value = "UNTRUSTED_TEXT"
     render_escape: str | None = None
     fail_message: str | None = None
+    unreturned_scratch_bytes = 0
+
+    def _write_unreturned(self, scratch_dir):
+        if self.unreturned_scratch_bytes:
+            (Path(scratch_dir) / "unreturned.bin").write_bytes(
+                b"x" * self.unreturned_scratch_bytes
+            )
 
     def inspect(self, path, scratch_dir, *, response_budget):
         self.calls.append(("inspect", path, scratch_dir, response_budget))
+        self._write_unreturned(scratch_dir)
         if self.fail_message is not None:
             raise InspectionError(self.fail_message)
         return {
@@ -87,6 +100,7 @@ class _FakePdfInspector:
 
     def render(self, path, scratch_dir, selectors, budget):
         self.calls.append(("render", path, scratch_dir, selectors, budget))
+        self._write_unreturned(scratch_dir)
         if self.fail_message is not None:
             raise InspectionError(self.fail_message)
         if self.render_escape is not None:
@@ -97,6 +111,7 @@ class _FakePdfInspector:
 
     def extract(self, path, scratch_dir, selectors, *, response_budget):
         self.calls.append(("extract", path, scratch_dir, selectors, response_budget))
+        self._write_unreturned(scratch_dir)
         if self.fail_message is not None:
             raise InspectionError(self.fail_message)
         return {
@@ -113,6 +128,7 @@ def fake_pdf_inspector(monkeypatch):
     _FakePdfInspector.extract_value = "UNTRUSTED_TEXT"
     _FakePdfInspector.render_escape = None
     _FakePdfInspector.fail_message = None
+    _FakePdfInspector.unreturned_scratch_bytes = 0
     module = types.ModuleType("skillopt.envs.skilleval.inspectors.pdf_image")
     module.PdfInspector = _FakePdfInspector
     module.ImageInspector = _FakePdfInspector
@@ -140,6 +156,18 @@ class TestBudgetsAndSelectors:
         )
         with pytest.raises(InspectionError, match="at least"):
             ResponseBudget(max_bytes=MIN_RESPONSE_BYTES - 1)
+
+    def test_scratch_budget_is_part_of_inspector_contract(self) -> None:
+        default = inspector_base.DEFAULT_SCRATCH_BYTES
+        maximum = inspector_base.MAX_SCRATCH_BYTES
+
+        assert 0 < default <= maximum
+        assert RenderBudget(max_scratch_bytes=default).max_scratch_bytes == default
+        assert ResponseBudget(
+            max_scratch_bytes=default
+        ).max_scratch_bytes == default
+        with pytest.raises(InspectionError, match="scratch"):
+            RenderBudget(max_scratch_bytes=maximum + 1)
 
     @pytest.mark.parametrize(
         "selectors",
@@ -269,6 +297,45 @@ class TestSafeRun:
         assert "truncated" in proc.stdout
         assert "truncated" in proc.stderr
 
+    def test_normal_parent_exit_terminates_lingering_process_group(
+        self, tmp_path
+    ) -> None:
+        pid_file = tmp_path / "child.pid"
+        script = (
+            "import pathlib, subprocess, sys; "
+            "child = subprocess.Popen("
+            "[sys.executable, '-c', 'import time; time.sleep(60)']); "
+            "pathlib.Path(sys.argv[1]).write_text(str(child.pid))"
+        )
+        child_pid = None
+        started = time.monotonic()
+        try:
+            safe_run(
+                [sys.executable, "-c", script, str(pid_file)],
+                timeout=5,
+                cwd=str(tmp_path),
+                home=str(tmp_path),
+            )
+            child_pid = int(pid_file.read_text(encoding="utf-8"))
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    state = Path(f"/proc/{child_pid}/stat").read_text().split()[2]
+                except (FileNotFoundError, ProcessLookupError):
+                    break
+                if state == "Z":
+                    break
+                time.sleep(0.02)
+            else:
+                pytest.fail("lingering child process remained alive")
+            assert time.monotonic() - started < 3
+        finally:
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
 
 class TestSecurePaths:
     def test_logical_path_boundaries_are_accepted(self) -> None:
@@ -396,6 +463,46 @@ class TestSecurePaths:
                 scratch_dir=str(scratch),
             )
 
+    def test_png_read_uses_open_directory_descriptors_during_replacement(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        _evidence, scratch = _roots(tmp_path)
+        nested = scratch / "nested"
+        nested.mkdir()
+        original = nested / "render.png"
+        PillowImage.new("RGB", (2, 3), color=(1, 2, 3)).save(original)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        PillowImage.new("RGB", (9, 9), color=(4, 5, 6)).save(
+            outside / "render.png"
+        )
+        held = scratch / "held"
+        real_open = os.open
+        replaced = False
+
+        def replacing_open(path, flags, *args, **kwargs):
+            nonlocal replaced
+            dir_fd = kwargs.get("dir_fd")
+            if not replaced and os.fspath(path) == "nested" and dir_fd is not None:
+                descriptor = real_open(path, flags, *args, **kwargs)
+                nested.rename(held)
+                nested.symlink_to(outside, target_is_directory=True)
+                replaced = True
+                return descriptor
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", replacing_open)
+        _data, details = artifact_mcp._read_png(
+            str(original),
+            str(scratch),
+            remaining_pixels=100,
+            remaining_bytes=10_000,
+        )
+
+        assert replaced is True
+        assert details["width"] == 2
+        assert details["height"] == 3
+
     @pytest.mark.parametrize("raw_suffix", ["nested/../render.png", "/render.png"])
     def test_rejects_non_normalized_absolute_render_output(
         self, tmp_path, fake_pdf_inspector, raw_suffix
@@ -514,6 +621,62 @@ class TestRegistry:
                 "units": [],
             }
 
+    def test_inventory_rejects_paths_deeper_than_tool_path_contract(
+        self, tmp_path
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        too_deep = evidence.joinpath(*(["a"] * (MAX_LOGICAL_COMPONENTS + 1)))
+        too_deep.mkdir(parents=True)
+        _write_pdf(too_deep / "report.pdf")
+
+        with pytest.raises(InspectionError, match="component count"):
+            inventory_artifacts(str(evidence), str(scratch))
+
+    def test_inspection_uses_stable_copy_when_evidence_directory_is_replaced(
+        self, tmp_path, fake_pdf_inspector, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        nested = evidence / "nested"
+        _write_pdf(nested / "report.pdf", b"ORIGINAL")
+        outside = tmp_path / "outside"
+        _write_pdf(outside / "report.pdf", b"ESCAPED")
+        held = evidence / "held"
+        real_detect = inspectors_mod.detect_artifact_kind
+        replaced = False
+
+        def replacing_detect(path):
+            nonlocal replaced
+            if not replaced:
+                nested.rename(held)
+                nested.symlink_to(outside, target_is_directory=True)
+                replaced = True
+            return real_detect(path)
+
+        def reading_inspect(self, path, scratch_dir, *, response_budget):
+            return {
+                "payload": Path(path).read_bytes().decode(
+                    "ascii",
+                    errors="replace",
+                )
+            }
+
+        monkeypatch.setattr(
+            inspectors_mod,
+            "detect_artifact_kind",
+            replacing_detect,
+        )
+        monkeypatch.setattr(_FakePdfInspector, "inspect", reading_inspect)
+
+        result = inspect_artifact(
+            "nested/report.pdf",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        assert replaced is True
+        assert "ORIGINAL" in result["payload"]
+        assert "ESCAPED" not in result["payload"]
+
     def test_inventory_response_limit_fails_closed(self, tmp_path) -> None:
         evidence, scratch = _roots(tmp_path)
         for index in range(10):
@@ -599,6 +762,50 @@ class TestRegistry:
                 scratch_dir=str(scratch),
                 **kwargs,
             )
+
+    def test_scratch_budget_counts_preexisting_and_unreturned_files(
+        self, tmp_path, fake_pdf_inspector
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        (scratch / "preexisting.bin").write_bytes(b"p" * 65)
+
+        with pytest.raises(InspectionError, match="scratch"):
+            inspect_artifact(
+                "report.pdf",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+                max_scratch_bytes=64,
+            )
+        assert fake_pdf_inspector.calls == []
+
+        (scratch / "preexisting.bin").unlink()
+        fake_pdf_inspector.unreturned_scratch_bytes = 128
+        with pytest.raises(InspectionError, match="scratch"):
+            render_artifact(
+                "report.pdf",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+                max_scratch_bytes=100,
+        )
+        assert (scratch / "unreturned.bin").stat().st_size == 128
+
+    def test_scratch_budget_counts_staged_input_and_outputs_at_peak(
+        self, tmp_path, fake_pdf_inspector
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf", b"e" * 60)
+        fake_pdf_inspector.unreturned_scratch_bytes = 50
+
+        with pytest.raises(InspectionError, match="scratch"):
+            inspect_artifact(
+                "report.pdf",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+                max_scratch_bytes=100,
+            )
+
+        assert (scratch / "unreturned.bin").stat().st_size == 50
 
 
 class TestArtifactCtl:
@@ -917,6 +1124,37 @@ class TestArtifactCtl:
         assert code == 2
         assert payload["status"] == "error"
 
+    def test_cli_passes_scratch_budget(self, tmp_path, capsys, monkeypatch) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        cli_module = sys.modules[
+            "skillopt.envs.skilleval.inspectors.__main__"
+        ]
+        observed = {}
+
+        def fake_inspect(*args, **kwargs):
+            observed.update(kwargs)
+            return {"ok": True}
+
+        monkeypatch.setattr(cli_module, "inspect_artifact", fake_inspect)
+        code, payload = self._run(
+            capsys,
+            [
+                "inspect",
+                "report.pdf",
+                "--evidence",
+                str(evidence),
+                "--scratch",
+                str(scratch),
+                "--max-scratch-bytes",
+                "1234",
+            ],
+        )
+
+        assert code == 0
+        assert payload["status"] == "ok"
+        assert observed["max_scratch_bytes"] == 1234
+
 
 def _assert_untrusted_location(value, needles, path=()):
     if isinstance(value, dict):
@@ -942,7 +1180,127 @@ def _structured_payload(result):
     return payload
 
 
+def _serialized_mcp_result_bytes(result) -> int:
+    return len(
+        result.model_dump_json(
+            by_alias=True,
+            exclude_none=True,
+        ).encode("utf-8")
+    )
+
+
 class TestArtifactMcp:
+    @pytest.mark.anyio
+    async def test_real_stdio_initialize_list_call_and_image(
+        self, tmp_path
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        server_script = tmp_path / "artifact_stdio_server.py"
+        server_script.write_text(
+            """
+import os
+import sys
+import types
+from pathlib import Path
+
+from PIL import Image as PillowImage
+
+class FakePdfInspector:
+    def inspect(self, path, scratch_dir, *, response_budget):
+        return {"filename": Path(path).name, "metadata": "STDIO_META"}
+
+    def render(self, path, scratch_dir, selectors, budget):
+        output = Path(scratch_dir) / "stdio-render.png"
+        PillowImage.new("RGB", (2, 3), color=(10, 20, 30)).save(output)
+        return [str(output)]
+
+    def extract(self, path, scratch_dir, selectors, *, response_budget):
+        return {"text": "STDIO_TEXT"}
+
+
+module = types.ModuleType("skillopt.envs.skilleval.inspectors.pdf_image")
+module.PdfInspector = FakePdfInspector
+module.ImageInspector = FakePdfInspector
+sys.modules[module.__name__] = module
+
+from skillopt.envs.skilleval.artifact_mcp import create_server
+
+server = create_server(
+    os.environ["TEST_ARTIFACT_EVIDENCE"],
+    os.environ["TEST_ARTIFACT_SCRATCH"],
+)
+server.run(transport="stdio")
+""".lstrip(),
+            encoding="utf-8",
+        )
+        environment = os.environ.copy()
+        repo_root = str(Path(__file__).resolve().parents[1])
+        environment.update(
+            {
+                "TEST_ARTIFACT_EVIDENCE": str(evidence),
+                "TEST_ARTIFACT_SCRATCH": str(scratch),
+                "PYTHONPATH": os.pathsep.join(
+                    filter(
+                        None,
+                        (repo_root, environment.get("PYTHONPATH")),
+                    )
+                ),
+            }
+        )
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=[str(server_script)],
+            env=environment,
+            cwd=repo_root,
+        )
+        stderr_path = tmp_path / "stdio-server.stderr"
+        with stderr_path.open("w+", encoding="utf-8") as stderr:
+            async with stdio_client(
+                parameters,
+                errlog=stderr,
+            ) as (read_stream, write_stream):
+                async with ClientSession(
+                    read_stream,
+                    write_stream,
+                ) as client:
+                    initialized = await client.initialize()
+                    tools = await client.list_tools()
+                    inventory = await client.call_tool(
+                        "artifact_inventory",
+                        {},
+                    )
+                    rendered = await client.call_tool(
+                        "artifact_render",
+                        {"path": "report.pdf", "max_pixels": 100},
+                    )
+            stderr.seek(0)
+            server_stderr = stderr.read()
+
+        assert initialized.serverInfo.name == "skillopt-artifact"
+        assert sorted(tool.name for tool in tools.tools) == [
+            "artifact_extract",
+            "artifact_inspect",
+            "artifact_inventory",
+            "artifact_render",
+        ]
+        assert _structured_payload(inventory)["untrusted_evidence"][
+            "status"
+        ] == "ok"
+        assert _structured_payload(rendered)["untrusted_evidence"][
+            "status"
+        ] == "ok"
+        images = [
+            content
+            for content in rendered.content
+            if isinstance(content, ImageContent)
+        ]
+        assert len(images) == 1
+        assert images[0].mimeType == "image/png"
+        assert "Traceback" not in server_stderr
+        assert "report.pdf" not in server_stderr
+        assert "STDIO_META" not in server_stderr
+
     @pytest.mark.anyio
     async def test_lists_exactly_four_tools_and_no_resources_or_prompts(
         self, tmp_path
@@ -1055,6 +1413,7 @@ class TestArtifactMcp:
             envelope = payload["untrusted_evidence"]
             assert envelope["status"] == "error"
             assert "error" in envelope
+            assert result.isError is True
 
     @pytest.mark.anyio
     async def test_server_maxima_reject_oversized_tool_budget(
@@ -1082,6 +1441,7 @@ class TestArtifactMcp:
         envelope = _structured_payload(result)["untrusted_evidence"]
         assert envelope["status"] == "error"
         assert "maximum" in envelope["error"]
+        assert result.isError is True
 
     @pytest.mark.anyio
     async def test_response_budget_uses_minimum_of_request_and_server(
@@ -1140,6 +1500,7 @@ class TestArtifactMcp:
 
         envelope = _structured_payload(result)["untrusted_evidence"]
         assert envelope["status"] == "error"
+        assert result.isError is True
         text = next(
             content.text
             for content in result.content
@@ -1183,12 +1544,13 @@ class TestArtifactMcp:
         envelope = _structured_payload(result)["untrusted_evidence"]
         assert envelope["status"] == "error"
         assert "selector" in envelope["error"]
+        assert result.isError is True
         text = next(
             content.text
             for content in result.content
             if isinstance(content, TextContent)
         )
-        assert len(text.encode("utf-8")) <= MIN_RESPONSE_BYTES
+        assert _serialized_mcp_result_bytes(result) <= MIN_RESPONSE_BYTES
         assert json.loads(text) == result.structuredContent
         assert fake_pdf_inspector.calls == []
 
@@ -1218,14 +1580,98 @@ class TestArtifactMcp:
         envelope = _structured_payload(result)["untrusted_evidence"]
         assert envelope["status"] == "error"
         assert "path" in envelope["error"]
+        assert result.isError is True
         text = next(
             content.text
             for content in result.content
             if isinstance(content, TextContent)
         )
-        assert len(text.encode("utf-8")) <= MIN_RESPONSE_BYTES
+        assert _serialized_mcp_result_bytes(result) <= MIN_RESPONSE_BYTES
         assert json.loads(text) == result.structuredContent
         assert fake_pdf_inspector.calls == []
+
+    @pytest.mark.anyio
+    async def test_unknown_argument_is_bounded_enveloped_and_not_dispatched(
+        self, tmp_path, fake_pdf_inspector
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        server = artifact_mcp.create_server(str(evidence), str(scratch))
+        unknown_name = "UNTRUSTED_UNKNOWN_" + "x" * 1_000
+
+        async with create_connected_server_and_client_session(
+            server,
+            raise_exceptions=True,
+        ) as client:
+            result = await client.call_tool(
+                "artifact_inspect",
+                {
+                    "path": "report.pdf",
+                    "max_response_bytes": MIN_RESPONSE_BYTES,
+                    unknown_name: "UNTRUSTED_VALUE" * 1_000,
+                },
+            )
+
+        envelope = _structured_payload(result)["untrusted_evidence"]
+        assert envelope["status"] == "error"
+        assert "unknown" in envelope["error"].lower()
+        assert result.isError is True
+        assert _serialized_mcp_result_bytes(result) <= MIN_RESPONSE_BYTES
+        assert fake_pdf_inspector.calls == []
+
+    @pytest.mark.anyio
+    async def test_scratch_budget_is_exposed_and_enforced(
+        self, tmp_path, fake_pdf_inspector
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        fake_pdf_inspector.unreturned_scratch_bytes = 128
+        server = artifact_mcp.create_server(
+            str(evidence),
+            str(scratch),
+            max_scratch_bytes=100,
+        )
+
+        async with create_connected_server_and_client_session(
+            server,
+            raise_exceptions=True,
+        ) as client:
+            tools = await client.list_tools()
+            inspect_tool = next(
+                tool for tool in tools.tools
+                if tool.name == "artifact_inspect"
+            )
+            assert "max_scratch_bytes" in inspect_tool.inputSchema["properties"]
+            result = await client.call_tool(
+                "artifact_inspect",
+                {
+                    "path": "report.pdf",
+                    "max_response_bytes": MIN_RESPONSE_BYTES,
+                    "max_scratch_bytes": 100,
+                },
+            )
+            inventory_result = await client.call_tool(
+                "artifact_inventory",
+                {
+                    "max_response_bytes": MIN_RESPONSE_BYTES,
+                    "max_scratch_bytes": 100,
+                },
+            )
+
+        envelope = _structured_payload(result)["untrusted_evidence"]
+        assert envelope["status"] == "error"
+        assert "scratch" in envelope["error"]
+        assert result.isError is True
+        assert _serialized_mcp_result_bytes(result) <= MIN_RESPONSE_BYTES
+        inventory_envelope = _structured_payload(inventory_result)[
+            "untrusted_evidence"
+        ]
+        assert inventory_envelope["status"] == "error"
+        assert inventory_result.isError is True
+        assert (
+            _serialized_mcp_result_bytes(inventory_result)
+            <= MIN_RESPONSE_BYTES
+        )
 
     @pytest.mark.anyio
     async def test_mcp_response_budget_below_minimum_skips_inspector(
@@ -1250,6 +1696,7 @@ class TestArtifactMcp:
         envelope = _structured_payload(result)["untrusted_evidence"]
         assert envelope["status"] == "error"
         assert "at least" in envelope["error"]
+        assert result.isError is True
         assert fake_pdf_inspector.calls == []
 
     @pytest.mark.anyio
@@ -1271,6 +1718,7 @@ class TestArtifactMcp:
         envelope = _structured_payload(result)["untrusted_evidence"]
         assert envelope["status"] == "error"
         assert "component" in envelope["error"]
+        assert result.isError is True
         assert fake_pdf_inspector.calls == []
 
     @pytest.mark.anyio
@@ -1315,6 +1763,42 @@ class TestArtifactMcp:
         assert images[0].mimeType == "image/png"
 
     @pytest.mark.anyio
+    async def test_render_full_result_budget_rejects_oversized_image_payload(
+        self, tmp_path, fake_pdf_inspector
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        large = scratch / "large.png"
+        pixels = os.urandom(128 * 128 * 3)
+        PillowImage.frombytes("RGB", (128, 128), pixels).save(
+            large,
+            compress_level=0,
+        )
+        fake_pdf_inspector.render_escape = str(large)
+        server = artifact_mcp.create_server(str(evidence), str(scratch))
+
+        async with create_connected_server_and_client_session(
+            server,
+            raise_exceptions=True,
+        ) as client:
+            result = await client.call_tool(
+                "artifact_render",
+                {
+                    "path": "report.pdf",
+                    "max_pixels": 128 * 128,
+                    "max_response_bytes": MIN_RESPONSE_BYTES,
+                },
+            )
+
+        envelope = _structured_payload(result)["untrusted_evidence"]
+        assert envelope["status"] == "error"
+        assert result.isError is True
+        assert _serialized_mcp_result_bytes(result) <= MIN_RESPONSE_BYTES
+        assert not any(
+            isinstance(content, ImageContent) for content in result.content
+        )
+
+    @pytest.mark.anyio
     async def test_render_rejects_non_png_and_oversized_media(
         self, tmp_path, fake_pdf_inspector
     ) -> None:
@@ -1340,6 +1824,7 @@ class TestArtifactMcp:
 
         envelope = _structured_payload(result)["untrusted_evidence"]
         assert envelope["status"] == "error"
+        assert result.isError is True
         assert not any(
             isinstance(content, ImageContent) for content in result.content
         )

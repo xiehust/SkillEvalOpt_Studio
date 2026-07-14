@@ -5,10 +5,8 @@ import errno
 import json
 import math
 import os
-import signal
 import stat
 import subprocess
-import threading
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Protocol, TypeAlias, cast
@@ -20,6 +18,8 @@ MIN_RESPONSE_BYTES = 512
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 DEFAULT_EXTRACT_CHARS = 500_000
 MAX_EXTRACT_CHARS = 4_000_000
+DEFAULT_SCRATCH_BYTES = 512 * 1024 * 1024
+MAX_SCRATCH_BYTES = 4 * 1024 * 1024 * 1024
 MAX_COMMAND_OUTPUT_CHARS = 64_000
 MAX_SELECTORS = 256
 MAX_SELECTOR_CHARS = 256
@@ -57,9 +57,15 @@ class RenderBudget:
     """Cumulative pixel budget for one render request."""
 
     max_pixels: int = MAX_RENDER_PIXELS
+    max_scratch_bytes: int = DEFAULT_SCRATCH_BYTES
 
     def __post_init__(self) -> None:
         _positive_int(self.max_pixels, "render pixel", MAX_RENDER_PIXELS)
+        _positive_int(
+            self.max_scratch_bytes,
+            "scratch byte",
+            MAX_SCRATCH_BYTES,
+        )
 
 
 @dataclass(frozen=True)
@@ -68,6 +74,7 @@ class ResponseBudget:
 
     max_bytes: int = DEFAULT_RESPONSE_BYTES
     max_extract_chars: int = DEFAULT_EXTRACT_CHARS
+    max_scratch_bytes: int = DEFAULT_SCRATCH_BYTES
 
     def __post_init__(self) -> None:
         _positive_int(self.max_bytes, "response byte", MAX_RESPONSE_BYTES)
@@ -79,6 +86,11 @@ class ResponseBudget:
             self.max_extract_chars,
             "extraction character",
             MAX_EXTRACT_CHARS,
+        )
+        _positive_int(
+            self.max_scratch_bytes,
+            "scratch byte",
+            MAX_SCRATCH_BYTES,
         )
 
 
@@ -429,33 +441,6 @@ def resolve_scratch_path(
     return candidate
 
 
-def _bounded_pipe_reader(
-    pipe,
-    chunks: list[bytes],
-    totals: list[int],
-) -> None:
-    try:
-        while True:
-            chunk = pipe.read(8_192)
-            if not chunk:
-                break
-            totals[0] += len(chunk)
-            remaining = MAX_COMMAND_OUTPUT_CHARS - sum(map(len, chunks))
-            if remaining > 0:
-                chunks.append(chunk[:remaining])
-    finally:
-        pipe.close()
-
-
-def _decode_output(chunks: list[bytes], total: int) -> str:
-    captured = b"".join(chunks).decode("utf-8", errors="replace")
-    if total > MAX_COMMAND_OUTPUT_CHARS:
-        captured += (
-            f"\n...[truncated {total - MAX_COMMAND_OUTPUT_CHARS} bytes]..."
-        )
-    return captured
-
-
 def safe_run(
     command: list[str],
     *,
@@ -463,110 +448,16 @@ def safe_run(
     cwd: str,
     home: str,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a fixed argv with a minimal environment and bounded diagnostics."""
-    if (
-        not isinstance(command, list)
-        or not command
-        or any(
-            not isinstance(part, str) or not part or "\x00" in part
-            for part in command
-        )
-    ):
-        raise InspectionError("invalid inspector command")
-    if (
-        isinstance(timeout, bool)
-        or not isinstance(timeout, (int, float))
-        or not math.isfinite(timeout)
-        or timeout <= 0
-        or timeout > MAX_COMMAND_TIMEOUT_SECONDS
-    ):
-        raise InspectionError("command timeout must be positive and bounded")
-    cwd = _absolute_path(cwd, "command cwd")
-    home = _absolute_path(home, "command home")
-    cwd_fd = _open_real_directory(cwd, "command cwd")
-    home_fd = _open_real_directory(home, "command home")
-    os.close(home_fd)
-    os.close(cwd_fd)
-    env = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "HOME": home,
-        "LANG": "C.UTF-8",
-    }
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            start_new_session=True,
-        )
-    except OSError as exc:
-        raise InspectionError(
-            "inspector command could not start: "
-            f"{type(exc).__name__}: {bounded_diagnostic(exc)}"
-        ) from exc
+    """Run a command through the focused process-isolation implementation."""
+    from ._process import safe_run as _safe_run
 
-    assert process.stdout is not None
-    assert process.stderr is not None
-    stdout_chunks: list[bytes] = []
-    stderr_chunks: list[bytes] = []
-    stdout_total = [0]
-    stderr_total = [0]
-    readers = [
-        threading.Thread(
-            target=_bounded_pipe_reader,
-            args=(process.stdout, stdout_chunks, stdout_total),
-            daemon=True,
-        ),
-        threading.Thread(
-            target=_bounded_pipe_reader,
-            args=(process.stderr, stderr_chunks, stderr_total),
-            daemon=True,
-        ),
-    ]
-    for reader in readers:
-        reader.start()
-
-    timed_out = False
-    try:
-        returncode = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        returncode = process.wait()
-    for reader in readers:
-        reader.join(timeout=2)
-    stdout = _decode_output(stdout_chunks, stdout_total[0])
-    stderr = _decode_output(stderr_chunks, stderr_total[0])
-
-    if timed_out:
-        raise InspectionError(
-            f"inspector command timed out after {timeout} seconds"
-        )
-    completed = subprocess.CompletedProcess(
-        command,
-        returncode,
-        stdout=stdout,
-        stderr=stderr,
-    )
-    if returncode != 0:
-        diagnostic = stderr or stdout or "(no output)"
-        raise InspectionError(
-            f"inspector command exited {returncode}: "
-            f"{bounded_diagnostic(diagnostic, MAX_COMMAND_OUTPUT_CHARS)}"
-        )
-    return completed
+    return _safe_run(command, timeout=timeout, cwd=cwd, home=home)
 
 
 __all__ = [
     "DEFAULT_EXTRACT_CHARS",
     "DEFAULT_RESPONSE_BYTES",
+    "DEFAULT_SCRATCH_BYTES",
     "InspectionError",
     "Inspector",
     "JSONValue",
@@ -578,6 +469,7 @@ __all__ = [
     "MAX_LOGICAL_PATH_CHARS",
     "MAX_RENDER_PIXELS",
     "MAX_RESPONSE_BYTES",
+    "MAX_SCRATCH_BYTES",
     "MIN_RESPONSE_BYTES",
     "RenderBudget",
     "ResponseBudget",
