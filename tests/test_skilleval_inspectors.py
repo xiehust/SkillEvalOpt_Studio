@@ -4689,6 +4689,954 @@ class TestSpreadsheetInspector:
         assert fake_pdf_inspector.calls[-1][0] == "render"
 
 
+class TestPdfImageInspectors:
+    def test_image_inspection_reports_rgba_metadata(self, tmp_path) -> None:
+        evidence, scratch = _roots(tmp_path)
+        PillowImage.new(
+            "RGBA",
+            (40, 20),
+            color=(255, 0, 0, 128),
+        ).save(evidence / "preview.png")
+
+        result = inspect_artifact(
+            "preview.png",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        assert result == {
+            "kind": "image",
+            "opens": True,
+            "format": "PNG",
+            "width": 40,
+            "height": 20,
+            "mode": "RGBA",
+            "frames": 1,
+            "has_transparency": True,
+        }
+
+    def test_pdf_inspection_indexes_metadata_and_extracts_text_separately(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        commands = []
+
+        def fake_run(command, **kwargs):
+            commands.append((command, kwargs))
+            if command[0] == "pdfinfo":
+                stdout = "Pages: 2\nTitle: Report\n"
+            else:
+                stdout = "Quarterly report\fSecond page\f"
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        monkeypatch.setattr(pdf_image, "safe_run", fake_run)
+
+        inspected = inspect_artifact(
+            "report.pdf",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+        extracted = extract_artifact(
+            "report.pdf",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["page:1-2"],
+        )
+
+        assert inspected["kind"] == "pdf"
+        assert inspected["opens"] is True
+        assert inspected["pages"] == 2
+        assert inspected["metadata"]["Title"] == "Report"
+        assert inspected["page_index"] == {
+            "items": [1, 2],
+            "returned": 2,
+            "omitted": 0,
+        }
+        assert "text" not in inspected
+        assert [page["text"] for page in extracted["page_text"]] == [
+            "Quarterly report",
+            "Second page",
+        ]
+        assert [command[0][0] for command in commands] == [
+            "pdfinfo",
+            "pdfinfo",
+            "pdftotext",
+        ]
+
+    def test_multiframe_image_index_and_extract_selectors(
+        self, tmp_path
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        first = PillowImage.new("RGBA", (8, 6), (255, 0, 0, 128))
+        second = PillowImage.new("RGBA", (4, 3), (0, 0, 255, 64))
+        first.save(
+            evidence / "animation.tiff",
+            save_all=True,
+            append_images=[second],
+        )
+        first.close()
+        second.close()
+
+        inspected = inspect_artifact(
+            "animation.tiff",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+        extracted = extract_artifact(
+            "animation.tiff",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["frame:2", "metadata"],
+        )
+
+        assert inspected["frames"] == 2
+        assert inspected["has_transparency"] is True
+        assert inspected["frame_index"] == {
+            "items": [
+                {
+                    "frame": 1,
+                    "width": 8,
+                    "height": 6,
+                    "mode": "RGBA",
+                    "has_transparency": True,
+                },
+                {
+                    "frame": 2,
+                    "width": 4,
+                    "height": 3,
+                    "mode": "RGBA",
+                    "has_transparency": True,
+                },
+            ],
+            "returned": 2,
+            "omitted": 0,
+        }
+        assert extracted["frame_data"] == [
+            inspected["frame_index"]["items"][1]
+        ]
+        assert extracted["metadata"]["format"] == "TIFF"
+        assert extracted["units_inspected"] == ["frame:2", "metadata"]
+        assert extracted["omitted"] == {"frames": 1, "metadata": 0}
+        assert extracted["truncated"] is False
+        assert extracted["next_cursor"] is None
+
+    def test_multiframe_image_extract_defaults_to_first_frame_page(
+        self, tmp_path
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        first = PillowImage.new("RGB", (8, 6), "red")
+        second = PillowImage.new("RGB", (4, 3), "blue")
+        first.save(
+            evidence / "animation.tiff",
+            save_all=True,
+            append_images=[second],
+        )
+        first.close()
+        second.close()
+
+        result = extract_artifact(
+            "animation.tiff",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        assert [frame["frame"] for frame in result["frame_data"]] == [1]
+        assert result["omitted"]["frames"] == 1
+        assert result["truncated"] is True
+        assert result["next_cursor"] == "frame:2"
+
+    def test_image_extract_reports_each_selected_metadata_unit(
+        self, tmp_path
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        PillowImage.new("RGB", (8, 6), "red").save(
+            evidence / "preview.png"
+        )
+
+        result = extract_artifact(
+            "preview.png",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["metadata:format", "metadata:width"],
+        )
+
+        assert result["metadata"] == {"format": "PNG", "width": 8}
+        assert result["units_inspected"] == [
+            "metadata:format",
+            "metadata:width",
+        ]
+        assert result["omitted"]["metadata"] == 4
+
+    def test_image_render_normalizes_selected_frame_to_png(
+        self, tmp_path
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        first = PillowImage.new("RGBA", (8, 6), (255, 0, 0, 128))
+        second = PillowImage.new("RGBA", (4, 3), (0, 0, 255, 64))
+        first.save(
+            evidence / "animation.tiff",
+            save_all=True,
+            append_images=[second],
+        )
+        first.close()
+        second.close()
+
+        outputs = render_artifact(
+            "animation.tiff",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["frame:2"],
+            max_pixels=12,
+        )
+
+        assert len(outputs) == 1
+        output = Path(outputs[0])
+        assert output.is_file()
+        assert output.parent.parent == scratch
+        with PillowImage.open(output) as rendered:
+            assert rendered.format == "PNG"
+            assert rendered.size == (4, 3)
+            assert rendered.mode == "RGBA"
+            assert rendered.getpixel((0, 0)) == (0, 0, 255, 64)
+        assert sorted(path.name for path in evidence.iterdir()) == [
+            "animation.tiff"
+        ]
+
+    def test_pdf_render_runs_pdftoppm_per_selected_page_in_order(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        commands = []
+
+        def fake_run(command, **kwargs):
+            commands.append((command, kwargs))
+            if command[0] == "pdfinfo":
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    "Pages: 2\n",
+                    "",
+                )
+            page = int(command[2])
+            size = (3, 4) if page == 1 else (5, 2)
+            PillowImage.new("RGB", size, (page, 0, 0)).save(
+                f"{command[-1]}.png"
+            )
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        monkeypatch.setattr(pdf_image, "safe_run", fake_run)
+
+        outputs = render_artifact(
+            "report.pdf",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["page:2", "page:1"],
+            max_pixels=22,
+        )
+
+        ppm_commands = [
+            command for command, _kwargs in commands
+            if command[0] == "pdftoppm"
+        ]
+        assert [command[2] for command in ppm_commands] == ["1", "2"]
+        assert [
+            command[:8] for command in ppm_commands
+        ] == [
+            [
+                "pdftoppm",
+                "-f",
+                "1",
+                "-singlefile",
+                "-png",
+                "-r",
+                "144",
+                ppm_commands[0][7],
+            ],
+            [
+                "pdftoppm",
+                "-f",
+                "2",
+                "-singlefile",
+                "-png",
+                "-r",
+                "144",
+                ppm_commands[1][7],
+            ],
+        ]
+        assert [Path(output).name.endswith(name) for output, name in zip(
+            outputs,
+            ("page-0001.png", "page-0002.png"),
+        )] == [True, True]
+        sizes = []
+        for output in outputs:
+            with PillowImage.open(output) as rendered:
+                sizes.append(rendered.size)
+        assert sizes == [(3, 4), (5, 2)]
+
+    def test_pdf_render_rejects_page_ranges_before_pdftoppm(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        commands = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "Pages: 100000\n",
+                "",
+            )
+
+        monkeypatch.setattr(pdf_image, "safe_run", fake_run)
+
+        with pytest.raises(InspectionError, match="render selector"):
+            render_artifact(
+                "report.pdf",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+                selectors=["page:1-100000"],
+            )
+
+        assert not any(command[0] == "pdftoppm" for command in commands)
+
+    def test_pdf_render_default_is_bounded_to_first_page(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        rendered_pages = []
+
+        def fake_run(command, **kwargs):
+            if command[0] == "pdfinfo":
+                stdout = "Pages: 100000\n"
+            else:
+                rendered_pages.append(int(command[2]))
+                PillowImage.new("RGB", (1, 1)).save(
+                    f"{command[-1]}.png"
+                )
+                stdout = ""
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        monkeypatch.setattr(pdf_image, "safe_run", fake_run)
+
+        outputs = render_artifact(
+            "report.pdf",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            max_pixels=1,
+        )
+
+        assert rendered_pages == [1]
+        assert len(outputs) == 1
+
+    def test_pdf_extract_truncates_page_text_with_explicit_pagination(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        commands = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            if command[0] == "pdfinfo":
+                stdout = "Pages: 3\n"
+            else:
+                stdout = ("A" * 2_000) + "\f"
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        monkeypatch.setattr(pdf_image, "safe_run", fake_run)
+
+        result = extract_artifact(
+            "report.pdf",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            max_response_bytes=700,
+            max_extract_chars=600,
+        )
+
+        assert len(result["page_text"]) == 1
+        page = result["page_text"][0]
+        assert page["page"] == 1
+        assert 0 < len(page["text"]) < 2_000
+        assert page["truncated"] is True
+        assert page["omitted_characters"] == 2_000 - len(page["text"])
+        assert result["units_inspected"] == ["page:1"]
+        assert result["omitted"]["pages"] == 2
+        assert result["omitted"]["characters"] == page["omitted_characters"]
+        assert result["truncated"] is True
+        assert result["next_cursor"] == "page:2"
+        text_command = next(
+            command for command in commands if command[0] == "pdftotext"
+        )
+        assert text_command[2:6] == ["-f", "1", "-l", "1"]
+
+    def test_pdf_contains_text_streams_pages_under_total_budgets(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        path = tmp_path / "report.pdf"
+        _write_pdf(path)
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        commands = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            if command[0] == "pdfinfo":
+                stdout = "Pages: 3\n"
+            else:
+                page = int(command[3])
+                stdout = (
+                    "needle is here\f"
+                    if page == 3
+                    else f"page {page}\f"
+                )
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        monkeypatch.setattr(pdf_image, "safe_run", fake_run)
+        inspector = pdf_image.PdfInspector()
+
+        assert inspector.contains_text(
+            str(path),
+            str(scratch),
+            "needle",
+            max_pages=3,
+            max_bytes=100,
+            timeout=10,
+        ) is True
+        assert [
+            command[3]
+            for command in commands
+            if command[0] == "pdftotext"
+        ] == ["1", "2", "3"]
+
+        with pytest.raises(InspectionError, match="page budget"):
+            inspector.contains_text(
+                str(path),
+                str(scratch),
+                "missing",
+                max_pages=2,
+                max_bytes=100,
+                timeout=10,
+            )
+
+    def test_pdf_contains_text_timeout_includes_pdfinfo(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        path = tmp_path / "report.pdf"
+        _write_pdf(path)
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        clock = [0.0]
+        commands = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            if command[0] == "pdfinfo":
+                clock[0] = 6.0
+                stdout = "Pages: 1\n"
+            else:
+                stdout = "missing\f"
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        monkeypatch.setattr(pdf_image, "safe_run", fake_run)
+        monkeypatch.setattr(
+            pdf_image.time,
+            "monotonic",
+            lambda: clock[0],
+        )
+
+        with pytest.raises(InspectionError, match="time budget"):
+            pdf_image.PdfInspector().contains_text(
+                str(path),
+                str(scratch),
+                "needle",
+                max_pages=1,
+                max_bytes=100,
+                timeout=5,
+            )
+
+        assert [command[0] for command in commands] == ["pdfinfo"]
+
+    def test_pdf_nonzero_tool_result_fails_closed(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        monkeypatch.setattr(
+            pdf_image,
+            "safe_run",
+            lambda command, **kwargs: subprocess.CompletedProcess(
+                command,
+                1,
+                "Pages: 1\n",
+                "broken PDF",
+            ),
+        )
+
+        with pytest.raises(InspectionError, match="exited 1"):
+            inspect_artifact(
+                "report.pdf",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+
+    @pytest.mark.parametrize(
+        ("limit_name", "limit_value", "match"),
+        [
+            ("MAX_IMAGE_PIXELS", 399, "pixel limit"),
+            ("MAX_IMAGE_DECODED_BYTES", 1_599, "decoded-byte limit"),
+        ],
+    )
+    def test_image_explicit_decode_limits_are_controlled(
+        self,
+        tmp_path,
+        monkeypatch,
+        limit_name,
+        limit_value,
+        match,
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        PillowImage.new("RGBA", (20, 20), (1, 2, 3, 4)).save(
+            evidence / "large.png"
+        )
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        monkeypatch.setattr(pdf_image, limit_name, limit_value)
+
+        with pytest.raises(InspectionError, match=match):
+            inspect_artifact(
+                "large.png",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+
+    def test_image_frame_limit_and_pillow_bomb_are_controlled(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        first = PillowImage.new("RGB", (5, 5), (1, 2, 3))
+        second = PillowImage.new("RGB", (5, 5), (4, 5, 6))
+        first.save(
+            evidence / "many.tiff",
+            save_all=True,
+            append_images=[second],
+        )
+        first.close()
+        second.close()
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        monkeypatch.setattr(pdf_image, "MAX_IMAGE_FRAMES", 1)
+        with pytest.raises(InspectionError, match="frame count"):
+            inspect_artifact(
+                "many.tiff",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+
+        monkeypatch.setattr(pdf_image, "MAX_IMAGE_FRAMES", 256)
+        monkeypatch.setattr(PillowImage, "MAX_IMAGE_PIXELS", 10)
+        with pytest.raises(InspectionError, match="decoded safely"):
+            inspect_artifact(
+                "many.tiff",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+
+    def test_image_decoded_limit_accounts_for_sample_width(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        PillowImage.new("F", (10, 10), 1.0).save(
+            evidence / "float.tiff"
+        )
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        monkeypatch.setattr(
+            pdf_image,
+            "MAX_IMAGE_DECODED_BYTES",
+            399,
+        )
+
+        with pytest.raises(InspectionError, match="decoded-byte limit"):
+            inspect_artifact(
+                "float.tiff",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+
+    def test_image_truncated_input_and_invalid_selectors_fail_closed(
+        self, tmp_path
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        valid = tmp_path / "valid.png"
+        PillowImage.new("RGB", (10, 10), (1, 2, 3)).save(valid)
+        truncated = evidence / "truncated.png"
+        payload = valid.read_bytes()
+        truncated.write_bytes(payload[: len(payload) // 2])
+        from skillopt.envs.skilleval.inspectors.pdf_image import ImageInspector
+
+        with pytest.raises(InspectionError):
+            ImageInspector().inspect(
+                str(truncated),
+                str(scratch),
+                response_budget=ResponseBudget(),
+            )
+
+        os.replace(valid, evidence / "valid.png")
+        with pytest.raises(InspectionError, match="image extract selector"):
+            extract_artifact(
+                "valid.png",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+                selectors=["frame:0"],
+            )
+        with pytest.raises(InspectionError, match="image render selector"):
+            render_artifact(
+                "valid.png",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+                selectors=["frame:0"],
+            )
+
+    def test_image_render_applies_exif_orientation_and_strips_icc(
+        self, tmp_path
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        image = PillowImage.new("RGB", (3, 2), (10, 20, 30))
+        exif = image.getexif()
+        exif[274] = 6
+        image.save(
+            evidence / "oriented.jpg",
+            exif=exif,
+            icc_profile=b"bounded-test-profile",
+        )
+        image.close()
+
+        metadata = extract_artifact(
+            "oriented.jpg",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=[
+                "metadata:orientation",
+                "metadata:icc_profile_bytes",
+            ],
+        )
+        outputs = render_artifact(
+            "oriented.jpg",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            max_pixels=6,
+        )
+
+        assert metadata["metadata"] == {
+            "orientation": 6,
+            "icc_profile_bytes": len(b"bounded-test-profile"),
+        }
+        with PillowImage.open(outputs[0]) as rendered:
+            assert rendered.size == (2, 3)
+            assert rendered.mode == "RGB"
+            assert "icc_profile" not in rendered.info
+            assert rendered.getexif().get(274) is None
+
+    @pytest.mark.parametrize("kind", ["image", "pdf"])
+    def test_render_pixel_overflow_rolls_back_transaction(
+        self, tmp_path, monkeypatch, kind
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        if kind == "image":
+            PillowImage.new("RGB", (10, 10), (1, 2, 3)).save(
+                evidence / "large.png"
+            )
+            filename = "large.png"
+        else:
+            _write_pdf(evidence / "large.pdf")
+            filename = "large.pdf"
+            from skillopt.envs.skilleval.inspectors import pdf_image
+
+            def fake_run(command, **kwargs):
+                if command[0] == "pdfinfo":
+                    stdout = "Pages: 1\n"
+                else:
+                    PillowImage.new("RGB", (10, 10)).save(
+                        f"{command[-1]}.png"
+                    )
+                    stdout = ""
+                return subprocess.CompletedProcess(command, 0, stdout, "")
+
+            monkeypatch.setattr(pdf_image, "safe_run", fake_run)
+
+        with pytest.raises(InspectionError, match="pixel budget"):
+            render_artifact(
+                filename,
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+                max_pixels=99,
+            )
+
+        assert list(scratch.iterdir()) == []
+        assert [path.name for path in evidence.iterdir()] == [filename]
+
+    def test_pdf_tool_receives_live_stable_evidence_descriptor(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf", b"stable")
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        observed = {}
+
+        def fake_run(command, **kwargs):
+            path = command[-1]
+            descriptor = int(path.removeprefix("/proc/self/fd/"))
+            observed["path"] = path
+            observed["payload"] = os.pread(descriptor, 100, 0)
+            observed["passed"] = descriptor in kwargs["pass_fds"]
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "Pages: 1\n",
+                "",
+            )
+
+        monkeypatch.setattr(pdf_image, "safe_run", fake_run)
+
+        inspect_artifact(
+            "report.pdf",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        assert observed["path"].startswith("/proc/self/fd/")
+        assert observed["payload"].startswith(b"%PDF-1.4\nstable")
+        assert observed["passed"] is True
+
+    def test_pdf_image_inspection_does_not_leak_file_descriptors(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        PillowImage.new("RGBA", (4, 3), (1, 2, 3, 4)).save(
+            evidence / "preview.png"
+        )
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        monkeypatch.setattr(
+            pdf_image,
+            "safe_run",
+            lambda command, **kwargs: subprocess.CompletedProcess(
+                command,
+                0,
+                "Pages: 1\n",
+                "",
+            ),
+        )
+        before = set(os.listdir("/proc/self/fd"))
+
+        for _ in range(5):
+            inspect_artifact(
+                "report.pdf",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+            inspect_artifact(
+                "preview.png",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+
+        assert set(os.listdir("/proc/self/fd")) == before
+
+    @pytest.mark.parametrize(
+        ("stdout", "match"),
+        [
+            ("Title: Missing pages\n", "Pages"),
+            ("Pages: 0\n", "positive integer"),
+            ("Pages: 100001\n", "exceeds maximum"),
+            ("Pages: 1\nmalformed\n", "malformed metadata"),
+        ],
+    )
+    def test_pdfinfo_malformed_page_metadata_is_rejected(
+        self, tmp_path, monkeypatch, stdout, match
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        monkeypatch.setattr(
+            pdf_image,
+            "safe_run",
+            lambda command, **kwargs: subprocess.CompletedProcess(
+                command,
+                0,
+                stdout,
+                "",
+            ),
+        )
+
+        with pytest.raises(InspectionError, match=match):
+            inspect_artifact(
+                "report.pdf",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+
+    def test_pdf_inspect_marks_truncated_metadata_values(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        monkeypatch.setattr(
+            pdf_image,
+            "safe_run",
+            lambda command, **kwargs: subprocess.CompletedProcess(
+                command,
+                0,
+                f"Pages: 1\nTitle: {'x' * 3_000}\n",
+                "",
+            ),
+        )
+
+        result = inspect_artifact(
+            "report.pdf",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        assert len(result["metadata"]["Title"]) == 2_048
+        assert result["metadata_truncated"] == 1
+        assert result["metadata_omitted"] == 0
+
+    @pytest.mark.parametrize(
+        ("failure", "match"),
+        [
+            (InspectionError("inspector command timed out"), "timed out"),
+            (FileNotFoundError("pdfinfo"), "PDF tool failed"),
+        ],
+    )
+    def test_pdf_missing_or_timed_out_tool_is_controlled(
+        self, tmp_path, monkeypatch, failure, match
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        def fail_tool(command, **kwargs):
+            raise failure
+
+        monkeypatch.setattr(pdf_image, "safe_run", fail_tool)
+
+        with pytest.raises(InspectionError, match=match):
+            inspect_artifact(
+                "report.pdf",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+
+    def test_pdf_extract_rejects_bad_pages_and_control_text(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        def fake_run(command, **kwargs):
+            stdout = (
+                "Pages: 2\n"
+                if command[0] == "pdfinfo"
+                else "unsafe\x00text\f"
+            )
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        monkeypatch.setattr(pdf_image, "safe_run", fake_run)
+
+        for selector in ("page:0", "page:2-1", "page:3"):
+            with pytest.raises(InspectionError):
+                extract_artifact(
+                    "report.pdf",
+                    evidence_dir=str(evidence),
+                    scratch_dir=str(scratch),
+                    selectors=[selector],
+                )
+        with pytest.raises(InspectionError, match="control characters"):
+            extract_artifact(
+                "report.pdf",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+                selectors=["page:1"],
+            )
+
+    @pytest.mark.skipif(
+        any(
+            shutil.which(tool) is None
+            for tool in ("pdfinfo", "pdftotext", "pdftoppm")
+        ),
+        reason="Poppler pdfinfo/pdftotext/pdftoppm are not installed",
+    )
+    def test_real_poppler_pdf_inspect_extract_render_smoke(
+        self, tmp_path
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        first = PillowImage.new("RGB", (16, 12), "white")
+        second = PillowImage.new("RGB", (16, 12), "black")
+        first.save(
+            evidence / "two-pages.pdf",
+            save_all=True,
+            append_images=[second],
+            resolution=72,
+        )
+        first.close()
+        second.close()
+
+        inspected = inspect_artifact(
+            "two-pages.pdf",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+        extracted = extract_artifact(
+            "two-pages.pdf",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["page:1"],
+        )
+        outputs = render_artifact(
+            "two-pages.pdf",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["page:2"],
+            max_pixels=10_000,
+        )
+
+        assert inspected["pages"] == 2
+        assert extracted["page_text"][0]["page"] == 1
+        assert len(outputs) == 1
+        with PillowImage.open(outputs[0]) as rendered:
+            assert rendered.format == "PNG"
+            assert rendered.width > 0
+            assert rendered.height > 0
+
+
 class TestArtifactCtl:
     def _run(self, capsys, argv):
         code = artifactctl_main(argv)
