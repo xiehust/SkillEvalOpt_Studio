@@ -201,6 +201,16 @@ class SkillEvalDataLoader(SplitDataLoader):
         items = _normalize_items(_load_json_or_jsonl(data_path), data_path)
         return self._normalize_plugin_metadata(items)
 
+    def write_split_items(self, split_path: str, items: list[dict]) -> None:
+        serialized_items: list[dict] = []
+        for item in items:
+            serialized = dict(item)
+            mode_explicit = serialized.pop("_judge_mode_explicit")
+            if not mode_explicit:
+                serialized.pop("judge_mode", None)
+            serialized_items.append(serialized)
+        super().write_split_items(split_path, serialized_items)
+
     def load_split_items(self, split_path: str) -> list[dict]:
         items = super().load_split_items(split_path)
         normalized = _normalize_items(items, split_path)

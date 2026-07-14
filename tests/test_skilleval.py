@@ -996,6 +996,32 @@ def _make_split_dir(tmp_path, counts=(2, 1, 1)):
 
 
 class TestSkillEvalDataLoader:
+    @staticmethod
+    def _ratio_round_trip(tmp_path, items, name):
+        data_path = tmp_path / f"{name}.json"
+        data_path.write_text(json.dumps(items), encoding="utf-8")
+        split_dir = tmp_path / f"{name}-split"
+
+        materializer = SkillEvalDataLoader(
+            data_path=str(data_path),
+            split_mode="ratio",
+            split_ratio="1:1:1",
+            split_output_dir=str(split_dir),
+        )
+        materializer.setup({})
+
+        reloaded = SkillEvalDataLoader(
+            split_dir=str(split_dir),
+            split_mode="split_dir",
+        )
+        reloaded.setup({})
+        loaded = reloaded.train_items + reloaded.val_items + reloaded.test_items
+        serialized = []
+        for split_name in ("train", "val", "test"):
+            split_path = split_dir / split_name / "items.json"
+            serialized.extend(json.loads(split_path.read_text(encoding="utf-8")))
+        return loaded, serialized
+
     def test_loads_and_validates_splits(self, tmp_path) -> None:
         loader = SkillEvalDataLoader(split_dir=_make_split_dir(tmp_path), split_mode="split_dir")
         loader.setup({})
@@ -1015,6 +1041,39 @@ class TestSkillEvalDataLoader:
         loader = SkillEvalDataLoader(split_dir=str(split), split_mode="split_dir")
         with pytest.raises(ValueError, match="rubric"):
             loader.setup({})
+
+    def test_ratio_split_reload_preserves_omitted_judge_mode(self, tmp_path) -> None:
+        items = [
+            _valid_item(f"implicit-{index}", _judge_mode_explicit=True)
+            for index in range(3)
+        ]
+        loaded, serialized = self._ratio_round_trip(tmp_path, items, "implicit")
+
+        assert all(item["judge_mode"] == "auto" for item in loaded)
+        assert all(item["_judge_mode_explicit"] is False for item in loaded)
+        assert all("judge_mode" not in item for item in serialized)
+        assert all("_judge_mode_explicit" not in item for item in serialized)
+
+    @pytest.mark.parametrize("mode", ["auto", "agentic", "chat"])
+    def test_ratio_split_reload_preserves_explicit_judge_mode(
+        self,
+        tmp_path,
+        mode,
+    ) -> None:
+        items = [
+            _valid_item(
+                f"{mode}-{index}",
+                judge_mode=mode,
+                _judge_mode_explicit=False,
+            )
+            for index in range(3)
+        ]
+        loaded, serialized = self._ratio_round_trip(tmp_path, items, mode)
+
+        assert all(item["judge_mode"] == mode for item in loaded)
+        assert all(item["_judge_mode_explicit"] is True for item in loaded)
+        assert all(item["judge_mode"] == mode for item in serialized)
+        assert all("_judge_mode_explicit" not in item for item in serialized)
 
 
 class TestSkillEvalAdapter:
