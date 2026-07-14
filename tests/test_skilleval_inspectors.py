@@ -8,12 +8,14 @@ import hashlib
 import json
 import multiprocessing
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
 import types
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -1707,6 +1709,565 @@ class TestRegistry:
                     pytest.fail("over-budget transaction entered")
 
         assert set(os.listdir("/proc/self/fd")) == before
+
+
+class TestSpreadsheetInspector:
+    @staticmethod
+    def _save_xlsx(path: Path, *, formula: bool = True) -> None:
+        from openpyxl import Workbook
+
+        book = Workbook()
+        sheet = book.active
+        sheet.title = "Summary"
+        sheet["A1"] = "Revenue"
+        sheet["B1"] = 10
+        sheet["B2"] = 20
+        if formula:
+            sheet["B3"] = "=SUM(B1:B2)"
+        sheet.merge_cells("A5:B5")
+        book.save(path)
+        book.close()
+
+    def test_xlsx_inspection_reports_values_formulas_and_layout(
+        self, tmp_path
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "report.xlsx"
+        self._save_xlsx(path)
+
+        result = inspect_artifact(
+            "report.xlsx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        assert result["kind"] == "spreadsheet"
+        assert result["opens"] is True
+        summary = result["sheets"][0]
+        assert summary["name"] == "Summary"
+        assert summary["used_range"] == "A1:B5"
+        assert summary["cells"]["B3"] == {
+            "coordinate": "B3",
+            "value": None,
+            "cached_value": None,
+            "formula": "=SUM(B1:B2)",
+            "number_format": "General",
+            "style_id": 0,
+        }
+        assert "A5:B5" in summary["merged_ranges"]
+        assert isinstance(summary["charts"], list)
+        assert isinstance(summary["drawings"], list)
+
+    def test_xlsx_loads_formula_and_cached_views(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        self._save_xlsx(evidence / "report.xlsx")
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        calls = []
+        real_load = spreadsheet.openpyxl.load_workbook
+
+        def recording_load(*args, **kwargs):
+            calls.append(kwargs.get("data_only"))
+            return real_load(*args, **kwargs)
+
+        monkeypatch.setattr(spreadsheet.openpyxl, "load_workbook", recording_load)
+
+        inspect_artifact(
+            "report.xlsx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        assert calls == [False, True]
+
+    def test_xlsx_check_evaluator_is_deterministic(self, tmp_path) -> None:
+        from openpyxl import Workbook
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            evaluate_xlsx_check,
+        )
+
+        path = tmp_path / "report.xlsx"
+        book = Workbook()
+        book.active.title = "Summary"
+        book.active["B12"] = "=SUM(B2:B11)"
+        book.active["C12"] = 1
+        book.save(path)
+        book.close()
+
+        formula_check = {
+            "id": "formula",
+            "type": "xlsx_formula",
+            "path": "report.xlsx",
+            "required": True,
+            "weight": 1.0,
+            "spec": {
+                "sheet": "Summary",
+                "cell": "B12",
+                "formula": "SUM(B2:B11)",
+            },
+        }
+        cell_check = {
+            "id": "cell",
+            "type": "xlsx_cell",
+            "path": "report.xlsx",
+            "required": True,
+            "weight": 1.0,
+            "spec": {"sheet": "Summary", "cell": "C12", "value": 1},
+        }
+
+        assert evaluate_xlsx_check(str(path), formula_check) == {
+            "id": "formula",
+            "passed": True,
+            "score": 1.0,
+            "reason": "formula matches exactly",
+            "evidence": [
+                {
+                    "path": "report.xlsx",
+                    "locator": "sheet=Summary,cell=B12",
+                    "source": "structure",
+                }
+            ],
+        }
+        assert evaluate_xlsx_check(str(path), cell_check)["passed"] is True
+        cell_check["spec"]["value"] = True
+        assert evaluate_xlsx_check(str(path), cell_check)["passed"] is False
+
+    @pytest.mark.parametrize(
+        ("sheet_name", "cell_ref", "reason"),
+        [
+            ("Missing", "A1", "worksheet"),
+            ("Summary", "Z99", "cell"),
+        ],
+    )
+    def test_xlsx_check_missing_sheet_or_cell_fails_deterministically(
+        self, tmp_path, sheet_name, cell_ref, reason
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            evaluate_xlsx_check,
+        )
+
+        path = tmp_path / "report.xlsx"
+        self._save_xlsx(path)
+        check = {
+            "id": "missing",
+            "type": "xlsx_cell",
+            "path": "report.xlsx",
+            "spec": {
+                "sheet": sheet_name,
+                "cell": cell_ref,
+                "value": "expected",
+            },
+        }
+
+        result = evaluate_xlsx_check(str(path), check)
+
+        assert result["passed"] is False
+        assert result["score"] == 0.0
+        assert reason in result["reason"]
+
+    def test_xlsx_sparse_extreme_dimension_is_paginated_without_grid_walk(
+        self, tmp_path
+    ) -> None:
+        from openpyxl import Workbook
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "sparse.xlsx"
+        book = Workbook()
+        sheet = book.active
+        sheet.title = "Summary"
+        for row in range(1, 131):
+            sheet.cell(row=row, column=1, value=row)
+        sheet["XFD1048576"] = "edge"
+        book.save(path)
+        book.close()
+
+        inspected = inspect_artifact(
+            "sparse.xlsx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+        summary = inspected["sheets"][0]
+
+        assert summary["max_row"] == 1_048_576
+        assert summary["max_column"] == 16_384
+        assert summary["cell_page"] == {
+            "page": 1,
+            "page_size": 128,
+            "total": 131,
+            "returned": 128,
+            "omitted": 3,
+            "omitted_due_to_budget": 0,
+        }
+        assert "XFD1048576" not in summary["cells"]
+
+        extracted = extract_artifact(
+            "sparse.xlsx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["sheet:Summary:page:2"],
+        )
+        page = extracted["sheets"][0]
+        assert list(page["cells"]) == ["A129", "A130", "XFD1048576"]
+        assert page["cell_page"]["omitted"] == 128
+
+    def test_xlsx_extraction_omits_oversized_cell_with_budget_metadata(
+        self, tmp_path
+    ) -> None:
+        from openpyxl import Workbook
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "large-cell.xlsx"
+        book = Workbook()
+        book.active.title = "Summary"
+        book.active["A1"] = "x" * 10_000
+        book.save(path)
+        book.close()
+
+        extracted = extract_artifact(
+            "large-cell.xlsx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["sheet:Summary"],
+            max_extract_chars=2_000,
+            max_response_bytes=2_000,
+        )
+
+        page = extracted["sheets"][0]
+        assert page["cells"] == {}
+        assert page["cell_page"]["returned"] == 0
+        assert page["cell_page"]["omitted_due_to_budget"] == 1
+
+    @pytest.mark.parametrize(
+        "unsafe_name",
+        [
+            "../escape.xml",
+            "/absolute.xml",
+            "xl\\evil.xml",
+            "xl//evil.xml",
+            "C:/absolute.xml",
+        ],
+    )
+    def test_xlsx_preflight_rejects_unsafe_zip_entries(
+        self, tmp_path, unsafe_name
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        path = tmp_path / "unsafe.xlsx"
+        self._save_xlsx(path)
+        with zipfile.ZipFile(path, "a") as archive:
+            archive.writestr(unsafe_name, "unsafe")
+
+        with pytest.raises(InspectionError, match="unsafe OOXML entry"):
+            preflight_xlsx(str(path))
+
+    @pytest.mark.parametrize(
+        "colliding_name",
+        [
+            "xl/workbook.xml",
+            "XL/workbook.xml",
+            "xl/WORKBOOK.XML",
+            "xl/cafe\u0301.xml",
+        ],
+    )
+    def test_xlsx_preflight_rejects_duplicate_or_unicode_case_collision(
+        self, tmp_path, colliding_name
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        path = tmp_path / "collision.xlsx"
+        self._save_xlsx(path)
+        if colliding_name == "xl/workbook.xml":
+            with pytest.warns(UserWarning, match="Duplicate name"):
+                with zipfile.ZipFile(path, "a") as archive:
+                    archive.writestr(colliding_name, "second")
+        else:
+            with zipfile.ZipFile(path, "a") as archive:
+                if "cafe" in colliding_name:
+                    archive.writestr("xl/caf\u00e9.xml", "first")
+                archive.writestr(colliding_name, "second")
+
+        with pytest.raises(InspectionError, match="colliding OOXML entry"):
+            preflight_xlsx(str(path))
+
+    def test_xlsx_preflight_rejects_entry_count_size_and_ratio_limits(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        path = tmp_path / "limits.xlsx"
+        self._save_xlsx(path)
+        with zipfile.ZipFile(path, "a", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("xl/media/repetitive.bin", b"0" * 1_000_000)
+
+        with zipfile.ZipFile(path) as archive:
+            members = archive.infolist()
+            declared = sum(info.file_size for info in members)
+
+        monkeypatch.setattr(spreadsheet, "_MAX_OOXML_ENTRIES", len(members) - 1)
+        with pytest.raises(InspectionError, match="entry count"):
+            spreadsheet.preflight_xlsx(str(path))
+
+        monkeypatch.setattr(spreadsheet, "_MAX_OOXML_ENTRIES", len(members))
+        monkeypatch.setattr(
+            spreadsheet,
+            "_MAX_OOXML_UNCOMPRESSED_BYTES",
+            declared - 1,
+        )
+        with pytest.raises(InspectionError, match="uncompressed"):
+            spreadsheet.preflight_xlsx(str(path))
+
+        monkeypatch.setattr(
+            spreadsheet,
+            "_MAX_OOXML_UNCOMPRESSED_BYTES",
+            declared,
+        )
+        monkeypatch.setattr(spreadsheet, "_MAX_COMPRESSION_RATIO", 2.0)
+        with pytest.raises(InspectionError, match="compression ratio"):
+            spreadsheet.preflight_xlsx(str(path))
+
+    def test_xlsx_preflight_rejects_unsupported_compression_and_content_type(
+        self, tmp_path
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        unsupported = tmp_path / "unsupported.xlsx"
+        self._save_xlsx(unsupported)
+        with zipfile.ZipFile(
+            unsupported,
+            "a",
+            compression=zipfile.ZIP_BZIP2,
+        ) as archive:
+            archive.writestr("xl/media/unsupported.bin", "payload")
+        with pytest.raises(InspectionError, match="compression"):
+            preflight_xlsx(str(unsupported))
+
+        mismatched = tmp_path / "mismatched.xlsx"
+        content_types = (
+            '<?xml version="1.0"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Override PartName="/word/document.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.'
+            'wordprocessingml.document.main+xml"/>'
+            "</Types>"
+        )
+        with zipfile.ZipFile(mismatched, "w") as archive:
+            archive.writestr("[Content_Types].xml", content_types)
+            archive.writestr("xl/workbook.xml", "<workbook/>")
+        with pytest.raises(InspectionError, match="content types"):
+            preflight_xlsx(str(mismatched))
+
+    def test_xlsx_preflight_rejects_encrypted_nonregular_and_nul_entries(
+        self,
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        encrypted = zipfile.ZipInfo("xl/encrypted.bin")
+        encrypted.flag_bits = 0x1
+        with pytest.raises(InspectionError, match="encrypted"):
+            spreadsheet._validate_member_type(encrypted)
+
+        linked = zipfile.ZipInfo("xl/linked.bin")
+        linked.create_system = 3
+        linked.external_attr = 0o120777 << 16
+        with pytest.raises(InspectionError, match="non-regular"):
+            spreadsheet._validate_member_type(linked)
+
+        nul_name = zipfile.ZipInfo("xl/good.xml")
+        nul_name.orig_filename = "xl/\x00evil.xml"
+        with pytest.raises(InspectionError, match="unsafe"):
+            spreadsheet._validate_member_name(nul_name)
+
+    def test_xlsx_corrupt_workbook_raises_controlled_error(self, tmp_path) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            evaluate_xlsx_check,
+        )
+
+        path = tmp_path / "corrupt.xlsx"
+        path.write_bytes(b"PK\x03\x04corrupt")
+        check = {
+            "id": "cell",
+            "type": "xlsx_cell",
+            "path": "corrupt.xlsx",
+            "spec": {"sheet": "Summary", "cell": "A1", "value": 1},
+        }
+
+        with pytest.raises(InspectionError, match="OOXML|workbook"):
+            evaluate_xlsx_check(str(path), check)
+
+    def test_xlsx_render_converts_to_pdf_and_delegates_with_budget(
+        self, tmp_path, fake_pdf_inspector
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        self._save_xlsx(evidence / "report.xlsx")
+
+        outputs = render_artifact(
+            "report.xlsx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["page:1"],
+            max_pixels=321,
+        )
+
+        render_call = fake_pdf_inspector.calls[-1]
+        assert render_call[0] == "render"
+        assert render_call[1].endswith(".pdf")
+        assert render_call[3] == ["page:1"]
+        assert render_call[4].max_pixels == 321
+        assert all("lo-profile" not in output for output in outputs)
+        assert all("lo-render" not in output for output in outputs)
+
+    def test_xlsx_render_rejects_non_pdf_selector_before_conversion(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        self._save_xlsx(evidence / "report.xlsx")
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        monkeypatch.setattr(
+            spreadsheet,
+            "_convert_with_libreoffice",
+            lambda *args, **kwargs: pytest.fail("conversion must not run"),
+        )
+
+        with pytest.raises(InspectionError, match="render selector"):
+            render_artifact(
+                "report.xlsx",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+                selectors=["sheet:Summary"],
+            )
+
+    def test_libreoffice_xls_conversion_uses_fresh_hardened_profile(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from openpyxl import Workbook
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            evaluate_xlsx_check,
+        )
+
+        path = tmp_path / "legacy.xls"
+        path.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1legacy")
+        observed = {}
+
+        def fake_run(command, *, timeout, cwd, home, pass_fds=()):
+            observed["command"] = command
+            observed["cwd"] = cwd
+            observed["home"] = home
+            profile_arg = next(
+                part
+                for part in command
+                if part.startswith("-env:UserInstallation=")
+            )
+            observed["profile_arg"] = profile_arg
+            profile_path = profile_arg.split("file://", 1)[1]
+            observed["profile_config"] = (
+                Path(profile_path) / "user" / "registrymodifications.xcu"
+            ).read_text(encoding="utf-8")
+            replacement = tmp_path / "replacement.xls"
+            replacement.write_bytes(b"REPLACED")
+            os.replace(replacement, path)
+            observed["input_path"] = command[-1]
+            observed["input_payload"] = Path(command[-1]).read_bytes()
+            out_dir = Path(command[command.index("--outdir") + 1])
+            book = Workbook()
+            book.active.title = "Summary"
+            book.active["A1"] = 7
+            book.save(out_dir / f"{Path(command[-1]).stem}.xlsx")
+            book.close()
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        monkeypatch.setattr(
+            spreadsheet,
+            "_find_libreoffice",
+            lambda: "/mock/libreoffice",
+        )
+        monkeypatch.setattr(spreadsheet, "safe_run", fake_run)
+        check = {
+            "id": "legacy",
+            "type": "xlsx_cell",
+            "path": "legacy.xls",
+            "spec": {"sheet": "Summary", "cell": "A1", "value": 7},
+        }
+
+        assert evaluate_xlsx_check(str(path), check)["passed"] is True
+        assert "--headless" in observed["command"]
+        assert observed["profile_arg"].startswith(
+            "-env:UserInstallation=file://"
+        )
+        assert str(tmp_path) not in observed["profile_arg"]
+        assert observed["home"] != str(tmp_path)
+        assert "MacroSecurityLevel" in observed["profile_config"]
+        assert "org.openoffice.Office.Calc/Content/Update" in (
+            observed["profile_config"]
+        )
+        assert '<prop oor:name="Link"' in observed["profile_config"]
+        assert observed["input_path"].startswith("/proc/self/fd/")
+        assert observed["input_payload"].startswith(
+            b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+        )
+
+    def test_libreoffice_conversion_requires_expected_output(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            evaluate_xlsx_check,
+        )
+
+        path = tmp_path / "legacy.xls"
+        path.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1legacy")
+        monkeypatch.setattr(
+            spreadsheet,
+            "_find_libreoffice",
+            lambda: "/mock/libreoffice",
+        )
+        monkeypatch.setattr(
+            spreadsheet,
+            "safe_run",
+            lambda command, **kwargs: subprocess.CompletedProcess(
+                command, 0, "", ""
+            ),
+        )
+        check = {
+            "id": "legacy",
+            "type": "xlsx_cell",
+            "path": "legacy.xls",
+            "spec": {"sheet": "Summary", "cell": "A1", "value": 7},
+        }
+
+        with pytest.raises(InspectionError, match="expected output"):
+            evaluate_xlsx_check(str(path), check)
+
+    @pytest.mark.skipif(
+        shutil.which("libreoffice") is None,
+        reason="LibreOffice is not installed",
+    )
+    def test_libreoffice_xlsx_render_smoke(
+        self, tmp_path, fake_pdf_inspector
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        self._save_xlsx(evidence / "report.xlsx")
+
+        outputs = render_artifact(
+            "report.xlsx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["page:1"],
+            max_pixels=10_000,
+        )
+
+        assert len(outputs) == 1
+        assert Path(outputs[0]).is_file()
+        assert fake_pdf_inspector.calls[-1][0] == "render"
 
 
 class TestArtifactCtl:
