@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import stat
+import struct
 import subprocess
 import zipfile
 from dataclasses import asdict, dataclass
@@ -80,6 +81,16 @@ _OOXML_MARKERS = {
 _OOXML_PREFIXES = {"xlsx": "xl/", "docx": "word/", "pptx": "ppt/"}
 _HASH_CHUNK_SIZE = 1024 * 1024
 _DEFAULT_MAX_BYTES = 100 * 1024 * 1024
+_ZIP_EOCD_SIZE = 22
+_ZIP_MAX_COMMENT_BYTES = 65535
+_MAX_OOXML_ENTRIES = 10_000
+_MAX_OOXML_CENTRAL_DIRECTORY_BYTES = 16 * 1024 * 1024
+_HAS_REQUIRED_DIR_FD = all(
+    function in os.supports_dir_fd
+    for function in (os.open, os.stat, os.mkdir, os.unlink, os.rmdir)
+)
+_HAS_STAT_NOFOLLOW = os.stat in os.supports_follow_symlinks
+_HAS_SCANDIR_FD = os.scandir in os.supports_fd
 
 
 @dataclass(frozen=True)
@@ -99,7 +110,19 @@ class EvidenceSnapshot:
     files: tuple[ManifestEntry, ...]
 
 
-class EvidenceLimitError(ValueError):
+class ArtifactValidationError(ValueError):
+    """Raised when target-produced filesystem state is invalid."""
+
+
+class ArtifactCollectionError(RuntimeError):
+    """Raised when evaluator infrastructure cannot securely collect artifacts."""
+
+
+class ArtifactConfigurationError(ArtifactCollectionError, ValueError):
+    """Raised when evaluator paths or configuration are unsafe."""
+
+
+class EvidenceLimitError(ArtifactValidationError):
     """Raised when candidate evidence exceeds its configured byte limit."""
 
 
@@ -114,27 +137,59 @@ class _JudgeDirs:
     evidence_descriptor: int
     scratch_descriptor: int
 
-    def close(self) -> None:
-        for descriptor in (
-            self.scratch_descriptor,
-            self.evidence_descriptor,
-            self.root_descriptor,
-            self.parent_descriptor,
-        ):
+    def close_children(self) -> None:
+        for name in ("scratch_descriptor", "evidence_descriptor", "root_descriptor"):
+            descriptor = getattr(self, name)
             if descriptor >= 0:
                 os.close(descriptor)
+                setattr(self, name, -1)
+
+    def close(self) -> None:
+        self.close_children()
+        if self.parent_descriptor >= 0:
+            os.close(self.parent_descriptor)
+            self.parent_descriptor = -1
 
 
 def _normalized_mime(mime: str | None) -> str:
     return (mime or "").split(";", 1)[0].strip().lower()
 
 
+def _require_secure_filesystem_capabilities() -> None:
+    missing: list[str] = []
+    for name in ("O_NOFOLLOW", "O_DIRECTORY"):
+        if not getattr(os, name, 0):
+            missing.append(name)
+    if not _HAS_REQUIRED_DIR_FD:
+        missing.append("dir_fd")
+    if not _HAS_STAT_NOFOLLOW:
+        missing.append("follow_symlinks=False")
+    if not _HAS_SCANDIR_FD:
+        missing.append("scandir(fd)")
+    if missing:
+        raise ArtifactCollectionError(
+            "secure artifact collection requires POSIX capabilities: "
+            + ", ".join(missing)
+        )
+
+
 def _directory_flags() -> int:
-    return os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
 def _file_flags() -> int:
-    return os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    return os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+
+
+def _raise_artifact_open_error(
+    exc: OSError,
+    *,
+    validation_message: str,
+    collection_message: str,
+) -> None:
+    if exc.errno in {errno.ELOOP, errno.ENOENT, errno.ENOTDIR}:
+        raise ArtifactValidationError(validation_message) from exc
+    raise ArtifactCollectionError(f"{collection_message}: {exc}") from exc
 
 
 def _stat_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
@@ -178,14 +233,61 @@ def _safe_zip_member(name: str) -> bool:
     return not path.is_absolute() and ".." not in path.parts
 
 
+def _preflight_zip_descriptor(descriptor: int) -> bool:
+    file_size = os.fstat(descriptor).st_size
+    tail_size = min(file_size, _ZIP_EOCD_SIZE + _ZIP_MAX_COMMENT_BYTES)
+    if tail_size < _ZIP_EOCD_SIZE:
+        return False
+    tail_offset = file_size - tail_size
+    tail = _read_descriptor(descriptor, tail_size, tail_offset)
+    eocd_index = tail.rfind(b"PK\x05\x06")
+    if eocd_index < 0 or eocd_index + _ZIP_EOCD_SIZE > len(tail):
+        return False
+    try:
+        (
+            _signature,
+            disk_number,
+            central_directory_disk,
+            entries_on_disk,
+            total_entries,
+            central_directory_size,
+            central_directory_offset,
+            comment_size,
+        ) = struct.unpack_from("<4s4H2LH", tail, eocd_index)
+    except struct.error:
+        return False
+    if eocd_index + _ZIP_EOCD_SIZE + comment_size != len(tail):
+        return False
+    if disk_number != 0 or central_directory_disk != 0:
+        return False
+    if entries_on_disk != total_entries:
+        return False
+    if (
+        entries_on_disk == 0xFFFF
+        or total_entries == 0xFFFF
+        or central_directory_size == 0xFFFFFFFF
+        or central_directory_offset == 0xFFFFFFFF
+    ):
+        return False
+    if (
+        total_entries > _MAX_OOXML_ENTRIES
+        or central_directory_size > _MAX_OOXML_CENTRAL_DIRECTORY_BYTES
+    ):
+        return False
+    eocd_offset = tail_offset + eocd_index
+    return central_directory_offset + central_directory_size <= eocd_offset
+
+
 def _inspect_ooxml_descriptor(descriptor: int) -> str | None:
+    if not _preflight_zip_descriptor(descriptor):
+        return None
     position = os.lseek(descriptor, 0, os.SEEK_CUR)
     try:
         os.lseek(descriptor, 0, os.SEEK_SET)
         with os.fdopen(os.dup(descriptor), "rb") as source:
             with zipfile.ZipFile(source) as archive:
                 members = archive.infolist()
-                if len(members) > 10000:
+                if len(members) > _MAX_OOXML_ENTRIES:
                     return None
                 names: set[str] = set()
                 content_types_info = None
@@ -266,6 +368,7 @@ def detect_artifact_kind(path: str, mime: str | None = None) -> str | None:
     A specific MIME type is authoritative. Generic MIME types are resolved by
     safe signature/container inspection before a supported suffix is used.
     """
+    _require_secure_filesystem_capabilities()
     detected_mime = _normalized_mime(mime)
     if mime is not None:
         specific_kind = _SPECIFIC_MIME_KINDS.get(detected_mime)
@@ -310,7 +413,11 @@ def _open_absolute_directory(path: str) -> int:
             try:
                 next_descriptor = os.open(part, _directory_flags(), dir_fd=current)
             except OSError as exc:
-                raise ValueError(f"directory path must not contain symlinks: {path}") from exc
+                _raise_artifact_open_error(
+                    exc,
+                    validation_message=f"directory path must not contain symlinks: {path}",
+                    collection_message=f"directory path could not be opened: {path}",
+                )
             os.close(current)
             current = next_descriptor
         return current
@@ -367,7 +474,11 @@ def _scan_directory(
             try:
                 child_descriptor = os.open(name, _directory_flags(), dir_fd=directory_descriptor)
             except OSError as exc:
-                raise ValueError(f"symlink directory is not allowed: {rel}") from exc
+                _raise_artifact_open_error(
+                    exc,
+                    validation_message=f"symlink directory is not allowed: {rel}",
+                    collection_message=f"artifact directory could not be opened: {rel}",
+                )
             try:
                 opened = os.fstat(child_descriptor)
                 if _stat_identity(info) != _stat_identity(opened):
@@ -414,7 +525,11 @@ def _scan_directory(
         try:
             descriptor = os.open(name, _file_flags(), dir_fd=directory_descriptor)
         except OSError as exc:
-            raise ValueError(f"symlink is not allowed in artifact workspace: {rel}") from exc
+            _raise_artifact_open_error(
+                exc,
+                validation_message=f"symlink is not allowed in artifact workspace: {rel}",
+                collection_message=f"artifact file could not be opened: {rel}",
+            )
         try:
             opened = os.fstat(descriptor)
             if _stat_identity(info) != _stat_identity(opened):
@@ -489,11 +604,25 @@ def _scan_manifest_descriptor(
 
 def build_manifest(root: str) -> dict[str, ManifestEntry]:
     """Build a deterministic manifest of regular, non-runtime files in *root*."""
-    rows, _directories = _scan_manifest(
-        root,
-        skip_runtime=True,
-        require_single_link=True,
-    )
+    _require_secure_filesystem_capabilities()
+    try:
+        rows, _directories = _scan_manifest(
+            root,
+            skip_runtime=True,
+            require_single_link=True,
+        )
+    except ArtifactValidationError:
+        raise
+    except ValueError as exc:
+        raise ArtifactValidationError(str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise ArtifactValidationError(
+            f"artifact workspace changed during collection: {root}"
+        ) from exc
+    except OSError as exc:
+        raise ArtifactCollectionError(
+            f"artifact workspace could not be collected: {root}: {exc}"
+        ) from exc
     return rows
 
 
@@ -597,6 +726,75 @@ def _same_filesystem_object(left: os.stat_result, right: os.stat_result) -> bool
     )
 
 
+def _directory_is_at_or_below(
+    directory_descriptor: int,
+    ancestor_info: os.stat_result,
+) -> bool:
+    current = os.dup(directory_descriptor)
+    try:
+        while True:
+            current_info = os.fstat(current)
+            if _same_filesystem_object(current_info, ancestor_info):
+                return True
+            parent = os.open("..", _directory_flags(), dir_fd=current)
+            parent_info = os.fstat(parent)
+            if _same_filesystem_object(current_info, parent_info):
+                os.close(parent)
+                return False
+            os.close(current)
+            current = parent
+    finally:
+        os.close(current)
+
+
+def _open_existing_directory_prefix(path: str) -> tuple[int, tuple[str, ...]]:
+    path = os.path.abspath(path)
+    parts = tuple(part for part in path.split(os.sep)[1:] if part)
+    current = os.open(os.path.abspath(os.sep), _directory_flags())
+    try:
+        for index, part in enumerate(parts):
+            try:
+                next_descriptor = os.open(part, _directory_flags(), dir_fd=current)
+            except FileNotFoundError:
+                return current, parts[index:]
+            except OSError as exc:
+                raise ArtifactConfigurationError(
+                    f"judge root path must contain only real directories: {path}"
+                ) from exc
+            os.close(current)
+            current = next_descriptor
+        return current, ()
+    except Exception:
+        os.close(current)
+        raise
+
+
+def _reject_overlapping_roots(
+    work_descriptor: int,
+    work_dir: str,
+    judge_root: str,
+) -> None:
+    judge_prefix_descriptor, remaining = _open_existing_directory_prefix(judge_root)
+    try:
+        work_info = os.fstat(work_descriptor)
+        judge_prefix_info = os.fstat(judge_prefix_descriptor)
+        judge_inside_work = _directory_is_at_or_below(
+            judge_prefix_descriptor,
+            work_info,
+        )
+        work_inside_judge = (
+            not remaining
+            and _directory_is_at_or_below(work_descriptor, judge_prefix_info)
+        )
+        if judge_inside_work or work_inside_judge:
+            raise ArtifactConfigurationError(
+                "artifact workspace and judge root overlap: "
+                f"work_dir={work_dir!r}, judge_root={os.path.abspath(judge_root)!r}"
+            )
+    finally:
+        os.close(judge_prefix_descriptor)
+
+
 def _remove_directory_at(
     parent_descriptor: int,
     name: str,
@@ -639,13 +837,39 @@ def _remove_directory_at(
 
 def _open_created_directory(parent_descriptor: int, name: str, mode: int) -> int:
     os.mkdir(name, mode, dir_fd=parent_descriptor)
-    descriptor = os.open(name, _directory_flags(), dir_fd=parent_descriptor)
-    named = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
-    opened = os.fstat(descriptor)
-    if not stat.S_ISDIR(named.st_mode) or not _same_filesystem_object(named, opened):
-        os.close(descriptor)
-        raise ValueError(f"created directory changed unexpectedly: {name}")
-    return descriptor
+    created_info: os.stat_result | None = None
+    descriptor = -1
+    try:
+        created_info = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(created_info.st_mode):
+            raise ValueError(f"created entry is not a directory: {name}")
+        descriptor = os.open(name, _directory_flags(), dir_fd=parent_descriptor)
+        opened = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(named.st_mode)
+            or not _same_filesystem_object(created_info, opened)
+            or not _same_filesystem_object(created_info, named)
+        ):
+            raise ValueError(f"created directory changed unexpectedly: {name}")
+        return descriptor
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if created_info is not None:
+            try:
+                _remove_directory_at(
+                    parent_descriptor,
+                    name,
+                    expected=created_info,
+                )
+            except (FileNotFoundError, ValueError, OSError):
+                pass
+        raise
 
 
 def _validate_absolute_directory_identity(path: str, expected_descriptor: int) -> None:
@@ -733,36 +957,38 @@ def _prepare_judge_dirs(judge_root: str) -> _JudgeDirs:
 
 
 def _open_relative_file(root_descriptor: int, parts: tuple[str, ...]) -> int:
-    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     current = os.dup(root_descriptor)
     try:
         for part in parts[:-1]:
             try:
-                next_descriptor = os.open(part, directory_flags, dir_fd=current)
+                next_descriptor = os.open(part, _directory_flags(), dir_fd=current)
             except OSError as exc:
-                raise ValueError(
-                    f"artifact parent must be a real directory: {'/'.join(parts)}"
-                ) from exc
+                rel = "/".join(parts)
+                _raise_artifact_open_error(
+                    exc,
+                    validation_message=f"artifact parent must be a real directory: {rel}",
+                    collection_message=f"artifact parent could not be opened: {rel}",
+                )
             os.close(current)
             current = next_descriptor
         try:
             return os.open(
                 parts[-1],
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+                _file_flags(),
                 dir_fd=current,
             )
         except OSError as exc:
-            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
-                raise ValueError(
-                    f"artifact must be a regular file, not a symlink: {'/'.join(parts)}"
-                ) from exc
-            raise
+            rel = "/".join(parts)
+            _raise_artifact_open_error(
+                exc,
+                validation_message=f"artifact must be a regular file, not a symlink: {rel}",
+                collection_message=f"artifact file could not be opened: {rel}",
+            )
     finally:
         os.close(current)
 
 
 def _open_destination_file(root_descriptor: int, parts: tuple[str, ...]) -> int:
-    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     current = os.dup(root_descriptor)
     try:
         for part in parts[:-1]:
@@ -770,12 +996,12 @@ def _open_destination_file(root_descriptor: int, parts: tuple[str, ...]) -> int:
                 os.mkdir(part, 0o700, dir_fd=current)
             except FileExistsError:
                 pass
-            next_descriptor = os.open(part, directory_flags, dir_fd=current)
+            next_descriptor = os.open(part, _directory_flags(), dir_fd=current)
             os.close(current)
             current = next_descriptor
         return os.open(
             parts[-1],
-            os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
             0o600,
             dir_fd=current,
         )
@@ -859,24 +1085,15 @@ def _copy_validated_file(
 
 def _revalidate_source_entry(
     work_descriptor: int,
-    source_descriptor: int,
     parts: tuple[str, ...],
     initial_info: os.stat_result,
     row: dict,
 ) -> ManifestEntry:
     rel = "/".join(parts)
-    retained_info = os.fstat(source_descriptor)
-    if (
-        not stat.S_ISREG(retained_info.st_mode)
-        or retained_info.st_nlink != 1
-        or _stat_identity(retained_info) != _stat_identity(initial_info)
-    ):
-        raise ValueError(f"artifact source changed after evidence copy: {rel}")
-
     named_descriptor = _open_relative_file(work_descriptor, parts)
     try:
         named_info = os.fstat(named_descriptor)
-        if _stat_identity(named_info) != _stat_identity(retained_info):
+        if _stat_identity(named_info) != _stat_identity(initial_info):
             raise ValueError(f"artifact source name changed after evidence copy: {rel}")
         entry = _manifest_entry_from_descriptor(
             named_descriptor,
@@ -884,7 +1101,7 @@ def _revalidate_source_entry(
             require_single_link=True,
         )
         final_named_info = os.fstat(named_descriptor)
-        if _stat_identity(final_named_info) != _stat_identity(retained_info):
+        if _stat_identity(final_named_info) != _stat_identity(initial_info):
             raise ValueError(f"artifact source changed after evidence copy: {rel}")
     finally:
         os.close(named_descriptor)
@@ -905,25 +1122,11 @@ def _revalidate_source_entry(
 
 def _revalidate_destination_entry(
     evidence_descriptor: int,
-    destination_descriptor: int,
     parts: tuple[str, ...],
     copied_info: os.stat_result,
     expected: ManifestEntry,
 ) -> ManifestEntry:
     rel = "/".join(parts)
-    retained_info = os.fstat(destination_descriptor)
-    if (
-        not stat.S_ISREG(retained_info.st_mode)
-        or retained_info.st_nlink != 1
-        or not _same_filesystem_object(copied_info, retained_info)
-        or retained_info.st_size != expected.size
-        or stat.S_IMODE(retained_info.st_mode) != 0o444
-    ):
-        raise ValueError(f"copied evidence destination changed after locking: {rel}")
-    retained_size, retained_hash = _hash_descriptor(destination_descriptor)
-    if retained_size != expected.size or retained_hash != expected.sha256:
-        raise ValueError(f"copied evidence destination content changed: {rel}")
-
     named_descriptor = _open_relative_file(evidence_descriptor, parts)
     try:
         named_info = os.fstat(named_descriptor)
@@ -948,9 +1151,13 @@ def _revalidate_destination_entry(
 
     confirmation_descriptor = _open_relative_file(evidence_descriptor, parts)
     try:
-        if not _same_filesystem_object(
-            copied_info,
-            os.fstat(confirmation_descriptor),
+        confirmation_info = os.fstat(confirmation_descriptor)
+        if (
+            not stat.S_ISREG(confirmation_info.st_mode)
+            or confirmation_info.st_nlink != 1
+            or not _same_filesystem_object(copied_info, confirmation_info)
+            or confirmation_info.st_size != expected.size
+            or stat.S_IMODE(confirmation_info.st_mode) != 0o444
         ):
             raise ValueError(f"copied evidence destination name changed: {rel}")
     finally:
@@ -1012,9 +1219,11 @@ def create_evidence_snapshot(
     max_bytes: int = _DEFAULT_MAX_BYTES,
 ) -> EvidenceSnapshot:
     """Copy declared outputs into a byte-verified, read-only evidence tree."""
+    _require_secure_filesystem_capabilities()
     if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
         raise ValueError("max_bytes must be a non-negative integer")
     work_dir = os.path.abspath(os.fspath(work_dir))
+    judge_root = os.path.abspath(os.fspath(judge_root))
 
     selected: list[tuple[dict, tuple[str, ...]]] = []
     seen: set[str] = set()
@@ -1031,9 +1240,10 @@ def create_evidence_snapshot(
 
     work_descriptor = _open_absolute_directory(work_dir)
     prepared: _JudgeDirs | None = None
-    validated_sources: list[tuple[dict, tuple[str, ...], int, os.stat_result]] = []
-    copied_destinations: list[tuple[tuple[str, ...], int, os.stat_result]] = []
+    validated_sources: list[tuple[dict, tuple[str, ...], os.stat_result]] = []
+    copied_destinations: list[tuple[tuple[str, ...], os.stat_result]] = []
     try:
+        _reject_overlapping_roots(work_descriptor, work_dir, judge_root)
         prepared = _prepare_judge_dirs(judge_root)
         evidence = prepared.evidence_path
         scratch = prepared.scratch_path
@@ -1041,11 +1251,15 @@ def create_evidence_snapshot(
         for row, parts in selected:
             rel = "/".join(parts)
             source_descriptor = _open_relative_file(work_descriptor, parts)
-            info = os.fstat(source_descriptor)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            try:
+                info = os.fstat(source_descriptor)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise ValueError(
+                        f"artifact must be a single-link regular file: {rel}"
+                    )
+            finally:
                 os.close(source_descriptor)
-                raise ValueError(f"artifact must be a single-link regular file: {rel}")
-            validated_sources.append((row, parts, source_descriptor, info))
+            validated_sources.append((row, parts, info))
             total_bytes += info.st_size
             if total_bytes > max_bytes:
                 raise EvidenceLimitError(
@@ -1053,17 +1267,21 @@ def create_evidence_snapshot(
                 )
 
         copied_total = 0
-        for row, parts, source_descriptor, info in validated_sources:
+        for row, parts, info in validated_sources:
             rel = "/".join(parts)
             if info.st_size > max_bytes - copied_total:
                 raise EvidenceLimitError(
                     f"candidate output bytes exceed configured limit {max_bytes}"
                 )
-            destination_descriptor = _open_destination_file(
-                prepared.evidence_descriptor,
-                parts,
-            )
+            source_descriptor = _open_relative_file(work_descriptor, parts)
+            destination_descriptor = -1
             try:
+                if _stat_identity(os.fstat(source_descriptor)) != _stat_identity(info):
+                    raise ValueError(f"artifact source changed before evidence copy: {rel}")
+                destination_descriptor = _open_destination_file(
+                    prepared.evidence_descriptor,
+                    parts,
+                )
                 copied = _copy_validated_file(
                     source_descriptor,
                     destination_descriptor,
@@ -1074,11 +1292,12 @@ def create_evidence_snapshot(
                 )
                 copied_total += copied
                 copied_destinations.append(
-                    (parts, destination_descriptor, os.fstat(destination_descriptor))
+                    (parts, os.fstat(destination_descriptor))
                 )
-            except Exception:
-                os.close(destination_descriptor)
-                raise
+            finally:
+                if destination_descriptor >= 0:
+                    os.close(destination_descriptor)
+                os.close(source_descriptor)
 
         evidence_rows, evidence_directories = _scan_manifest_descriptor(
             prepared.evidence_descriptor,
@@ -1090,7 +1309,7 @@ def create_evidence_snapshot(
             raise RuntimeError("unexpected directory in copied evidence")
         manifest_descriptor = os.open(
             "artifact-manifest.json",
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
             0o600,
             dir_fd=prepared.scratch_descriptor,
         )
@@ -1115,24 +1334,22 @@ def create_evidence_snapshot(
         expected_entries = tuple(
             _revalidate_source_entry(
                 work_descriptor,
-                source_descriptor,
                 parts,
                 info,
                 row,
             )
-            for row, parts, source_descriptor, info in validated_sources
+            for row, parts, info in validated_sources
         )
         if len(copied_destinations) != len(expected_entries):
             raise RuntimeError("copied evidence destination set is incomplete")
         destination_entries = tuple(
             _revalidate_destination_entry(
                 prepared.evidence_descriptor,
-                destination_descriptor,
                 parts,
                 copied_info,
                 expected_entries[index],
             )
-            for index, (parts, destination_descriptor, copied_info) in enumerate(
+            for index, (parts, copied_info) in enumerate(
                 copied_destinations
             )
         )
@@ -1164,21 +1381,30 @@ def create_evidence_snapshot(
             files=final_entries,
         )
     except Exception:
+        if work_descriptor >= 0:
+            os.close(work_descriptor)
+            work_descriptor = -1
         if prepared is not None:
+            expected_root = None
             try:
-                _remove_directory_at(
-                    prepared.parent_descriptor,
-                    prepared.root_name,
-                    expected=os.fstat(prepared.root_descriptor),
-                )
-            except (FileNotFoundError, ValueError, OSError):
-                pass
+                if prepared.root_descriptor >= 0:
+                    expected_root = os.fstat(prepared.root_descriptor)
+            except OSError:
+                expected_root = None
+            finally:
+                prepared.close_children()
+            if expected_root is not None:
+                try:
+                    _remove_directory_at(
+                        prepared.parent_descriptor,
+                        prepared.root_name,
+                        expected=expected_root,
+                    )
+                except (FileNotFoundError, ValueError, OSError):
+                    pass
+            prepared.close()
         raise
     finally:
-        for _parts, destination_descriptor, _info in copied_destinations:
-            os.close(destination_descriptor)
-        for _row, _parts, source_descriptor, _info in validated_sources:
-            os.close(source_descriptor)
         if work_descriptor >= 0:
             os.close(work_descriptor)
         if prepared is not None:
@@ -1188,6 +1414,7 @@ def create_evidence_snapshot(
 def verify_evidence_snapshot(snapshot: EvidenceSnapshot) -> None:
     """Raise if an evidence snapshot's path set or bytes have changed."""
     try:
+        _require_secure_filesystem_capabilities()
         current_rows, current_directories = _scan_manifest(
             snapshot.evidence_dir,
             skip_runtime=False,
@@ -1196,6 +1423,8 @@ def verify_evidence_snapshot(snapshot: EvidenceSnapshot) -> None:
             required_directory_mode=0o555,
         )
         current = tuple(current_rows.values())
+    except ArtifactCollectionError:
+        raise
     except Exception as exc:
         raise RuntimeError("evidence changed while judge was running") from exc
     if (

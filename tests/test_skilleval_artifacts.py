@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 import os
+import resource
 import stat
+import struct
 import zipfile
 from dataclasses import FrozenInstanceError
 
@@ -302,6 +304,42 @@ class TestArtifactKind:
         assert detect_artifact_kind(str(unsafe), "application/zip") is None
         assert detect_artifact_kind(str(corrupt), "application/zip") is None
 
+    @pytest.mark.parametrize(
+        ("entry_count", "central_directory_size"),
+        [
+            (10_001, 0),
+            (1, 16 * 1024 * 1024 + 1),
+            (0xFFFF, 0xFFFFFFFF),
+        ],
+    )
+    def test_rejects_oversized_or_zip64_eocd_before_zipfile(
+        self,
+        tmp_path,
+        monkeypatch,
+        entry_count,
+        central_directory_size,
+    ) -> None:
+        path = tmp_path / "oversized.xlsx"
+        eocd = struct.pack(
+            "<4s4H2LH",
+            b"PK\x05\x06",
+            0,
+            0,
+            entry_count,
+            entry_count,
+            central_directory_size,
+            4,
+            0,
+        )
+        path.write_bytes(b"PK\x03\x04" + eocd)
+
+        def unexpected_zipfile(*args, **kwargs):
+            pytest.fail("ZipFile must not inspect an unbounded central directory")
+
+        monkeypatch.setattr(artifacts_mod.zipfile, "ZipFile", unexpected_zipfile)
+
+        assert detect_artifact_kind(str(path), mime="application/zip") is None
+
     def test_unknown_octet_stream_is_not_binary_output(self, tmp_path) -> None:
         path = tmp_path / "unknown.bin"
         path.write_bytes(b"\x00\x01\x02")
@@ -311,6 +349,37 @@ class TestArtifactKind:
 
 
 class TestEvidenceSnapshot:
+    @pytest.mark.parametrize("relationship", ["equal", "judge_inside", "work_inside"])
+    def test_rejects_workspace_and_judge_overlap_without_mutation(
+        self, tmp_path, relationship
+    ) -> None:
+        if relationship == "work_inside":
+            judge_root = tmp_path / "judge"
+            work = judge_root / "work"
+        else:
+            work = tmp_path / "work"
+            judge_root = work if relationship == "equal" else work / "judge"
+        work.mkdir(parents=True)
+        output = work / "report.pdf"
+        outputs = _outputs_after(work, lambda: output.write_bytes(b"%PDF-1.4\n"))
+        marker = work / "keep.txt"
+        marker.write_text("keep", encoding="utf-8")
+        judge_arg = (
+            os.path.join(str(work), "..", work.name)
+            if relationship == "equal"
+            else str(judge_root)
+        )
+
+        with pytest.raises(ValueError, match="overlap"):
+            create_evidence_snapshot(
+                str(work), outputs, judge_arg, max_bytes=1024
+            )
+
+        assert output.read_bytes() == b"%PDF-1.4\n"
+        assert marker.read_text(encoding="utf-8") == "keep"
+        if relationship == "judge_inside":
+            assert not judge_root.exists()
+
     def test_copies_only_declared_outputs_and_writes_manifest_to_scratch(
         self, tmp_path
     ) -> None:
@@ -974,3 +1043,91 @@ class TestEvidenceSnapshot:
                 str(work), outputs, str(judge_root), max_bytes=1024
             )
         assert replaced is True
+
+    @pytest.mark.skipif(
+        not os.path.isdir("/proc/self/fd"),
+        reason="requires Linux fd accounting",
+    )
+    def test_many_files_under_low_fd_limit_close_before_failure_cleanup(
+        self, tmp_path
+    ) -> None:
+        work = tmp_path / "work"
+        work.mkdir()
+        outputs = _outputs_after(
+            work,
+            lambda: [
+                (work / f"report-{index:03d}.pdf").write_bytes(b"%PDF-1.4\n")
+                for index in range(48)
+            ],
+        )
+        bad_outputs = [dict(row) for row in outputs]
+        bad_outputs[-1]["sha256"] = "0" * 64
+        judge_root = tmp_path / "judge"
+        baseline_fds = len(os.listdir("/proc/self/fd"))
+        old_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        limited_soft = baseline_fds + 20
+        if old_limit[0] <= limited_soft:
+            pytest.skip("existing RLIMIT_NOFILE is already too low")
+
+        resource.setrlimit(resource.RLIMIT_NOFILE, (limited_soft, old_limit[1]))
+        try:
+            with pytest.raises(ValueError, match="hash mismatch"):
+                create_evidence_snapshot(
+                    str(work), bad_outputs, str(judge_root), max_bytes=4096
+                )
+            assert not judge_root.exists()
+            assert len(os.listdir("/proc/self/fd")) == baseline_fds
+
+            snapshot = create_evidence_snapshot(
+                str(work), outputs, str(judge_root), max_bytes=4096
+            )
+            assert len(snapshot.files) == 48
+            assert len(os.listdir("/proc/self/fd")) == baseline_fds
+        finally:
+            resource.setrlimit(resource.RLIMIT_NOFILE, old_limit)
+
+
+class TestFilesystemHelpers:
+    @pytest.mark.skipif(
+        not os.path.isdir("/proc/self/fd"),
+        reason="requires Linux fd accounting",
+    )
+    def test_created_directory_fstat_failure_closes_fd_and_removes_inode(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        parent_descriptor = os.open(tmp_path, artifacts_mod._directory_flags())
+        baseline_fds = len(os.listdir("/proc/self/fd"))
+        real_fstat = artifacts_mod.os.fstat
+        failed = False
+
+        def failing_fstat(descriptor):
+            nonlocal failed
+            if descriptor != parent_descriptor and not failed:
+                failed = True
+                raise OSError("injected fstat failure")
+            return real_fstat(descriptor)
+
+        monkeypatch.setattr(artifacts_mod.os, "fstat", failing_fstat)
+        try:
+            with pytest.raises(OSError, match="injected"):
+                artifacts_mod._open_created_directory(
+                    parent_descriptor,
+                    "created",
+                    0o700,
+                )
+            assert failed is True
+            assert not (tmp_path / "created").exists()
+            assert len(os.listdir("/proc/self/fd")) == baseline_fds
+        finally:
+            os.close(parent_descriptor)
+
+    def test_missing_secure_open_flag_is_typed_infrastructure_error(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        root = tmp_path / "work"
+        root.mkdir()
+        error_type = getattr(artifacts_mod, "ArtifactCollectionError", RuntimeError)
+        monkeypatch.setattr(artifacts_mod.os, "O_NOFOLLOW", 0)
+
+        with pytest.raises(error_type, match="O_NOFOLLOW"):
+            build_manifest(str(root))

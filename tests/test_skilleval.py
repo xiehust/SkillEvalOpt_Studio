@@ -565,10 +565,23 @@ class TestRunBatch:
         assert results[0]["response"] == "done"
         assert "symlink directory" in results[0]["artifact_error"]
         assert results[0]["artifact_failure"] is True
+        assert results[0]["artifact_error_type"] == "target_validation"
+        assert results[0]["score_valid"] is True
+        assert results[0]["error"] == results[0]["artifact_error"]
         assert results[0]["artifacts"] == []
-        assert "error" not in results[0]
         assert [row["path"] for row in results[1]["artifacts"]] == ["ok.pdf"]
         assert "artifact_error" not in results[1]
+
+        judged = []
+
+        def fake_judge(item, response, listing):
+            judged.append(item["id"])
+            return {"hard": 1, "soft": 1.0, "judge_reason": "ok"}
+
+        scored = evaluator.merge_scores(_three_items()[:2], results, fake_judge)
+        assert judged == ["t2"]
+        assert scored[0]["hard"] == 0
+        assert scored[0]["soft"] == 0.0
 
     def test_hard_linked_target_output_is_artifact_failure_and_batch_isolated(
         self, tmp_path, monkeypatch
@@ -588,7 +601,9 @@ class TestRunBatch:
         assert "single-link" in results[0]["artifact_error"]
         assert results[0]["artifact_failure"] is True
         assert results[0]["artifacts"] == []
-        assert "error" not in results[0]
+        assert results[0]["artifact_error_type"] == "target_validation"
+        assert results[0]["score_valid"] is True
+        assert results[0]["error"] == results[0]["artifact_error"]
         assert [row["path"] for row in results[1]["artifacts"]] == ["report.pdf"]
         assert "artifact_error" not in results[1]
 
@@ -615,6 +630,63 @@ class TestRunBatch:
         assert result["response"] == "done"
         assert [row["path"] for row in result["artifacts"]] == ["report.pdf"]
         assert "artifact_error" not in result
+
+    def test_artifact_collection_failure_is_invalid_not_target_zero(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        error_type = getattr(
+            rollout_mod,
+            "ArtifactCollectionError",
+            RuntimeError,
+        )
+        manifest_calls = 0
+
+        def fail_post_manifest(work_dir):
+            nonlocal manifest_calls
+            manifest_calls += 1
+            if manifest_calls == 1:
+                return {}
+            raise error_type("injected collection failure")
+
+        self._patch_harness(monkeypatch, lambda **kwargs: ("done", "raw"))
+        monkeypatch.setattr(rollout_mod, "build_manifest", fail_post_manifest)
+
+        item = _valid_item("t1")
+        result = run_batch([item], "# skill", str(tmp_path))[0]
+
+        assert result["response"] == "done"
+        assert "injected collection failure" in result["artifact_collection_error"]
+        assert result["artifact_collection_error_type"] == "infrastructure"
+        assert result["score_valid"] is False
+        assert "artifact_error" not in result
+        assert "error" not in result
+
+        judged = []
+
+        def fake_judge(*args):
+            judged.append(args)
+            return {"hard": 1, "soft": 1.0, "judge_reason": "wrong"}
+
+        scored = evaluator.merge_scores([item], [result], fake_judge)[0]
+        assert judged == []
+        assert scored["score_valid"] is False
+        assert scored["judge_skipped"] == "invalid_rollout"
+
+    def test_target_execution_error_is_preserved_with_artifact_validation_error(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        def produce_then_fail(*, work_dir, **kwargs):
+            os.symlink("/tmp", os.path.join(work_dir, "forbidden"))
+            raise RuntimeError("CLI crashed")
+
+        self._patch_harness(monkeypatch, produce_then_fail)
+
+        result = run_batch([_valid_item("t1")], "# skill", str(tmp_path))[0]
+
+        assert "RuntimeError: CLI crashed" in result["error"]
+        assert result["artifact_error_type"] == "target_validation"
+        assert "symlink" in result["artifact_error"]
+        assert result["score_valid"] is True
 
 
 # ── CLI / report ──────────────────────────────────────────────────────────

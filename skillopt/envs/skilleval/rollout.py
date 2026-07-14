@@ -16,7 +16,12 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from typing import TypedDict
 
-from skillopt.envs.skilleval.artifacts import build_manifest, diff_manifests
+from skillopt.envs.skilleval.artifacts import (
+    ArtifactCollectionError,
+    ArtifactValidationError,
+    build_manifest,
+    diff_manifests,
+)
 from skillopt.model.backend_config import get_target_backend
 from skillopt.model.codex_harness import (
     extract_exec_usage,
@@ -98,6 +103,7 @@ def _rollout_one(
         "duration_s": 0.0,
         "work_dir": work_dir,
         "artifacts": [],
+        "score_valid": True,
     }
     start = time.time()
     try:
@@ -157,9 +163,24 @@ def _rollout_one(
             try:
                 after = build_manifest(work_dir)
                 result["artifacts"] = diff_manifests(before, after)
-            except Exception as exc:  # noqa: BLE001 — target artifact failure
+            except ArtifactValidationError as exc:
                 result["artifact_error"] = f"{type(exc).__name__}: {exc}"
                 result["artifact_failure"] = True
+                result["artifact_error_type"] = "target_validation"
+                if not result.get("error"):
+                    result["error"] = result["artifact_error"]
+            except ArtifactCollectionError as exc:
+                result["artifact_collection_error"] = f"{type(exc).__name__}: {exc}"
+                result["artifact_collection_error_type"] = "infrastructure"
+                result["score_valid"] = False
+            except Exception as exc:  # noqa: BLE001 — unexpected collection failure
+                result["artifact_collection_error"] = f"{type(exc).__name__}: {exc}"
+                result["artifact_collection_error_type"] = "infrastructure"
+                result["score_valid"] = False
+    except (ArtifactCollectionError, ArtifactValidationError) as exc:
+        result["artifact_collection_error"] = f"{type(exc).__name__}: {exc}"
+        result["artifact_collection_error_type"] = "infrastructure"
+        result["score_valid"] = False
     except Exception as exc:  # noqa: BLE001 — isolate task failures
         result["error"] = f"{type(exc).__name__}: {exc}"
         result["error_traceback"] = traceback.format_exc(limit=5)

@@ -194,7 +194,14 @@ def merge_scores(items: list[dict], rollout_results: list[dict], judge_fn) -> li
     merged = []
     for item, rollout_result in zip(items, rollout_results):
         result = dict(rollout_result)
-        if result.get("error"):
+        if result.get("score_valid") is False:
+            result.update({
+                "hard": 0,
+                "soft": 0.0,
+                "judge_reason": "",
+                "judge_skipped": "invalid_rollout",
+            })
+        elif result.get("error"):
             result.update({"hard": 0, "soft": 0.0, "judge_reason": ""})
         else:
             work_dir = result.get("work_dir", "")
