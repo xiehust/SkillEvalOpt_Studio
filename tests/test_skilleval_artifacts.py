@@ -53,6 +53,60 @@ def _write_ooxml(path, kind: str, *, unsafe_name: str | None = None) -> None:
             archive.writestr(unsafe_name, "unsafe")
 
 
+def _rewrite_always_zip64_eocd(path) -> None:
+    payload = path.read_bytes()
+    eocd_offset = payload.rfind(b"PK\x05\x06")
+    assert eocd_offset >= 0
+    (
+        _signature,
+        disk_number,
+        central_disk,
+        entries_on_disk,
+        total_entries,
+        central_size,
+        central_offset,
+        comment_size,
+    ) = struct.unpack_from("<4s4H2LH", payload, eocd_offset)
+    assert disk_number == central_disk == 0
+    comment = payload[eocd_offset + 22:]
+    assert len(comment) == comment_size
+
+    prefix = payload[:eocd_offset]
+    zip64_offset = len(prefix)
+    zip64_record = struct.pack(
+        "<4sQ2H2L4Q",
+        b"PK\x06\x06",
+        44,
+        45,
+        45,
+        0,
+        0,
+        entries_on_disk,
+        total_entries,
+        central_size,
+        central_offset,
+    )
+    locator = struct.pack(
+        "<4sLQL",
+        b"PK\x06\x07",
+        0,
+        zip64_offset,
+        1,
+    )
+    classic = struct.pack(
+        "<4s4H2LH",
+        b"PK\x05\x06",
+        0,
+        0,
+        0xFFFF,
+        0xFFFF,
+        0xFFFFFFFF,
+        0xFFFFFFFF,
+        comment_size,
+    )
+    path.write_bytes(prefix + zip64_record + locator + classic + comment)
+
+
 def _outputs_after(work, mutate) -> list[dict]:
     before = build_manifest(str(work))
     mutate()
@@ -265,6 +319,58 @@ class TestArtifactKind:
         path = tmp_path / "artifact.bin"
         _write_ooxml(path, kind)
         assert detect_artifact_kind(str(path), "application/zip") == kind
+
+    def test_generic_zip_accepts_valid_always_zip64_eocd(
+        self, tmp_path
+    ) -> None:
+        path = tmp_path / "artifact.bin"
+        _write_ooxml(path, "xlsx")
+        _rewrite_always_zip64_eocd(path)
+
+        assert detect_artifact_kind(str(path), "application/zip") == "xlsx"
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("total_disks", 2),
+            ("classic_entry_count", 1),
+            ("record_offset_delta", 1),
+        ],
+    )
+    def test_generic_zip_rejects_inconsistent_zip64_eocd(
+        self,
+        tmp_path,
+        field,
+        value,
+    ) -> None:
+        path = tmp_path / "artifact.bin"
+        _write_ooxml(path, "xlsx")
+        _rewrite_always_zip64_eocd(path)
+        payload = bytearray(path.read_bytes())
+        locator_offset = payload.rfind(b"PK\x06\x07")
+        classic_offset = payload.rfind(b"PK\x05\x06")
+        assert locator_offset >= 0
+        assert classic_offset >= 0
+
+        if field == "total_disks":
+            struct.pack_into("<L", payload, locator_offset + 16, value)
+        elif field == "classic_entry_count":
+            struct.pack_into("<H", payload, classic_offset + 8, value)
+        else:
+            record_offset = struct.unpack_from(
+                "<Q",
+                payload,
+                locator_offset + 8,
+            )[0]
+            struct.pack_into(
+                "<Q",
+                payload,
+                locator_offset + 8,
+                record_offset + value,
+            )
+        path.write_bytes(payload)
+
+        assert detect_artifact_kind(str(path), "application/zip") is None
 
     def test_generic_ole_and_unavailable_mime_fall_back_to_supported_suffix(
         self, tmp_path

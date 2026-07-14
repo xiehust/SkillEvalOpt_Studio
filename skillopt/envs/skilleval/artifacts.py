@@ -83,6 +83,9 @@ _HASH_CHUNK_SIZE = 1024 * 1024
 _DEFAULT_MAX_BYTES = 100 * 1024 * 1024
 _ZIP_EOCD_SIZE = 22
 _ZIP_MAX_COMMENT_BYTES = 65535
+_ZIP64_EOCD_LOCATOR_SIZE = 20
+_ZIP64_EOCD_FIXED_SIZE = 56
+_MAX_ZIP64_EOCD_BYTES = 1024 * 1024
 _MAX_OOXML_ENTRIES = 10_000
 _MAX_OOXML_CENTRAL_DIRECTORY_BYTES = 16 * 1024 * 1024
 _HAS_REQUIRED_DIR_FD = all(
@@ -258,24 +261,126 @@ def _preflight_zip_descriptor(descriptor: int) -> bool:
         return False
     if eocd_index + _ZIP_EOCD_SIZE + comment_size != len(tail):
         return False
-    if disk_number != 0 or central_directory_disk != 0:
-        return False
-    if entries_on_disk != total_entries:
-        return False
-    if (
-        entries_on_disk == 0xFFFF
+    needs_zip64 = (
+        disk_number == 0xFFFF
+        or central_directory_disk == 0xFFFF
+        or entries_on_disk == 0xFFFF
         or total_entries == 0xFFFF
         or central_directory_size == 0xFFFFFFFF
         or central_directory_offset == 0xFFFFFFFF
-    ):
+    )
+    eocd_offset = tail_offset + eocd_index
+    locator_offset = eocd_offset - _ZIP64_EOCD_LOCATOR_SIZE
+    locator = (
+        _read_descriptor(
+            descriptor,
+            _ZIP64_EOCD_LOCATOR_SIZE,
+            locator_offset,
+        )
+        if locator_offset >= 0
+        else b""
+    )
+    has_zip64 = locator.startswith(b"PK\x06\x07")
+
+    if needs_zip64 and not has_zip64:
         return False
+    if has_zip64:
+        if len(locator) != _ZIP64_EOCD_LOCATOR_SIZE:
+            return False
+        try:
+            (
+                _locator_signature,
+                locator_disk,
+                zip64_offset,
+                total_disks,
+            ) = struct.unpack("<4sLQL", locator)
+        except struct.error:
+            return False
+        if locator_disk != 0 or total_disks != 1:
+            return False
+        fixed = _read_descriptor(
+            descriptor,
+            _ZIP64_EOCD_FIXED_SIZE,
+            zip64_offset,
+        )
+        if len(fixed) != _ZIP64_EOCD_FIXED_SIZE:
+            return False
+        try:
+            (
+                zip64_signature,
+                zip64_record_size,
+                _version_made,
+                version_needed,
+                zip64_disk,
+                zip64_central_disk,
+                zip64_entries_on_disk,
+                zip64_total_entries,
+                zip64_central_size,
+                zip64_central_offset,
+            ) = struct.unpack("<4sQ2H2L4Q", fixed)
+        except struct.error:
+            return False
+        zip64_total_size = 12 + zip64_record_size
+        if (
+            zip64_signature != b"PK\x06\x06"
+            or zip64_record_size < 44
+            or zip64_total_size > _MAX_ZIP64_EOCD_BYTES
+            or zip64_offset + zip64_total_size != locator_offset
+            or version_needed < 45
+            or zip64_disk != 0
+            or zip64_central_disk != 0
+            or zip64_entries_on_disk != zip64_total_entries
+        ):
+            return False
+        classic_pairs = (
+            (disk_number, 0xFFFF, zip64_disk),
+            (
+                central_directory_disk,
+                0xFFFF,
+                zip64_central_disk,
+            ),
+            (entries_on_disk, 0xFFFF, zip64_entries_on_disk),
+            (total_entries, 0xFFFF, zip64_total_entries),
+            (
+                central_directory_size,
+                0xFFFFFFFF,
+                zip64_central_size,
+            ),
+            (
+                central_directory_offset,
+                0xFFFFFFFF,
+                zip64_central_offset,
+            ),
+        )
+        if any(
+            classic not in {sentinel, resolved}
+            for classic, sentinel, resolved in classic_pairs
+        ):
+            return False
+        total_entries = zip64_total_entries
+        central_directory_size = zip64_central_size
+        central_directory_offset = zip64_central_offset
+        central_boundary = zip64_offset
+    else:
+        if (
+            disk_number != 0
+            or central_directory_disk != 0
+            or entries_on_disk != total_entries
+        ):
+            return False
+        central_boundary = eocd_offset
+
     if (
         total_entries > _MAX_OOXML_ENTRIES
         or central_directory_size > _MAX_OOXML_CENTRAL_DIRECTORY_BYTES
     ):
         return False
-    eocd_offset = tail_offset + eocd_index
-    return central_directory_offset + central_directory_size <= eocd_offset
+    return (
+        central_directory_offset >= 0
+        and central_directory_size >= 0
+        and central_directory_offset + central_directory_size
+        <= central_boundary
+    )
 
 
 def _inspect_ooxml_descriptor(descriptor: int) -> str | None:

@@ -12,12 +12,14 @@ import struct
 import tempfile
 import unicodedata
 import zipfile
+import zlib
 from contextlib import contextmanager
 from pathlib import Path
 from xml.etree import ElementTree
 
 import openpyxl
 from openpyxl.utils.cell import coordinate_to_tuple, get_column_letter
+from openpyxl.worksheet.worksheet import Worksheet
 
 from skillopt.envs.skilleval import artifacts as artifact_security
 
@@ -39,6 +41,18 @@ _MAX_OOXML_ENTRIES = 10_000
 _MAX_OOXML_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 _MAX_CONTENT_TYPES_BYTES = 2 * 1024 * 1024
 _MAX_OOXML_LOCAL_METADATA_BYTES = 16 * 1024 * 1024
+_MAX_OOXML_XML_PART_BYTES = 32 * 1024 * 1024
+_MAX_OOXML_XML_NODES = 1_000_000
+_MAX_OOXML_XML_DEPTH = 256
+_MAX_WORKSHEET_ROWS = 100_000
+_MAX_WORKSHEET_CELLS = 250_000
+_MAX_WORKSHEET_MERGES = 50_000
+_MAX_SHARED_STRING_ITEMS = 250_000
+_MAX_SHARED_STRING_CHARS = 16 * 1024 * 1024
+_MAX_STYLE_RECORDS = 100_000
+_MAX_RELATIONSHIPS = 100_000
+_MAX_DRAWING_OBJECTS = 100_000
+_MAX_CHART_OBJECTS = 100_000
 _MAX_COMPRESSION_RATIO = 200.0
 _ZIP_STREAM_CHUNK = 1024 * 1024
 _LOCAL_FILE_HEADER = struct.Struct("<4s5H3L2H")
@@ -55,6 +69,9 @@ _SUPPORTED_ZIP_COMPRESSION = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
 _XLSX_WORKBOOK_CONTENT_TYPE = (
     "application/vnd.openxmlformats-officedocument."
     "spreadsheetml.sheet.main+xml"
+)
+_CONTENT_TYPES_NAMESPACE = (
+    "http://schemas.openxmlformats.org/package/2006/content-types"
 )
 _CELL_SELECTOR_RE = re.compile(
     r"^sheet:([^:]+?)(?::page:([1-9][0-9]*))?$"
@@ -262,6 +279,8 @@ def _validate_data_descriptor(
     unsigned_size = body_struct.size
     signed_size = len(_DATA_DESCRIPTOR_SIGNATURE) + unsigned_size
     available = boundary - descriptor_start
+    if available < unsigned_size:
+        raise InspectionError("OOXML data descriptor is truncated")
     if available > signed_size:
         raise InspectionError("OOXML data descriptor has wrong width")
     payload = _read_local_header_bytes(
@@ -269,19 +288,18 @@ def _validate_data_descriptor(
         available,
         descriptor_start,
     )
-    if len(payload) < len(_DATA_DESCRIPTOR_SIGNATURE):
-        raise InspectionError("OOXML data descriptor is truncated")
-
-    has_signature = payload.startswith(_DATA_DESCRIPTOR_SIGNATURE)
-    expected_size = signed_size if has_signature else unsigned_size
-    if len(payload) < expected_size:
-        if has_signature and len(payload) == unsigned_size:
-            raise InspectionError("OOXML data descriptor is ambiguous")
-        raise InspectionError("OOXML data descriptor is truncated")
-    if len(payload) > expected_size:
+    if available not in {unsigned_size, signed_size}:
+        if payload.startswith(_DATA_DESCRIPTOR_SIGNATURE):
+            raise InspectionError("OOXML data descriptor is truncated")
         raise InspectionError("OOXML data descriptor has wrong width")
-
-    body = payload[len(_DATA_DESCRIPTOR_SIGNATURE):] if has_signature else payload
+    has_signature = available == signed_size
+    if has_signature and not payload.startswith(_DATA_DESCRIPTOR_SIGNATURE):
+        raise InspectionError("OOXML data descriptor has wrong width")
+    body = (
+        payload[len(_DATA_DESCRIPTOR_SIGNATURE):]
+        if has_signature
+        else payload
+    )
     actual_crc, actual_compressed, actual_uncompressed = body_struct.unpack(body)
     if actual_crc != member.CRC:
         raise InspectionError(
@@ -494,7 +512,10 @@ def _validate_local_headers(
         previous_end = interval_end
 
 
-def _validate_content_types(payload: bytes, names: set[str]) -> None:
+def _validate_content_types(
+    payload: bytes,
+    names: set[str],
+) -> dict[str, str]:
     if len(payload) > _MAX_CONTENT_TYPES_BYTES:
         raise InspectionError("OOXML content types exceed size limit")
     lowered = payload.lower()
@@ -505,17 +526,316 @@ def _validate_content_types(payload: bytes, names: set[str]) -> None:
     except ElementTree.ParseError as exc:
         raise InspectionError("OOXML content types are malformed") from exc
 
-    workbook_types = {
-        element.attrib.get("ContentType")
-        for element in root
-        if element.tag.rsplit("}", 1)[-1] == "Override"
-        and element.attrib.get("PartName") == "/xl/workbook.xml"
-    }
+    types_tag = f"{{{_CONTENT_TYPES_NAMESPACE}}}Types"
+    default_tag = f"{{{_CONTENT_TYPES_NAMESPACE}}}Default"
+    override_tag = f"{{{_CONTENT_TYPES_NAMESPACE}}}Override"
+    if root.tag != types_tag or root.attrib:
+        raise InspectionError("OOXML content types root is invalid")
+
+    defaults: dict[str, str] = {}
+    overrides: dict[str, str] = {}
+    for element in root:
+        if len(element):
+            raise InspectionError("OOXML content types child is invalid")
+        if element.tag == default_tag:
+            if set(element.attrib) != {"Extension", "ContentType"}:
+                raise InspectionError("OOXML content types Default is invalid")
+            extension = element.attrib["Extension"]
+            content_type = element.attrib["ContentType"]
+            key = extension.casefold()
+            if (
+                not extension
+                or extension.startswith(".")
+                or "/" in extension
+                or "\\" in extension
+                or key in defaults
+            ):
+                raise InspectionError(
+                    "OOXML content types contain duplicate or invalid Default"
+                )
+            defaults[key] = content_type
+        elif element.tag == override_tag:
+            if set(element.attrib) != {"PartName", "ContentType"}:
+                raise InspectionError("OOXML content types Override is invalid")
+            part_name = element.attrib["PartName"]
+            content_type = element.attrib["ContentType"]
+            if (
+                not part_name.startswith("/")
+                or part_name == "/"
+                or part_name in overrides
+            ):
+                raise InspectionError(
+                    "OOXML content types contain duplicate or invalid PartName"
+                )
+            archive_name = part_name[1:]
+            if (
+                not artifact_security._safe_zip_member(archive_name)
+                or archive_name not in names
+                or archive_name.endswith("/")
+            ):
+                raise InspectionError(
+                    "OOXML content types reference a missing or invalid part"
+                )
+            overrides[part_name] = content_type
+        else:
+            raise InspectionError("OOXML content types child is invalid")
+
+        if (
+            not content_type
+            or content_type != content_type.strip()
+            or any(ord(character) < 0x20 for character in content_type)
+        ):
+            raise InspectionError("OOXML content types mapping is invalid")
+
+    mapped: dict[str, str] = {}
+    for name in names:
+        if name == "[Content_Types].xml" or name.endswith("/"):
+            continue
+        content_type = overrides.get(f"/{name}")
+        if content_type is None:
+            extension = (
+                name.rsplit(".", 1)[1].casefold()
+                if "." in name.rsplit("/", 1)[-1]
+                else ""
+            )
+            content_type = defaults.get(extension)
+        if content_type is None:
+            raise InspectionError(
+                f"OOXML content types do not map part {bounded_diagnostic(name)!r}"
+            )
+        mapped[name] = content_type
+
     if (
-        workbook_types != {_XLSX_WORKBOOK_CONTENT_TYPE}
-        or "xl/workbook.xml" not in names
+        mapped.get("xl/workbook.xml") != _XLSX_WORKBOOK_CONTENT_TYPE
+        or overrides.get("/xl/workbook.xml")
+        != _XLSX_WORKBOOK_CONTENT_TYPE
     ):
         raise InspectionError("OOXML content types do not describe an XLSX workbook")
+    return mapped
+
+
+def _read_bounded_member(
+    archive: zipfile.ZipFile,
+    member: zipfile.ZipInfo,
+    limit: int,
+    label: str,
+) -> bytes:
+    payload = bytearray()
+    with archive.open(member, "r") as entry:
+        while True:
+            chunk = entry.read(min(_ZIP_STREAM_CHUNK, limit - len(payload) + 1))
+            if not chunk:
+                break
+            payload.extend(chunk)
+            if len(payload) > limit:
+                raise InspectionError(f"{label} exceed size limit")
+    if len(payload) != member.file_size:
+        raise InspectionError("OOXML entry size metadata does not match content")
+    return bytes(payload)
+
+
+def _is_xml_content_type(content_type: str | None) -> bool:
+    if content_type is None:
+        return False
+    media_type = content_type.split(";", 1)[0].strip().casefold()
+    return (
+        media_type in {"application/xml", "text/xml"}
+        or media_type.endswith("+xml")
+    )
+
+
+def _xml_local_name(tag: object) -> str:
+    if not isinstance(tag, str):
+        return ""
+    return tag.rsplit("}", 1)[-1]
+
+
+class _XmlStructureValidator:
+    _STYLE_TAGS = {
+        "numFmt",
+        "font",
+        "fill",
+        "border",
+        "xf",
+        "cellStyle",
+        "dxf",
+        "tableStyle",
+    }
+    _DRAWING_TAGS = {"sp", "pic", "graphicFrame", "cxnSp", "grpSp"}
+
+    def __init__(
+        self,
+        name: str,
+        content_type: str | None,
+        totals: dict[str, int],
+    ) -> None:
+        self._name = name
+        self._totals = totals
+        self._parser = ElementTree.XMLPullParser(events=("start", "end"))
+        self._bytes = 0
+        self._depth = 0
+        self._declaration_tail = b""
+        media_type = (
+            content_type.split(";", 1)[0].strip().casefold()
+            if content_type is not None
+            else ""
+        )
+        self._worksheet = (
+            media_type.endswith(".worksheet+xml")
+            or (
+                name.startswith("xl/worksheets/")
+                and name.endswith(".xml")
+            )
+        )
+        self._shared_strings = (
+            media_type.endswith(".sharedstrings+xml")
+            or name == "xl/sharedStrings.xml"
+        )
+        self._styles = (
+            media_type.endswith(".styles+xml")
+            or name == "xl/styles.xml"
+        )
+        self._relationships = (
+            media_type.endswith(".relationships+xml")
+            or name.endswith(".rels")
+        )
+        self._drawing = (
+            media_type.endswith(".drawing+xml")
+            or (
+                name.startswith("xl/drawings/")
+                and name.endswith(".xml")
+            )
+        )
+        self._chart = (
+            media_type.endswith(".chart+xml")
+            or (
+                name.startswith("xl/charts/")
+                and name.endswith(".xml")
+            )
+        )
+
+    def _increment(self, key: str, limit: int, label: str) -> None:
+        self._totals[key] = self._totals.get(key, 0) + 1
+        if self._totals[key] > limit:
+            raise InspectionError(f"OOXML {label} count exceeds configured limit")
+
+    def _drain_events(self) -> None:
+        for event, element in self._parser.read_events():
+            local_name = _xml_local_name(element.tag)
+            if event == "start":
+                self._depth += 1
+                if self._depth > _MAX_OOXML_XML_DEPTH:
+                    raise InspectionError(
+                        "OOXML XML depth exceeds configured limit"
+                    )
+                self._increment(
+                    "nodes",
+                    _MAX_OOXML_XML_NODES,
+                    "XML node",
+                )
+                if self._worksheet:
+                    if local_name == "row":
+                        self._increment(
+                            "worksheet_rows",
+                            _MAX_WORKSHEET_ROWS,
+                            "worksheet row",
+                        )
+                    elif local_name == "c":
+                        self._increment(
+                            "worksheet_cells",
+                            _MAX_WORKSHEET_CELLS,
+                            "worksheet cell",
+                        )
+                    elif local_name == "mergeCell":
+                        self._increment(
+                            "worksheet_merges",
+                            _MAX_WORKSHEET_MERGES,
+                            "worksheet merge",
+                        )
+                if self._shared_strings and local_name == "si":
+                    self._increment(
+                        "shared_string_items",
+                        _MAX_SHARED_STRING_ITEMS,
+                        "shared string item",
+                    )
+                if self._styles and local_name in self._STYLE_TAGS:
+                    self._increment(
+                        "style_records",
+                        _MAX_STYLE_RECORDS,
+                        "style record",
+                    )
+                if self._relationships and local_name == "Relationship":
+                    self._increment(
+                        "relationships",
+                        _MAX_RELATIONSHIPS,
+                        "relationship",
+                    )
+                if self._drawing and local_name in self._DRAWING_TAGS:
+                    self._increment(
+                        "drawing_objects",
+                        _MAX_DRAWING_OBJECTS,
+                        "drawing object",
+                    )
+                if self._chart and (
+                    local_name == "chart"
+                    or local_name == "ser"
+                    or local_name.endswith("Chart")
+                ):
+                    self._increment(
+                        "chart_objects",
+                        _MAX_CHART_OBJECTS,
+                        "chart object",
+                    )
+            else:
+                if self._shared_strings and local_name == "t":
+                    chars = len(element.text or "")
+                    self._totals["shared_string_chars"] = (
+                        self._totals.get("shared_string_chars", 0) + chars
+                    )
+                    if (
+                        self._totals["shared_string_chars"]
+                        > _MAX_SHARED_STRING_CHARS
+                    ):
+                        raise InspectionError(
+                            "OOXML shared string character count "
+                            "exceeds configured limit"
+                        )
+                self._depth -= 1
+                element.clear()
+
+    def feed(self, chunk: bytes) -> None:
+        self._bytes += len(chunk)
+        if self._bytes > _MAX_OOXML_XML_PART_BYTES:
+            raise InspectionError(
+                f"OOXML XML part bytes exceed configured limit: "
+                f"{bounded_diagnostic(self._name)!r}"
+            )
+        declaration_scan = (self._declaration_tail + chunk).lower()
+        if b"<!doctype" in declaration_scan or b"<!entity" in declaration_scan:
+            raise InspectionError(
+                "OOXML XML part contains forbidden declarations"
+            )
+        self._declaration_tail = declaration_scan[-16:]
+        try:
+            self._parser.feed(chunk)
+            self._drain_events()
+        except ElementTree.ParseError as exc:
+            raise InspectionError(
+                f"OOXML XML part is malformed: "
+                f"{bounded_diagnostic(self._name)!r}"
+            ) from exc
+
+    def finish(self) -> None:
+        try:
+            self._parser.close()
+            self._drain_events()
+        except ElementTree.ParseError as exc:
+            raise InspectionError(
+                f"OOXML XML part is malformed: "
+                f"{bounded_diagnostic(self._name)!r}"
+            ) from exc
+        if self._depth != 0:
+            raise InspectionError("OOXML XML part has invalid nesting")
 
 
 def _open_stable_descriptor(path: str, label: str) -> int:
@@ -589,8 +909,19 @@ def preflight_xlsx(path: str) -> None:
                             "OOXML content types exceed size limit"
                         )
 
+                    content_types = _read_bounded_member(
+                        archive,
+                        content_types_info,
+                        _MAX_CONTENT_TYPES_BYTES,
+                        "OOXML content types",
+                    )
+                    part_content_types = _validate_content_types(
+                        content_types,
+                        names,
+                    )
+
                     actual_total = 0
-                    content_types = bytearray()
+                    xml_totals: dict[str, int] = {}
                     for member in members:
                         if member.is_dir():
                             if member.file_size != 0:
@@ -599,6 +930,20 @@ def preflight_xlsx(path: str) -> None:
                                 )
                             continue
                         actual_entry = 0
+                        name = _member_name(member)
+                        content_type = part_content_types.get(name)
+                        xml_validator = (
+                            _XmlStructureValidator(
+                                name,
+                                content_type,
+                                xml_totals,
+                            )
+                            if (
+                                name == "[Content_Types].xml"
+                                or _is_xml_content_type(content_type)
+                            )
+                            else None
+                        )
                         with archive.open(member, "r") as entry:
                             while True:
                                 chunk = entry.read(_ZIP_STREAM_CHUNK)
@@ -615,12 +960,14 @@ def preflight_xlsx(path: str) -> None:
                                         "OOXML actual uncompressed bytes exceed "
                                         "declared or configured limits"
                                     )
-                                if member is content_types_info:
-                                    content_types.extend(chunk)
+                                if xml_validator is not None:
+                                    xml_validator.feed(chunk)
                         if actual_entry != member.file_size:
                             raise InspectionError(
                                 "OOXML entry size metadata does not match content"
                             )
+                        if xml_validator is not None:
+                            xml_validator.finish()
             except InspectionError:
                 raise
             except (
@@ -628,6 +975,7 @@ def preflight_xlsx(path: str) -> None:
                 RuntimeError,
                 NotImplementedError,
                 ValueError,
+                zlib.error,
                 zipfile.BadZipFile,
                 zipfile.LargeZipFile,
             ) as exc:
@@ -638,7 +986,6 @@ def preflight_xlsx(path: str) -> None:
             raise InspectionError(
                 "OOXML total size metadata does not match content"
             )
-        _validate_content_types(bytes(content_types), names)
     finally:
         os.close(descriptor)
 
@@ -700,12 +1047,13 @@ def _convert_with_libreoffice(
     if target_format not in {"xlsx", "pdf"}:
         raise InspectionError("unsupported LibreOffice conversion target")
 
-    profile = Path(tempfile.mkdtemp(prefix="lo-profile-", dir=scratch_dir))
-    output_dir = Path(tempfile.mkdtemp(prefix="lo-output-", dir=scratch_dir))
-    _write_libreoffice_profile(profile)
+    libreoffice_executable = _find_libreoffice()
     env_executable = shutil.which("env")
     if env_executable is None:
         raise InspectionError("env executable is unavailable for LibreOffice")
+    profile = Path(tempfile.mkdtemp(prefix="lo-profile-", dir=scratch_dir))
+    output_dir = Path(tempfile.mkdtemp(prefix="lo-output-", dir=scratch_dir))
+    _write_libreoffice_profile(profile)
     input_descriptor = _open_stable_descriptor(
         path,
         "LibreOffice spreadsheet input",
@@ -714,7 +1062,7 @@ def _convert_with_libreoffice(
     command = [
         env_executable,
         f"FONTCONFIG_FILE={profile / 'fontconfig.xml'}",
-        _find_libreoffice(),
+        libreoffice_executable,
         "--headless",
         "--invisible",
         "--nologo",
@@ -856,6 +1204,7 @@ def _sheet_inventory(sheet, total_cells: int, page: int | None) -> dict:
     ] + images
     return {
         "name": sheet.title,
+        "type": "worksheet",
         "max_row": sheet.max_row,
         "max_column": sheet.max_column,
         "used_range": sheet.calculate_dimension(),
@@ -876,10 +1225,63 @@ def _sheet_inventory(sheet, total_cells: int, page: int | None) -> dict:
     }
 
 
+def _chartsheet_inventory(sheet) -> dict:
+    charts = [
+        {
+            "type": type(chart).__name__,
+            "anchor": _anchor_metadata(getattr(chart, "anchor", None)),
+        }
+        for chart in getattr(sheet, "_charts", ())
+    ]
+    return {
+        "name": sheet.title,
+        "type": "chartsheet",
+        "charts": charts,
+        "drawings": [
+            {"kind": "chart", **chart}
+            for chart in charts
+        ],
+        "cells": {},
+        "cell_page": {
+            "page": None,
+            "page_size": _CELL_PAGE_SIZE,
+            "total": 0,
+            "returned": 0,
+            "omitted": 0,
+            "omitted_due_to_budget": 0,
+        },
+    }
+
+
 def _iter_content_cells(sheet):
     for cell in sheet._cells.values():
         if getattr(cell, "value", None) is not None:
             yield cell
+
+
+def _formula_text_and_metadata(
+    value: object,
+) -> tuple[str | None, dict | None]:
+    if isinstance(value, str):
+        return value, None
+    if value is None:
+        return None, None
+    if type(value).__module__ != "openpyxl.worksheet.formula":
+        return None, {"kind": "unsupported"}
+    text = getattr(value, "text", None)
+    if not isinstance(text, str):
+        return None, {"kind": "unsupported"}
+    raw_kind = getattr(value, "t", None)
+    kind = (
+        raw_kind
+        if isinstance(raw_kind, str) and raw_kind
+        else "formula"
+    )
+    metadata = {"kind": kind}
+    ref = getattr(value, "ref", None)
+    if isinstance(ref, str):
+        metadata["ref"] = ref
+    return text, metadata
 
 
 def _cell_detail(formula_cell, cached_sheet) -> dict:
@@ -887,12 +1289,13 @@ def _cell_detail(formula_cell, cached_sheet) -> dict:
         (formula_cell.row, formula_cell.column)
     )
     cached_value = None if cached_cell is None else cached_cell.value
-    formula = (
-        formula_cell.value
-        if formula_cell.data_type == "f"
-        else None
-    )
-    return {
+    formula = None
+    formula_metadata = None
+    if formula_cell.data_type == "f":
+        formula, formula_metadata = _formula_text_and_metadata(
+            formula_cell.value
+        )
+    detail = {
         "coordinate": formula_cell.coordinate,
         "value": _json_scalar(cached_value),
         "cached_value": _json_scalar(cached_value),
@@ -900,6 +1303,9 @@ def _cell_detail(formula_cell, cached_sheet) -> dict:
         "number_format": formula_cell.number_format,
         "style_id": formula_cell.style_id,
     }
+    if formula_metadata is not None:
+        detail["formula_metadata"] = formula_metadata
+    return detail
 
 
 def _text_chars(value) -> int:
@@ -959,10 +1365,14 @@ def _build_structure(
     source_sheets = {
         sheet.title: sheet for sheet in formula_book.worksheets
     }
-    for name, page in pages.items():
-        formula_sheet = source_sheets[name]
-        total = sum(1 for _cell in _iter_content_cells(formula_sheet))
-        rows.append(_sheet_inventory(formula_sheet, total, page))
+    for sheet in formula_book._sheets:
+        if isinstance(sheet, Worksheet):
+            if sheet.title not in pages:
+                continue
+            total = sum(1 for _cell in _iter_content_cells(sheet))
+            rows.append(_sheet_inventory(sheet, total, pages[sheet.title]))
+        else:
+            rows.append(_chartsheet_inventory(sheet))
 
     result = {"kind": "spreadsheet", "opens": True, "sheets": rows}
     used_bytes = _json_bytes(result)
@@ -979,6 +1389,8 @@ def _build_structure(
     byte_limit = max(0, budget.max_bytes - 128)
     char_limit = max(0, budget.max_extract_chars - 128)
     for row in rows:
+        if row["type"] != "worksheet":
+            continue
         page = row["cell_page"]["page"]
         if page is None:
             continue
@@ -1149,15 +1561,22 @@ def _criterion(
 
 
 def _formula_body(value: object) -> str | None:
-    if not isinstance(value, str):
+    text, _metadata = _formula_text_and_metadata(value)
+    if text is None:
         return None
-    return value[1:] if value.startswith("=") else value
+    return text[1:] if text.startswith("=") else text
 
 
 def _exact_cell_equal(actual: object, expected: object) -> bool:
     if isinstance(actual, bool) or isinstance(expected, bool):
         return type(actual) is type(expected) and actual == expected
     if isinstance(actual, (int, float)) and isinstance(expected, (int, float)):
+        if (
+            isinstance(actual, float) and not math.isfinite(actual)
+        ) or (
+            isinstance(expected, float) and not math.isfinite(expected)
+        ):
+            return False
         return actual == expected
     return type(actual) is type(expected) and actual == expected
 
@@ -1214,16 +1633,27 @@ def evaluate_xlsx_check(path: str, check: dict) -> dict:
 
     with _check_xlsx_path(path) as xlsx_path:
         with _opened_workbooks(xlsx_path) as (formula_book, cached_book):
-            if sheet_name not in formula_book.sheetnames:
+            formula_sheets = {
+                sheet.title: sheet for sheet in formula_book.worksheets
+            }
+            cached_sheets = {
+                sheet.title: sheet for sheet in cached_book.worksheets
+            }
+            if sheet_name not in formula_sheets:
+                reason = (
+                    f"sheet {sheet_name!r} is not a worksheet"
+                    if sheet_name in formula_book.sheetnames
+                    else f"worksheet {sheet_name!r} is missing"
+                )
                 return _criterion(
                     check,
                     sheet_name,
                     cell_ref,
                     False,
-                    f"worksheet {sheet_name!r} is missing",
+                    reason,
                 )
-            formula_sheet = formula_book[sheet_name]
-            cached_sheet = cached_book[sheet_name]
+            formula_sheet = formula_sheets[sheet_name]
+            cached_sheet = cached_sheets[sheet_name]
             formula_cell = formula_sheet._cells.get((row, column))
             cached_cell = cached_sheet._cells.get((row, column))
 
@@ -1233,14 +1663,24 @@ def evaluate_xlsx_check(path: str, check: dict) -> dict:
                     raise InspectionError(
                         "xlsx_formula check formula must be a string"
                     )
-                actual = None if formula_cell is None else formula_cell.value
+                actual_value = (
+                    None if formula_cell is None else formula_cell.value
+                )
+                actual, actual_metadata = _formula_text_and_metadata(
+                    actual_value
+                )
                 if actual is None:
+                    detail = (
+                        "unsupported formula object"
+                        if actual_metadata is not None
+                        else "missing or has no formula"
+                    )
                     return _criterion(
                         check,
                         sheet_name,
                         cell_ref,
                         False,
-                        f"cell {cell_ref} is missing or has no formula",
+                        f"cell {cell_ref} {detail}",
                     )
                 passed = (
                     formula_cell.data_type == "f"

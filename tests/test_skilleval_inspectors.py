@@ -1995,6 +1995,95 @@ class TestSpreadsheetInspector:
         cell_check["spec"]["value"] = True
         assert evaluate_xlsx_check(str(path), cell_check)["passed"] is False
 
+    def test_xlsx_array_formula_is_json_safe_and_checkable(
+        self, tmp_path
+    ) -> None:
+        from openpyxl import Workbook
+        from openpyxl.worksheet.formula import ArrayFormula
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            evaluate_xlsx_check,
+        )
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "array-formula.xlsx"
+        book = Workbook()
+        sheet = book.active
+        sheet.title = "Summary"
+        sheet["A1"] = ArrayFormula(
+            ref="A1:A2",
+            text="=ROW(A1:A2)",
+        )
+        book.save(path)
+        book.close()
+
+        inspected = inspect_artifact(
+            "array-formula.xlsx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+        detail = inspected["sheets"][0]["cells"]["A1"]
+        assert detail["formula"] == "=ROW(A1:A2)"
+        assert detail["formula_metadata"] == {
+            "kind": "array",
+            "ref": "A1:A2",
+        }
+        json.dumps(inspected, allow_nan=False)
+
+        check = {
+            "id": "array",
+            "type": "xlsx_formula",
+            "path": "array-formula.xlsx",
+            "spec": {
+                "sheet": "Summary",
+                "cell": "A1",
+                "formula": "ROW(A1:A2)",
+            },
+        }
+        assert evaluate_xlsx_check(str(path), check)["passed"] is True
+
+    def test_xlsx_unknown_formula_object_is_controlled(self) -> None:
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        cached_sheet = types.SimpleNamespace(_cells={})
+        values = [
+            object(),
+            types.SimpleNamespace(
+                text="=SUM(A1:A2)",
+                ref="A1:A2",
+                t="array",
+            ),
+        ]
+
+        for value in values:
+            formula_cell = types.SimpleNamespace(
+                row=1,
+                column=1,
+                coordinate="A1",
+                value=value,
+                data_type="f",
+                number_format="General",
+                style_id=0,
+            )
+            detail = spreadsheet._cell_detail(formula_cell, cached_sheet)
+
+            assert detail["formula"] is None
+            assert detail["formula_metadata"] == {"kind": "unsupported"}
+            json.dumps(detail, allow_nan=False)
+
+    @pytest.mark.parametrize(
+        "value",
+        [float("nan"), float("inf"), float("-inf")],
+        ids=["nan", "positive-infinity", "negative-infinity"],
+    )
+    def test_xlsx_cell_equality_rejects_nonfinite_numbers(
+        self, value
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        assert spreadsheet._exact_cell_equal(value, value) is False
+        assert spreadsheet._exact_cell_equal(1, value) is False
+        assert spreadsheet._exact_cell_equal(value, 1) is False
+
     @pytest.mark.parametrize(
         ("sheet_name", "cell_ref", "reason"),
         [
@@ -2130,6 +2219,42 @@ class TestSpreadsheetInspector:
         assert list(page["cells"]) == ["A129", "A130", "XFD1048576"]
         assert page["cell_page"]["omitted"] == 128
 
+    def test_xlsx_inventory_includes_chart_sheets(self, tmp_path) -> None:
+        from openpyxl import Workbook
+        from openpyxl.chart import BarChart, Reference
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "chartsheet.xlsx"
+        book = Workbook()
+        data = book.active
+        data.title = "Data"
+        data["A1"] = 1
+        chart = BarChart()
+        chart.add_data(
+            Reference(data, min_col=1, min_row=1, max_row=1)
+        )
+        chart_sheet = book.create_chartsheet("Chart")
+        chart_sheet.add_chart(chart)
+        book.save(path)
+        book.close()
+
+        inspected = inspect_artifact(
+            "chartsheet.xlsx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        assert [
+            (sheet["name"], sheet["type"])
+            for sheet in inspected["sheets"]
+        ] == [("Data", "worksheet"), ("Chart", "chartsheet")]
+        assert inspected["sheets"][1]["charts"] == [
+            {"type": "BarChart", "anchor": {}}
+        ]
+        assert inspected["sheets"][1]["drawings"] == [
+            {"kind": "chart", "type": "BarChart", "anchor": {}}
+        ]
+
     def test_xlsx_extraction_omits_oversized_cell_with_budget_metadata(
         self, tmp_path
     ) -> None:
@@ -2249,6 +2374,217 @@ class TestSpreadsheetInspector:
         with pytest.raises(InspectionError, match="compression ratio"):
             spreadsheet.preflight_xlsx(str(path))
 
+    def test_xlsx_structure_limit_rejects_before_openpyxl_load(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "too-many-cells.xlsx"
+        self._save_xlsx(path)
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        monkeypatch.setattr(
+            spreadsheet,
+            "_MAX_WORKSHEET_CELLS",
+            1,
+            raising=False,
+        )
+        load_calls = []
+
+        def forbidden_load(*args, **kwargs):
+            load_calls.append((args, kwargs))
+            raise AssertionError("load_workbook must not be called")
+
+        monkeypatch.setattr(
+            spreadsheet.openpyxl,
+            "load_workbook",
+            forbidden_load,
+        )
+
+        with pytest.raises(InspectionError, match="worksheet cell"):
+            inspect_artifact(
+                "too-many-cells.xlsx",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+        assert load_calls == []
+
+    def test_xlsx_structure_limits_follow_content_type_not_part_path(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        path = tmp_path / "renamed-worksheet.xlsx"
+        self._save_xlsx(path)
+        renamed = tmp_path / "renamed-package.xlsx"
+        old_name = "xl/worksheets/sheet1.xml"
+        new_name = "xl/custom/sheet-data.xml"
+        with (
+            zipfile.ZipFile(path) as source,
+            zipfile.ZipFile(renamed, "w") as destination,
+        ):
+            for member in source.infolist():
+                payload = source.read(member)
+                if member.filename == "[Content_Types].xml":
+                    payload = payload.replace(
+                        f"/{old_name}".encode(),
+                        f"/{new_name}".encode(),
+                    )
+                destination.writestr(
+                    new_name if member.filename == old_name else member.filename,
+                    payload,
+                )
+        os.replace(renamed, path)
+        monkeypatch.setattr(spreadsheet, "_MAX_WORKSHEET_CELLS", 0)
+
+        with pytest.raises(InspectionError, match="worksheet cell"):
+            spreadsheet.preflight_xlsx(str(path))
+
+    @pytest.mark.parametrize(
+        ("limit_name", "reason", "fixture_kind"),
+        [
+            ("_MAX_WORKSHEET_ROWS", "worksheet row", "basic"),
+            ("_MAX_WORKSHEET_CELLS", "worksheet cell", "basic"),
+            ("_MAX_WORKSHEET_MERGES", "worksheet merge", "basic"),
+            ("_MAX_SHARED_STRING_ITEMS", "shared string item", "shared"),
+            ("_MAX_SHARED_STRING_CHARS", "shared string character", "shared"),
+            ("_MAX_STYLE_RECORDS", "style record", "basic"),
+            ("_MAX_RELATIONSHIPS", "relationship", "basic"),
+            ("_MAX_DRAWING_OBJECTS", "drawing object", "chart"),
+            ("_MAX_CHART_OBJECTS", "chart object", "chart"),
+        ],
+    )
+    def test_xlsx_preflight_enforces_xml_structure_limits(
+        self,
+        tmp_path,
+        monkeypatch,
+        limit_name,
+        reason,
+        fixture_kind,
+    ) -> None:
+        from openpyxl import Workbook
+        from openpyxl.chart import BarChart, Reference
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        path = tmp_path / f"{fixture_kind}.xlsx"
+        self._save_xlsx(path)
+        if fixture_kind == "shared":
+            shared_strings = (
+                b'<?xml version="1.0" encoding="UTF-8"?>'
+                b'<sst xmlns="http://schemas.openxmlformats.org/'
+                b'spreadsheetml/2006/main" count="1" uniqueCount="1">'
+                b"<si><t>Revenue</t></si></sst>"
+            )
+            with zipfile.ZipFile(path, "a") as archive:
+                archive.writestr(
+                    "xl/sharedStrings.xml",
+                    shared_strings,
+                )
+
+            def add_shared_override(payload: bytes) -> bytes:
+                override = (
+                    b'<Override PartName="/xl/sharedStrings.xml" '
+                    b'ContentType="application/vnd.openxmlformats-'
+                    b'officedocument.spreadsheetml.sharedStrings+xml"/>'
+                )
+                return payload.replace(b"</Types>", override + b"</Types>")
+
+            self._rewrite_xlsx_member(
+                path,
+                "[Content_Types].xml",
+                add_shared_override,
+            )
+        elif fixture_kind == "chart":
+            book = Workbook()
+            data = book.active
+            data["A1"] = 1
+            chart = BarChart()
+            chart.add_data(
+                Reference(data, min_col=1, min_row=1, max_row=1)
+            )
+            data.add_chart(chart, "C1")
+            book.save(path)
+            book.close()
+
+        monkeypatch.setattr(
+            spreadsheet,
+            limit_name,
+            0,
+            raising=False,
+        )
+        with pytest.raises(InspectionError, match=reason):
+            spreadsheet.preflight_xlsx(str(path))
+
+    @pytest.mark.parametrize(
+        ("limit_name", "reason"),
+        [
+            ("_MAX_OOXML_XML_PART_BYTES", "XML part bytes"),
+            ("_MAX_OOXML_XML_NODES", "XML node"),
+        ],
+    )
+    def test_xlsx_preflight_enforces_general_xml_limits(
+        self,
+        tmp_path,
+        monkeypatch,
+        limit_name,
+        reason,
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        path = tmp_path / "xml-limits.xlsx"
+        self._save_xlsx(path)
+        monkeypatch.setattr(
+            spreadsheet,
+            limit_name,
+            1,
+            raising=False,
+        )
+
+        with pytest.raises(InspectionError, match=reason):
+            spreadsheet.preflight_xlsx(str(path))
+
+    @pytest.mark.parametrize(
+        "invalid_case",
+        ["namespace", "child", "duplicate", "unmapped"],
+    )
+    def test_xlsx_content_types_schema_is_strict(
+        self, tmp_path, invalid_case
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        path = tmp_path / f"content-types-{invalid_case}.xlsx"
+        self._save_xlsx(path)
+        if invalid_case == "unmapped":
+            with zipfile.ZipFile(path, "a") as archive:
+                archive.writestr("xl/unmapped.payload", b"payload")
+        else:
+            def invalidate(payload: bytes) -> bytes:
+                if invalid_case == "namespace":
+                    return payload.replace(
+                        b"http://schemas.openxmlformats.org/package/"
+                        b"2006/content-types",
+                        b"urn:invalid-content-types",
+                    )
+                if invalid_case == "child":
+                    return payload.replace(
+                        b"</Types>",
+                        b"<Bogus/></Types>",
+                    )
+                marker = b'<Override PartName="/xl/workbook.xml"'
+                start = payload.index(marker)
+                end = payload.index(b"/>", start) + 2
+                return payload[:end] + payload[start:end] + payload[end:]
+
+            self._rewrite_xlsx_member(
+                path,
+                "[Content_Types].xml",
+                invalidate,
+            )
+
+        with pytest.raises(InspectionError, match="content types"):
+            preflight_xlsx(str(path))
+
     def test_xlsx_preflight_rejects_unsupported_compression_and_content_type(
         self, tmp_path
     ) -> None:
@@ -2281,6 +2617,32 @@ class TestSpreadsheetInspector:
             archive.writestr("xl/workbook.xml", "<workbook/>")
         with pytest.raises(InspectionError, match="content types"):
             preflight_xlsx(str(mismatched))
+
+    def test_xlsx_preflight_wraps_decompression_errors(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        path = tmp_path / "decompression-error.xlsx"
+        self._save_xlsx(path)
+        real_open = spreadsheet.zipfile.ZipFile.open
+
+        def broken_open(archive, member, *args, **kwargs):
+            if getattr(member, "filename", member) == "[Content_Types].xml":
+                raise zlib.error("invalid distance code")
+            return real_open(archive, member, *args, **kwargs)
+
+        monkeypatch.setattr(
+            spreadsheet.zipfile.ZipFile,
+            "open",
+            broken_open,
+        )
+
+        with pytest.raises(
+            InspectionError,
+            match="OOXML ZIP could not be validated",
+        ):
+            spreadsheet.preflight_xlsx(str(path))
 
     def test_xlsx_preflight_rejects_encrypted_nonregular_and_nul_entries(
         self,
@@ -2427,31 +2789,42 @@ class TestSpreadsheetInspector:
         ):
             preflight_xlsx(str(path))
 
-    def test_xlsx_preflight_rejects_ambiguous_data_descriptor(
-        self, tmp_path
+    @pytest.mark.parametrize(
+        ("zip64", "descriptor_format"),
+        [(False, "<3L"), (True, "<LQQ")],
+        ids=["zip32", "zip64"],
+    )
+    def test_xlsx_data_descriptor_accepts_unsigned_signature_crc(
+        self,
+        tmp_path,
+        zip64,
+        descriptor_format,
     ) -> None:
-        from skillopt.envs.skilleval.inspectors.spreadsheet import (
-            preflight_xlsx,
-        )
+        from skillopt.envs.skilleval.inspectors import spreadsheet
 
-        path = tmp_path / "ambiguous-descriptor.xlsx"
-        self._save_xlsx(path)
-        self._rewrite_xlsx_with_data_descriptors(
-            path,
-            zip64=False,
-            signature=False,
-            descriptor_transform=lambda name, descriptor: (
-                b"PK\x07\x08" + descriptor[4:]
-                if name == "[Content_Types].xml"
-                else descriptor
-            ),
+        member = zipfile.ZipInfo("xl/collision.xml")
+        member.CRC = 0x08074B50
+        member.compress_size = 7
+        member.file_size = 11
+        descriptor = struct.pack(
+            descriptor_format,
+            member.CRC,
+            member.compress_size,
+            member.file_size,
         )
-
-        with pytest.raises(
-            InspectionError,
-            match="data descriptor is ambiguous",
-        ):
-            preflight_xlsx(str(path))
+        path = tmp_path / "descriptor.bin"
+        path.write_bytes(descriptor)
+        file_descriptor = os.open(path, os.O_RDONLY)
+        try:
+            assert spreadsheet._validate_data_descriptor(
+                file_descriptor,
+                member,
+                0,
+                len(descriptor),
+                zip64=zip64,
+            ) == len(descriptor)
+        finally:
+            os.close(file_descriptor)
 
     def test_xlsx_preflight_rejects_wrong_data_descriptor_width(
         self, tmp_path
@@ -2878,6 +3251,43 @@ class TestSpreadsheetInspector:
 
         with pytest.raises(InspectionError, match="expected output"):
             evaluate_xlsx_check(str(path), check)
+
+    def test_libreoffice_lookup_failure_does_not_leak_input_fd(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        path = tmp_path / "legacy.xls"
+        path.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1legacy")
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+
+        def missing_libreoffice():
+            raise InspectionError("LibreOffice is unavailable")
+
+        monkeypatch.setattr(
+            spreadsheet,
+            "_find_libreoffice",
+            missing_libreoffice,
+        )
+        with scratch_transaction(
+            str(scratch),
+            max_bytes=inspector_base.DEFAULT_SCRATCH_BYTES,
+            max_entries=inspector_base.DEFAULT_SCRATCH_ENTRIES,
+            max_depth=inspector_base.DEFAULT_SCRATCH_DEPTH,
+        ) as transaction:
+            before = set(os.listdir("/proc/self/fd"))
+            for _ in range(3):
+                with pytest.raises(
+                    InspectionError,
+                    match="LibreOffice is unavailable",
+                ):
+                    spreadsheet._convert_with_libreoffice(
+                        str(path),
+                        transaction.proc_path,
+                        "xlsx",
+                    )
+            assert set(os.listdir("/proc/self/fd")) == before
 
     @pytest.mark.skipif(
         shutil.which("libreoffice") is None
