@@ -86,8 +86,8 @@ Studio request:
   optimizer state. `plugin_hash()` includes Skill names, Skill content,
   support-file relative paths, and support-file bytes.
 - `PluginTrainer.preflight()` runs before `_configure_models()`. It loads every
-  split, normalizes Plugin metadata, validates complete held-out coverage, and
-  rejects unsupported modes and invalid numeric settings.
+  split, normalizes Plugin metadata, validates held-out coverage for every
+  trainable Skill, and rejects unsupported modes and invalid numeric settings.
 - Model setup applies shared and role-specific Azure/OpenAI, Qwen, MiniMax,
   Codex exec, and Claude Code exec configuration before training.
 - Failed scored trajectories are categorized as `routing`, `execution`,
@@ -98,10 +98,18 @@ Studio request:
 - Reflection, merge, ranking, and edit application run independently per
   selected Skill using only trajectories attributed to that Skill.
 - A candidate is accepted only when the configured overall metric strictly
-  improves and no covered Skill regresses more than
+  improves and no trainable Skill regresses more than
   `max_skill_regression`. The default `0.0` forbids any regression.
 - Validation coverage is checked after `sel_env_num` is applied, so the actual
-  gate set must cover every installed Skill.
+  gate set must cover every trainable Skill. Installed frozen Skills remain in
+  every rollout but do not require attributed validation tasks or receive
+  dedicated regression metrics.
+- Ratio-mode SkillEval splits greedily seed validation with the smallest
+  deterministic task set covering all trainable Skills, then fill to at least
+  the requested ratio count. Validation may grow beyond the nominal ratio;
+  train, validation, and test remain disjoint and train/test remain non-empty.
+  `split_manifest.json` records `required_validation_skills`,
+  `minimum_validation_count`, actual counts, and `coverage_aware: true`.
 - Complete snapshots are written below `plugin_versions/`. Runtime state points
   only to a completed snapshot. Resume requires the same ordered runtime names
   and trainable names and starts after `last_completed_step`.
@@ -141,7 +149,10 @@ out/
 | Missing/empty `SKILL.md`, unsafe name, or duplicate runtime name | Exit before model configuration |
 | Unknown `--train-skill` | Exit before model configuration |
 | Malformed or unknown task target | Exit before model configuration |
-| Validation subset misses an installed Skill | Exit before model configuration |
+| Ratio source misses a trainable Skill | Exit before model configuration and name the missing source coverage |
+| Validation subset misses a trainable Skill after `sel_env_num` | Exit before model configuration |
+| Validation has no task for an installed frozen Skill | Continue; the Skill remains installed but has no dedicated regression metric |
+| Coverage-aware validation would leave train or test empty | Exit before model configuration |
 | No trainable Skill | Exit before model configuration |
 | `max_skills_per_candidate <= 0` | Reject; do not replace zero with the default |
 | `max_skill_regression` outside `[0, 1]` | Reject |
@@ -160,6 +171,9 @@ out/
 - Good: six `cc-knowledge` Skills are installed, five are trainable, two are
   selected from attributed failures, and the complete six-Skill candidate is
   gated.
+- Good: a frozen installed Skill has no attributed task; the runtime still
+  installs it while coverage and per-Skill gate metrics use the five trainable
+  Skills.
 - Good: a candidate raises overall soft score and keeps every covered Skill at
   or above its previous score; it becomes the new `best_plugin/`.
 - Base: `trainable_skill_ids` is omitted, so every selected Plugin Skill is
@@ -168,7 +182,7 @@ out/
   `skip_no_attribution` without optimizer calls.
 - Bad: local improvement of one Skill is accepted without evaluating the
   complete Plugin.
-- Bad: a higher Plugin score hides a covered Skill regression above the
+- Bad: a higher Plugin score hides a trainable Skill regression above the
   configured threshold.
 - Bad: Studio passes a sidecar display name as `--train-skill` instead of the
   frontmatter/path runtime name.
@@ -180,11 +194,15 @@ out/
 - Attribution: every category, stable tie ordering, trainable filtering, and no
   gradients for task/judge failures.
 - Gate: strict overall improvement, hard/soft/mixed projection, threshold
-  boundaries, complete per-Skill coverage, accept, and reject reasons.
+  boundaries, trainable per-Skill coverage, frozen-Skill exclusion, accept,
+  and reject reasons.
 - Trainer: complete-Plugin baseline/candidate/test rollouts, accepted export,
-  rejected regression, skip paths, and resume without replay.
-- CLI: task metadata and held-out coverage failures occur before
-  `_configure_models`; role-specific backend settings are applied.
+  rejected trainable regression, coverage-aware ratio splits, deterministic
+  split manifests, `sel_env_num` truncation, skip paths, and resume without
+  replay.
+- CLI: task metadata and trainable held-out coverage failures occur before
+  `_configure_models`; missing frozen-Skill coverage is accepted; role-specific
+  backend settings are applied.
 - Studio: exact repeated `--skill` flags, runtime `--train-skill` names,
   trainable subset validation, stub job artifacts, mid-run Plugin mode, and
   per-Skill diffs.
@@ -236,10 +254,11 @@ candidate_results = adapter.rollout_plugin(validation_items, candidate_state, ou
 gate = evaluate_plugin_gate(
     current_aggregates,
     aggregate_results(candidate_results, list(candidate_state.names)),
-    list(candidate_state.names),
+    list(candidate_state.trainable_names),
     max_skill_regression=cfg["max_skill_regression"],
 )
 ```
 
-Always validate the complete Plugin and enforce both the overall and per-Skill
-conditions.
+Always run the complete Plugin, enforce the overall condition across all
+validation tasks, and enforce dedicated regression conditions for trainable
+Skills.

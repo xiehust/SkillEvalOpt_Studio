@@ -18,7 +18,12 @@ Task item schema::
 """
 from __future__ import annotations
 
-from skillopt.datasets.base import SplitDataLoader, _load_json_or_jsonl
+from skillopt.datasets.base import (
+    SplitDataLoader,
+    _compute_weighted_counts,
+    _load_json_or_jsonl,
+)
+from skillopt.envs.skilleval.plugin import normalize_plugin_tasks
 
 _REQUIRED_FIELDS = ("id", "question", "rubric")
 _DEFAULT_TASK_TYPE = "default"
@@ -141,9 +146,140 @@ class SkillEvalDataLoader(SplitDataLoader):
     single-file evaluation path.
     """
 
+    def setup(self, cfg: dict) -> None:
+        self.plugin_skill_names = self._normalize_skill_names(
+            cfg.get("plugin_skill_names"),
+            "plugin_skill_names",
+        )
+        self.required_validation_skills = self._normalize_skill_names(
+            cfg.get("required_validation_skills"),
+            "required_validation_skills",
+        )
+        installed = set(self.plugin_skill_names)
+        unknown = [
+            name
+            for name in self.required_validation_skills
+            if name not in installed
+        ]
+        if unknown:
+            raise ValueError(
+                "required_validation_skills must be installed Plugin Skills: "
+                f"{unknown}"
+            )
+        self._minimum_validation_count = 0
+        super().setup(cfg)
+
+    @staticmethod
+    def _normalize_skill_names(value: object, key: str) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        if not isinstance(value, (list, tuple)):
+            raise ValueError(f"{key} must be a string array")
+        names: list[str] = []
+        for raw_name in value:
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                raise ValueError(f"{key} must contain non-empty strings")
+            name = raw_name.strip()
+            if name not in names:
+                names.append(name)
+        return tuple(names)
+
+    def _normalize_plugin_metadata(self, items: list[dict]) -> list[dict]:
+        if self.plugin_skill_names:
+            normalize_plugin_tasks(items, set(self.plugin_skill_names))
+        return items
+
     def load_raw_items(self, data_path: str) -> list[dict]:
-        return _normalize_items(_load_json_or_jsonl(data_path), data_path)
+        items = _normalize_items(_load_json_or_jsonl(data_path), data_path)
+        return self._normalize_plugin_metadata(items)
 
     def load_split_items(self, split_path: str) -> list[dict]:
         items = super().load_split_items(split_path)
-        return _normalize_items(items, split_path)
+        normalized = _normalize_items(items, split_path)
+        return self._normalize_plugin_metadata(normalized)
+
+    def _partition_ratio_items(
+        self,
+        shuffled: list[dict],
+        counts: tuple[int, int, int],
+        ratio: tuple[int, int, int],
+    ) -> tuple[list[dict], list[dict], list[dict]]:
+        required_names = self.required_validation_skills
+        if not required_names:
+            return super()._partition_ratio_items(shuffled, counts, ratio)
+
+        required = set(required_names)
+        coverage = [
+            {
+                name
+                for name in item.get("target_skills", [])
+                if isinstance(name, str) and name in required
+            }
+            for item in shuffled
+        ]
+        covered = {name for targets in coverage for name in targets}
+        missing = [name for name in required_names if name not in covered]
+        if missing:
+            raise ValueError(
+                "Plugin task set cannot cover every trainable Skill; "
+                f"missing source coverage for: {missing}"
+            )
+
+        selected: list[int] = []
+        selected_set: set[int] = set()
+        uncovered = set(required)
+        while uncovered:
+            best_index = -1
+            best_gain: set[str] = set()
+            for index, targets in enumerate(coverage):
+                if index in selected_set:
+                    continue
+                gain = targets & uncovered
+                if len(gain) > len(best_gain):
+                    best_index = index
+                    best_gain = gain
+            if best_index < 0:
+                raise RuntimeError(
+                    "coverage selection stalled after source coverage validation"
+                )
+            selected.append(best_index)
+            selected_set.add(best_index)
+            uncovered -= best_gain
+
+        self._minimum_validation_count = len(selected)
+        val_n = max(counts[1], self._minimum_validation_count)
+        if val_n > len(shuffled) - 2:
+            raise ValueError(
+                "Plugin ratio split cannot keep train and test non-empty: "
+                f"validation needs {self._minimum_validation_count} tasks to cover "
+                f"{list(required_names)}, but the source has {len(shuffled)} tasks"
+            )
+
+        for index in range(len(shuffled)):
+            if len(selected) >= val_n:
+                break
+            if index not in selected_set:
+                selected.append(index)
+                selected_set.add(index)
+
+        val_items = [shuffled[index] for index in selected]
+        remaining = [
+            item for index, item in enumerate(shuffled) if index not in selected_set
+        ]
+        train_n = _compute_weighted_counts(
+            len(remaining),
+            (ratio[0], ratio[2]),
+        )[0]
+        train_n = max(1, min(len(remaining) - 1, train_n))
+        train_items = remaining[:train_n]
+        test_items = remaining[train_n:]
+        return train_items, val_items, test_items
+
+    def _ratio_split_manifest(self) -> dict:
+        if not self.required_validation_skills:
+            return {}
+        return {
+            "coverage_aware": True,
+            "required_validation_skills": list(self.required_validation_skills),
+            "minimum_validation_count": self._minimum_validation_count,
+        }

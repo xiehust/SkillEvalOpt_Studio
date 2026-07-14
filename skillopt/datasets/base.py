@@ -206,8 +206,7 @@ def _parse_split_ratio(text: str) -> tuple[int, int, int]:
     return train, val, test
 
 
-def _compute_split_counts(total: int, ratio: tuple[int, int, int]) -> tuple[int, int, int]:
-    weights = list(ratio)
+def _compute_weighted_counts(total: int, weights: tuple[int, ...]) -> list[int]:
     denom = sum(weights)
     raw = [total * weight / denom for weight in weights]
     counts = [int(value) for value in raw]
@@ -219,6 +218,11 @@ def _compute_split_counts(total: int, ratio: tuple[int, int, int]) -> tuple[int,
     )
     for idx in order[:remaining]:
         counts[idx] += 1
+    return counts
+
+
+def _compute_split_counts(total: int, ratio: tuple[int, int, int]) -> tuple[int, int, int]:
+    counts = _compute_weighted_counts(total, ratio)
     return counts[0], counts[1], counts[2]
 
 
@@ -327,6 +331,24 @@ class SplitDataLoader(BaseDataLoader):
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(items, f, ensure_ascii=False, indent=2)
 
+    def _partition_ratio_items(
+        self,
+        shuffled: list[dict],
+        counts: tuple[int, int, int],
+        ratio: tuple[int, int, int],
+    ) -> tuple[list[dict], list[dict], list[dict]]:
+        """Partition shuffled items; subclasses may enforce domain coverage."""
+        del ratio
+        train_n, val_n, test_n = counts
+        train_items = shuffled[:train_n]
+        val_items = shuffled[train_n: train_n + val_n]
+        test_items = shuffled[train_n + val_n: train_n + val_n + test_n]
+        return train_items, val_items, test_items
+
+    def _ratio_split_manifest(self) -> dict[str, Any]:
+        """Return subclass-specific metadata for a generated split."""
+        return {}
+
     def _materialize_ratio_split(self, cfg: dict) -> str:
         data_path = os.path.abspath(str(self.data_path or "").strip())
         if not data_path:
@@ -344,9 +366,11 @@ class SplitDataLoader(BaseDataLoader):
         rng.shuffle(shuffled)
 
         train_n, val_n, test_n = _compute_split_counts(len(shuffled), ratio)
-        train_items = shuffled[:train_n]
-        val_items = shuffled[train_n: train_n + val_n]
-        test_items = shuffled[train_n + val_n: train_n + val_n + test_n]
+        train_items, val_items, test_items = self._partition_ratio_items(
+            shuffled,
+            (train_n, val_n, test_n),
+            ratio,
+        )
 
         split_dir = self._resolve_split_output_dir(cfg)
         manifest = {
@@ -360,6 +384,7 @@ class SplitDataLoader(BaseDataLoader):
                 "test": len(test_items),
             },
         }
+        manifest.update(self._ratio_split_manifest())
         os.makedirs(split_dir, exist_ok=True)
         self.write_split_items(os.path.join(split_dir, "train"), train_items)
         self.write_split_items(os.path.join(split_dir, "val"), val_items)

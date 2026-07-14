@@ -15,7 +15,6 @@ from skillopt.envs.skilleval.plugin import (
     PluginState,
     aggregate_results,
     load_plugin_snapshot,
-    normalize_plugin_tasks,
     plugin_hash,
     write_plugin_snapshot,
 )
@@ -100,21 +99,21 @@ class PluginTrainer:
         if not 0.0 <= mixed_weight <= 1.0:
             raise ValueError("gate_mixed_weight must be in [0, 1]")
 
+        cfg["plugin_skill_names"] = list(self.initial_state.names)
+        cfg["required_validation_skills"] = list(
+            self.initial_state.trainable_names
+        )
         self.adapter.setup(cfg)
         self.dataloader = self.adapter.get_dataloader()
-        skill_names = set(self.initial_state.names)
-        for items in (
-            self.dataloader.train_items,
-            self.dataloader.val_items,
-            self.dataloader.test_items,
-        ):
-            normalize_plugin_tasks(items, skill_names)
 
         selection_limit = int(cfg.get("sel_env_num", 0) or 0)
         self._selection_items = list(self.dataloader.val_items)
         if selection_limit > 0:
             self._selection_items = self._selection_items[:selection_limit]
-        validate_plugin_coverage(self._selection_items, list(self.initial_state.names))
+        validate_plugin_coverage(
+            self._selection_items,
+            list(self.initial_state.trainable_names),
+        )
 
         batch_size = int(cfg.get("batch_size", 0) or 0)
         num_epochs = int(cfg.get("num_epochs", 0) or 0)
@@ -193,7 +192,7 @@ class PluginTrainer:
     ) -> None:
         overall_score, per_skill = metric_scores(
             aggregates,
-            list(state.names),
+            list(state.trainable_names),
             self.cfg["gate_metric"],
             float(self.cfg.get("gate_mixed_weight", 0.5)),
         )
@@ -417,7 +416,7 @@ class PluginTrainer:
                         gate = evaluate_plugin_gate(
                             current_aggregates,
                             candidate_aggregates,
-                            list(current_state.names),
+                            list(current_state.trainable_names),
                             metric=cfg["gate_metric"],
                             mixed_weight=float(cfg.get("gate_mixed_weight", 0.5)),
                             max_skill_regression=float(
@@ -443,7 +442,7 @@ class PluginTrainer:
 
                 current_score, current_skill_scores = metric_scores(
                     current_aggregates,
-                    list(current_state.names),
+                    list(current_state.trainable_names),
                     cfg["gate_metric"],
                     float(cfg.get("gate_mixed_weight", 0.5)),
                 )
@@ -500,7 +499,7 @@ class PluginTrainer:
         actions = Counter(str(row.get("action")) for row in history)
         current_score, current_skill_scores = metric_scores(
             current_aggregates,
-            list(current_state.names),
+            list(current_state.trainable_names),
             cfg["gate_metric"],
             float(cfg.get("gate_mixed_weight", 0.5)),
         )

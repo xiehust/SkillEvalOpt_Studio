@@ -377,7 +377,7 @@ class TestPluginTrainer:
             [
                 str(_make_skill(tmp_path, "alpha")),
                 str(_make_skill(tmp_path, "beta")),
-            ]
+            ],
         )
         split = _write_split(
             tmp_path,
@@ -390,6 +390,205 @@ class TestPluginTrainer:
 
         with pytest.raises(ValueError, match="max_skills_per_candidate"):
             PluginTrainer(cfg, adapter, state).preflight()
+
+    def test_ratio_split_expands_validation_for_trainable_coverage(
+        self,
+        tmp_path,
+    ) -> None:
+        state = collect_plugin_state(
+            [
+                str(_make_skill(tmp_path, "alpha")),
+                str(_make_skill(tmp_path, "beta")),
+                str(_make_skill(tmp_path, "gamma")),
+                str(_make_skill(tmp_path, "frozen")),
+            ],
+            ["alpha", "beta", "gamma"],
+        )
+        tasks = [
+            _task("task-a1", ["alpha"]),
+            _task("task-b1", ["beta"]),
+            _task("task-c1", ["gamma"]),
+            _task("task-ab", ["alpha", "beta"], "integration"),
+            _task("task-a2", ["alpha"]),
+            _task("task-b2", ["beta"]),
+            _task("task-c2", ["gamma"]),
+        ]
+        data_path = tmp_path / "tasks.json"
+        data_path.write_text(json.dumps(tasks), encoding="utf-8")
+
+        def prepare(split_name: str, **overrides):
+            split_output = tmp_path / split_name
+            cfg = _trainer_cfg(
+                tmp_path,
+                "",
+                split_mode="ratio",
+                split_dir="",
+                data_path=str(data_path),
+                split_output_dir=str(split_output),
+                split_ratio="4:1:2",
+                batch_size=1,
+                eval_test=False,
+                **overrides,
+            )
+            adapter = SkillEvalAdapter(
+                data_path=str(data_path),
+                split_mode="ratio",
+                split_ratio="4:1:2",
+                split_output_dir=str(split_output),
+                workers=1,
+            )
+            trainer = PluginTrainer(cfg, adapter, state)
+            trainer.preflight()
+            return trainer, split_output
+
+        first, first_split = prepare("split-first")
+        second, _second_split = prepare("split-second")
+
+        first_ids = [item["id"] for item in first._selection_items]
+        second_ids = [item["id"] for item in second._selection_items]
+        assert first_ids == second_ids
+        assert len(first_ids) == 2
+        assert {
+            target
+            for item in first._selection_items
+            for target in item["target_skills"]
+        } >= {"alpha", "beta", "gamma"}
+
+        manifest = json.loads(
+            (first_split / "split_manifest.json").read_text(encoding="utf-8")
+        )
+        assert manifest["counts"] == {"train": 3, "val": 2, "test": 2}
+        assert manifest["coverage_aware"] is True
+        assert manifest["required_validation_skills"] == [
+            "alpha",
+            "beta",
+            "gamma",
+        ]
+        assert manifest["minimum_validation_count"] == 2
+
+    def test_ratio_split_rejects_missing_or_truncated_trainable_coverage(
+        self,
+        tmp_path,
+    ) -> None:
+        state = collect_plugin_state(
+            [
+                str(_make_skill(tmp_path, "alpha")),
+                str(_make_skill(tmp_path, "beta")),
+                str(_make_skill(tmp_path, "gamma")),
+            ]
+        )
+        complete_tasks = [
+            _task("task-a1", ["alpha"]),
+            _task("task-b1", ["beta"]),
+            _task("task-c1", ["gamma"]),
+            _task("task-ab", ["alpha", "beta"], "integration"),
+            _task("task-a2", ["alpha"]),
+            _task("task-b2", ["beta"]),
+            _task("task-c2", ["gamma"]),
+        ]
+
+        def preflight(tasks: list[dict], split_name: str, **overrides) -> None:
+            data_path = tmp_path / f"{split_name}.json"
+            data_path.write_text(json.dumps(tasks), encoding="utf-8")
+            split_output = tmp_path / split_name
+            cfg = _trainer_cfg(
+                tmp_path,
+                "",
+                split_mode="ratio",
+                split_dir="",
+                data_path=str(data_path),
+                split_output_dir=str(split_output),
+                split_ratio="4:1:2",
+                batch_size=1,
+                eval_test=False,
+                **overrides,
+            )
+            adapter = SkillEvalAdapter(
+                data_path=str(data_path),
+                split_mode="ratio",
+                split_ratio="4:1:2",
+                split_output_dir=str(split_output),
+                workers=1,
+            )
+            PluginTrainer(cfg, adapter, state).preflight()
+
+        without_gamma = [
+            dict(task, target_skills=["alpha"])
+            if task["target_skills"] == ["gamma"]
+            else task
+            for task in complete_tasks
+        ]
+        with pytest.raises(ValueError, match="missing source coverage.*gamma"):
+            preflight(without_gamma, "split-missing")
+
+        with pytest.raises(ValueError, match="gamma"):
+            preflight(complete_tasks, "split-truncated", sel_env_num=1)
+
+    def test_frozen_skill_needs_no_coverage_or_regression_metric(
+        self,
+        tmp_path,
+        monkeypatch,
+    ) -> None:
+        state = collect_plugin_state(
+            [
+                str(_make_skill(tmp_path, "alpha")),
+                str(_make_skill(tmp_path, "frozen")),
+            ],
+            ["alpha"],
+        )
+        split = _write_split(
+            tmp_path,
+            [_task("train-a", ["alpha"])],
+            [_task("val-a", ["alpha"]), _task("val-general", None)],
+            [_task("test-a", ["alpha"])],
+        )
+        cfg = _trainer_cfg(
+            tmp_path,
+            split,
+            batch_size=1,
+            max_skills_per_candidate=1,
+            eval_test=False,
+        )
+        adapter = SkillEvalAdapter(
+            split_dir=str(split),
+            split_mode="split_dir",
+            workers=1,
+            analyst_workers=1,
+            failure_only=True,
+            minibatch_size=1,
+            edit_budget=1,
+        )
+        _patch_append_reflection(monkeypatch, adapter, [])
+
+        def fake_rollout(items, plugin_state, out_dir, **kwargs):
+            del out_dir, kwargs
+            changed = "## Improved" in plugin_state.skill("alpha").content
+            return [
+                {
+                    "id": item["id"],
+                    "hard": int(changed and item["id"].startswith("val-")),
+                    "soft": float(changed and item["id"].startswith("val-")),
+                    "task_type": item.get("task_type", "default"),
+                    "target_skills": list(item.get("target_skills") or []),
+                }
+                for item in items
+            ]
+
+        monkeypatch.setattr(adapter, "rollout_plugin", fake_rollout)
+        trainer = PluginTrainer(cfg, adapter, state)
+        trainer.preflight()
+        summary = trainer.train()
+
+        assert summary["total_accepts"] == 1
+        assert summary["best_skill_scores"] == {"alpha": 1.0}
+        history = json.loads(
+            (tmp_path / "out" / "history.json").read_text(encoding="utf-8")
+        )
+        assert set(history[0]["regressions"]) == {"alpha"}
+        runtime = json.loads(
+            (tmp_path / "out" / "runtime_state.json").read_text(encoding="utf-8")
+        )
+        assert runtime["current_skill_scores"] == {"alpha": 1.0}
 
     def test_accepts_complete_candidate_exports_and_resumes(
         self, tmp_path, monkeypatch
@@ -473,15 +672,14 @@ class TestPluginTrainer:
         assert resumed_summary["total_steps"] == 1
         assert len(reflect_calls) == 2
 
-    def test_rejects_overall_gain_when_other_skill_regresses(
+    def test_rejects_overall_gain_when_other_trainable_skill_regresses(
         self, tmp_path, monkeypatch
     ) -> None:
         state = collect_plugin_state(
             [
                 str(_make_skill(tmp_path, "alpha")),
                 str(_make_skill(tmp_path, "beta")),
-            ],
-            ["alpha"],
+            ]
         )
         split = _write_split(
             tmp_path,
