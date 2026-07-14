@@ -6,12 +6,13 @@ import io
 import json
 import os
 import stat
-from typing import Callable
+from typing import Annotated, Callable
 
-from mcp.server.mcpserver import Image, MCPServer, ResourceSecurity
-from mcp_types import CallToolResult, ImageContent, TextContent
+from mcp.server.fastmcp import FastMCP, Image
+from mcp.types import CallToolResult, ImageContent, TextContent
 from PIL import Image as PillowImage
 from PIL import UnidentifiedImageError
+from pydantic import Field
 
 from .inspectors import (
     extract_artifact,
@@ -24,18 +25,30 @@ from .inspectors.base import (
     DEFAULT_RESPONSE_BYTES,
     InspectionError,
     MAX_EXTRACT_CHARS,
+    MAX_LOGICAL_COMPONENTS,
+    MAX_LOGICAL_COMPONENT_BYTES,
+    MAX_LOGICAL_PATH_BYTES,
+    MAX_LOGICAL_PATH_CHARS,
     MAX_RENDER_PIXELS,
     MAX_RESPONSE_BYTES,
+    MIN_RESPONSE_BYTES,
     ResponseBudget,
     bounded_diagnostic,
     resolve_scratch_path,
     validate_json_result,
+    validate_logical_path,
     validate_roots,
 )
 
 DEFAULT_MAX_MEDIA_BYTES = 25 * 1024 * 1024
 MAX_MEDIA_BYTES = 100 * 1024 * 1024
-_MIN_SERVER_RESPONSE_BYTES = 512
+_PATH_ARGUMENT_DESCRIPTION = (
+    "Normalized POSIX-relative evidence path; at most "
+    f"{MAX_LOGICAL_PATH_CHARS} characters, {MAX_LOGICAL_PATH_BYTES} UTF-8 "
+    f"bytes, {MAX_LOGICAL_COMPONENTS} components, and "
+    f"{MAX_LOGICAL_COMPONENT_BYTES} UTF-8 bytes per component."
+)
+LogicalPath = Annotated[str, Field(description=_PATH_ARGUMENT_DESCRIPTION)]
 
 
 def _positive_maximum(value: object, name: str, maximum: int) -> int:
@@ -55,6 +68,23 @@ def _request_budget(
 ) -> int:
     selected = default if value is None else value
     return _positive_maximum(selected, name, maximum)
+
+
+def _select_response_budget(
+    requested: int | None,
+    server_maximum: int,
+) -> int:
+    if requested is None:
+        return server_maximum
+    if (
+        isinstance(requested, bool)
+        or not isinstance(requested, int)
+        or requested < MIN_RESPONSE_BYTES
+    ):
+        raise InspectionError(
+            f"response byte budget must be at least {MIN_RESPONSE_BYTES}"
+        )
+    return min(requested, server_maximum)
 
 
 def _envelope(operation: str, *, result=None, error: str | None = None) -> dict:
@@ -116,20 +146,29 @@ def _error_result(
         )
         return _tool_result(
             fallback,
-            response_limit=max(
-                response_limit,
-                _MIN_SERVER_RESPONSE_BYTES,
-            ),
+            response_limit=response_limit,
         )
 
 
 def _guarded_tool(
     operation: str,
-    response_limit: int,
-    function: Callable[[], CallToolResult],
+    requested_response_limit: int | None,
+    server_response_maximum: int,
+    function: Callable[[int], CallToolResult],
 ) -> CallToolResult:
     try:
-        return function()
+        response_limit = _select_response_budget(
+            requested_response_limit,
+            server_response_maximum,
+        )
+    except Exception as exc:
+        return _error_result(
+            operation,
+            exc,
+            response_limit=server_response_maximum,
+        )
+    try:
+        return function(response_limit)
     except Exception as exc:
         return _error_result(
             operation,
@@ -197,7 +236,7 @@ def create_server(
     max_response_bytes: int = DEFAULT_RESPONSE_BYTES,
     max_extract_chars: int = DEFAULT_EXTRACT_CHARS,
     max_media_bytes: int = DEFAULT_MAX_MEDIA_BYTES,
-) -> MCPServer:
+) -> FastMCP:
     """Create an in-memory or stdio Artifact MCP server."""
     evidence, scratch = validate_roots(evidence_dir, scratch_dir)
     server_render_max = _positive_maximum(
@@ -210,10 +249,10 @@ def create_server(
         "server response byte maximum",
         MAX_RESPONSE_BYTES,
     )
-    if server_response_max < _MIN_SERVER_RESPONSE_BYTES:
+    if server_response_max < MIN_RESPONSE_BYTES:
         raise InspectionError(
             f"server response byte maximum must be at least "
-            f"{_MIN_SERVER_RESPONSE_BYTES}"
+            f"{MIN_RESPONSE_BYTES}"
         )
     server_extract_max = _positive_maximum(
         max_extract_chars,
@@ -226,11 +265,9 @@ def create_server(
         MAX_MEDIA_BYTES,
     )
 
-    server = MCPServer(
+    server = FastMCP(
         "skillopt-artifact",
-        description="Trusted bounded access to immutable evaluation artifacts.",
         instructions=None,
-        resource_security=ResourceSecurity(exempt_params={"path"}),
     )
 
     @server.tool(
@@ -240,16 +277,7 @@ def create_server(
     def artifact_inventory(
         max_response_bytes: int | None = None,
     ) -> CallToolResult:
-        response_limit = server_response_max
-
-        def run() -> CallToolResult:
-            nonlocal response_limit
-            response_limit = _request_budget(
-                max_response_bytes,
-                default=server_response_max,
-                maximum=server_response_max,
-                name="response byte budget",
-            )
+        def run(response_limit: int) -> CallToolResult:
             result = inventory_artifacts(
                 evidence,
                 scratch,
@@ -260,26 +288,26 @@ def create_server(
                 response_limit=response_limit,
             )
 
-        return _guarded_tool("artifact_inventory", response_limit, run)
+        return _guarded_tool(
+            "artifact_inventory",
+            max_response_bytes,
+            server_response_max,
+            run,
+        )
 
     @server.tool(
         name="artifact_inspect",
-        description="Inspect one logical evidence-relative artifact.",
+        description=(
+            "Inspect one logical evidence artifact. "
+            + _PATH_ARGUMENT_DESCRIPTION
+        ),
     )
     def artifact_inspect(
-        path: str,
+        path: LogicalPath,
         max_response_bytes: int | None = None,
     ) -> CallToolResult:
-        response_limit = server_response_max
-
-        def run() -> CallToolResult:
-            nonlocal response_limit
-            response_limit = _request_budget(
-                max_response_bytes,
-                default=server_response_max,
-                maximum=server_response_max,
-                name="response byte budget",
-            )
+        def run(response_limit: int) -> CallToolResult:
+            validate_logical_path(path)
             result = inspect_artifact(
                 path,
                 evidence_dir=evidence,
@@ -291,28 +319,28 @@ def create_server(
                 response_limit=response_limit,
             )
 
-        return _guarded_tool("artifact_inspect", response_limit, run)
+        return _guarded_tool(
+            "artifact_inspect",
+            max_response_bytes,
+            server_response_max,
+            run,
+        )
 
     @server.tool(
         name="artifact_render",
-        description="Render selected artifact units as bounded PNG content.",
+        description=(
+            "Render selected artifact units as bounded PNG content. "
+            + _PATH_ARGUMENT_DESCRIPTION
+        ),
     )
     def artifact_render(
-        path: str,
+        path: LogicalPath,
         selectors: list[str] | None = None,
         max_pixels: int | None = None,
         max_response_bytes: int | None = None,
     ) -> CallToolResult:
-        response_limit = server_response_max
-
-        def run() -> CallToolResult:
-            nonlocal response_limit
-            response_limit = _request_budget(
-                max_response_bytes,
-                default=server_response_max,
-                maximum=server_response_max,
-                name="response byte budget",
-            )
+        def run(response_limit: int) -> CallToolResult:
+            validate_logical_path(path)
             pixel_limit = _request_budget(
                 max_pixels,
                 default=server_render_max,
@@ -349,28 +377,28 @@ def create_server(
                 images=images,
             )
 
-        return _guarded_tool("artifact_render", response_limit, run)
+        return _guarded_tool(
+            "artifact_render",
+            max_response_bytes,
+            server_response_max,
+            run,
+        )
 
     @server.tool(
         name="artifact_extract",
-        description="Extract bounded content from selected artifact units.",
+        description=(
+            "Extract bounded content from selected artifact units. "
+            + _PATH_ARGUMENT_DESCRIPTION
+        ),
     )
     def artifact_extract(
-        path: str,
+        path: LogicalPath,
         selectors: list[str] | None = None,
         max_extract_chars: int | None = None,
         max_response_bytes: int | None = None,
     ) -> CallToolResult:
-        response_limit = server_response_max
-
-        def run() -> CallToolResult:
-            nonlocal response_limit
-            response_limit = _request_budget(
-                max_response_bytes,
-                default=server_response_max,
-                maximum=server_response_max,
-                name="response byte budget",
-            )
+        def run(response_limit: int) -> CallToolResult:
+            validate_logical_path(path)
             extract_limit = _request_budget(
                 max_extract_chars,
                 default=server_extract_max,
@@ -390,7 +418,12 @@ def create_server(
                 response_limit=response_limit,
             )
 
-        return _guarded_tool("artifact_extract", response_limit, run)
+        return _guarded_tool(
+            "artifact_extract",
+            max_response_bytes,
+            server_response_max,
+            run,
+        )
 
     return server
 

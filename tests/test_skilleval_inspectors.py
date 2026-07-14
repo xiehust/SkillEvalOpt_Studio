@@ -9,8 +9,8 @@ import types
 from pathlib import Path
 
 import pytest
-from mcp.client import Client
-from mcp_types import ImageContent, TextContent
+from mcp.shared.memory import create_connected_server_and_client_session
+from mcp.types import ImageContent, TextContent
 from PIL import Image as PillowImage
 
 from skillopt.envs.skilleval import artifact_mcp
@@ -25,13 +25,19 @@ from skillopt.envs.skilleval.inspectors import (
 from skillopt.envs.skilleval.inspectors.__main__ import main as artifactctl_main
 from skillopt.envs.skilleval.inspectors.base import (
     MAX_COMMAND_OUTPUT_CHARS,
+    MAX_LOGICAL_COMPONENTS,
+    MAX_LOGICAL_COMPONENT_BYTES,
+    MAX_LOGICAL_PATH_BYTES,
+    MAX_LOGICAL_PATH_CHARS,
     MAX_RENDER_PIXELS,
     MAX_RESPONSE_BYTES,
+    MIN_RESPONSE_BYTES,
     RenderBudget,
     ResponseBudget,
     normalize_selectors,
     resolve_evidence_path,
     safe_run,
+    validate_logical_path,
     validate_roots,
 )
 
@@ -47,6 +53,15 @@ def _roots(tmp_path: Path) -> tuple[Path, Path]:
     evidence.mkdir()
     scratch.mkdir()
     return evidence, scratch
+
+
+def test_package_metadata_targets_stable_mcp_and_python_310() -> None:
+    root = Path(__file__).resolve().parents[1]
+    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'requires-python = ">=3.10"' in pyproject
+    assert '"mcp>=1.26,<2"' in pyproject
+    requirements = (root / "requirements.txt").read_text(encoding="utf-8")
+    assert "\nmcp>=1.26,<2\n" in f"\n{requirements}"
 
 
 def _write_pdf(path: Path, body: bytes = b"content") -> None:
@@ -115,6 +130,16 @@ class TestBudgetsAndSelectors:
         assert response.max_extract_chars > 0
         with pytest.raises(Exception):
             render.max_pixels = 1  # type: ignore[misc]
+
+    def test_response_budget_enforces_documented_minimum(self) -> None:
+        assert MIN_RESPONSE_BYTES >= len(
+            b'{"status":"error","error":"InspectionError: bounded failure"}'
+        )
+        assert ResponseBudget(max_bytes=MIN_RESPONSE_BYTES).max_bytes == (
+            MIN_RESPONSE_BYTES
+        )
+        with pytest.raises(InspectionError, match="at least"):
+            ResponseBudget(max_bytes=MIN_RESPONSE_BYTES - 1)
 
     @pytest.mark.parametrize(
         "selectors",
@@ -246,6 +271,36 @@ class TestSafeRun:
 
 
 class TestSecurePaths:
+    def test_logical_path_boundaries_are_accepted(self) -> None:
+        max_total = "/".join(["a" * 240] * 17)
+        assert len(max_total) == MAX_LOGICAL_PATH_CHARS
+        assert len(max_total.encode("utf-8")) == MAX_LOGICAL_PATH_BYTES
+        assert validate_logical_path(max_total) == tuple(
+            ["a" * 240] * 17
+        )
+        assert len(validate_logical_path("a/" * 63 + "a")) == (
+            MAX_LOGICAL_COMPONENTS
+        )
+        assert validate_logical_path("a" * MAX_LOGICAL_COMPONENT_BYTES) == (
+            "a" * MAX_LOGICAL_COMPONENT_BYTES,
+        )
+
+    @pytest.mark.parametrize(
+        ("logical_path", "message"),
+        [
+            ("/".join(["a" * 240] * 16 + ["a" * 241]), "character"),
+            ("/".join(["界" * 85] * 17), "UTF-8"),
+            ("/".join(["a"] * 65), "component count"),
+            ("界" * 86, "component.*UTF-8"),
+            ("\ud800", "valid UTF-8"),
+        ],
+    )
+    def test_logical_path_resource_limits_are_rejected(
+        self, logical_path, message
+    ) -> None:
+        with pytest.raises(InspectionError, match=message):
+            validate_logical_path(logical_path)
+
     @pytest.mark.parametrize(
         "logical_path",
         [
@@ -638,11 +693,206 @@ class TestArtifactCtl:
         assert payload["error"].startswith("InspectionError:")
         assert len(json.dumps(payload)) < 2_000
 
+    def test_selected_response_budget_bounds_compact_error(
+        self, tmp_path, capsys, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        cli_module = sys.modules[
+            "skillopt.envs.skilleval.inspectors.__main__"
+        ]
+        monkeypatch.setattr(
+            cli_module,
+            "inspect_artifact",
+            lambda *args, **kwargs: {"text": "界" * 10_000},
+        )
+
+        code = artifactctl_main(
+            [
+                "inspect",
+                "report.pdf",
+                "--evidence",
+                str(evidence),
+                "--scratch",
+                str(scratch),
+                "--max-response-bytes",
+                str(MIN_RESPONSE_BYTES),
+            ]
+        )
+        captured = capsys.readouterr()
+
+        assert code == 2
+        assert captured.err == ""
+        assert len(captured.out.splitlines()) == 1
+        assert len(captured.out.rstrip("\n").encode("utf-8")) <= (
+            MIN_RESPONSE_BYTES
+        )
+        assert json.loads(captured.out)["status"] == "error"
+
+    def test_selected_response_budget_bounds_success(
+        self, tmp_path, capsys, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        cli_module = sys.modules[
+            "skillopt.envs.skilleval.inspectors.__main__"
+        ]
+        monkeypatch.setattr(
+            cli_module,
+            "inspect_artifact",
+            lambda *args, **kwargs: {"text": "ok"},
+        )
+
+        code = artifactctl_main(
+            [
+                "inspect",
+                "report.pdf",
+                "--evidence",
+                str(evidence),
+                "--scratch",
+                str(scratch),
+                "--max-response-bytes",
+                str(MIN_RESPONSE_BYTES),
+            ]
+        )
+        captured = capsys.readouterr()
+
+        assert code == 0
+        assert captured.err == ""
+        assert len(captured.out.rstrip("\n").encode("utf-8")) <= (
+            MIN_RESPONSE_BYTES
+        )
+        assert json.loads(captured.out)["status"] == "ok"
+
+    def test_response_budget_below_minimum_rejects_before_dispatch(
+        self, tmp_path, capsys, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        called = False
+        cli_module = sys.modules[
+            "skillopt.envs.skilleval.inspectors.__main__"
+        ]
+
+        def inspect_should_not_run(*args, **kwargs):
+            nonlocal called
+            called = True
+            return {}
+
+        monkeypatch.setattr(
+            cli_module,
+            "inspect_artifact",
+            inspect_should_not_run,
+        )
+        code, payload = self._run(
+            capsys,
+            [
+                "inspect",
+                "report.pdf",
+                "--evidence",
+                str(evidence),
+                "--scratch",
+                str(scratch),
+                "--max-response-bytes",
+                str(MIN_RESPONSE_BYTES - 1),
+            ],
+        )
+
+        assert code == 2
+        assert payload["status"] == "error"
+        assert "at least" in payload["error"]
+        assert called is False
+
+    def test_path_limit_is_checked_before_root_filesystem_access(
+        self, tmp_path, capsys
+    ) -> None:
+        code, payload = self._run(
+            capsys,
+            [
+                "inspect",
+                "a" * (MAX_LOGICAL_COMPONENT_BYTES + 1),
+                "--evidence",
+                str(tmp_path / "missing-evidence"),
+                "--scratch",
+                str(tmp_path / "missing-scratch"),
+            ],
+        )
+
+        assert code == 2
+        assert payload["status"] == "error"
+        assert "component" in payload["error"]
+        assert "does not exist" not in payload["error"]
+
     def test_parse_error_is_json_only(self, capsys) -> None:
         code, payload = self._run(capsys, ["inspect"])
         assert code == 2
         assert payload["status"] == "error"
         assert "required" in payload["error"]
+
+    @pytest.mark.parametrize("argv", [["--help"], ["inspect", "--help"]])
+    def test_help_is_one_success_json_object(self, capsys, argv) -> None:
+        code, payload = self._run(capsys, argv)
+        assert code == 0
+        assert payload["status"] == "ok"
+        assert "usage:" in payload["result"]["help"]
+
+    def test_selected_response_budget_bounds_help(self, capsys) -> None:
+        argv = [
+            "render",
+            "--max-response-bytes",
+            str(MIN_RESPONSE_BYTES),
+            "--help",
+        ]
+
+        code = artifactctl_main(argv)
+        captured = capsys.readouterr()
+
+        assert code == 0
+        assert captured.err == ""
+        assert len(captured.out.splitlines()) == 1
+        assert len(captured.out.rstrip("\n").encode("utf-8")) <= (
+            MIN_RESPONSE_BYTES
+        )
+        assert json.loads(captured.out)["status"] == "ok"
+
+    def test_selected_response_budget_bounds_argparse_error(self, capsys) -> None:
+        argv = [
+            "inspect",
+            "report.pdf",
+            "--evidence",
+            "/missing/evidence",
+            "--scratch",
+            "/missing/scratch",
+            "--max-response-bytes",
+            str(MIN_RESPONSE_BYTES),
+            "--unknown=" + "x" * 2_000,
+        ]
+
+        code = artifactctl_main(argv)
+        captured = capsys.readouterr()
+
+        assert code == 2
+        assert captured.err == ""
+        assert len(captured.out.splitlines()) == 1
+        assert len(captured.out.rstrip("\n").encode("utf-8")) <= (
+            MIN_RESPONSE_BYTES
+        )
+        assert json.loads(captured.out)["status"] == "error"
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            [],
+            ["unknown-command"],
+            ["inventory", "--unknown-option"],
+        ],
+    )
+    def test_all_argparse_errors_are_one_error_json_object(
+        self, capsys, argv
+    ) -> None:
+        code, payload = self._run(capsys, argv)
+        assert code == 2
+        assert payload["status"] == "error"
+        assert payload["error"].startswith("InspectionError:")
 
     @pytest.mark.parametrize(
         "argv",
@@ -686,8 +936,8 @@ def _assert_untrusted_location(value, needles, path=()):
 
 
 def _structured_payload(result):
-    assert result.structured_content is not None
-    payload = result.structured_content
+    assert result.structuredContent is not None
+    payload = result.structuredContent
     assert set(payload) == {"untrusted_evidence"}
     return payload
 
@@ -700,7 +950,10 @@ class TestArtifactMcp:
         evidence, scratch = _roots(tmp_path)
         server = artifact_mcp.create_server(str(evidence), str(scratch))
 
-        async with Client(server, raise_exceptions=True) as client:
+        async with create_connected_server_and_client_session(
+            server,
+            raise_exceptions=True,
+        ) as client:
             tools = await client.list_tools()
             resources = await client.list_resources()
             prompts = await client.list_prompts()
@@ -713,6 +966,18 @@ class TestArtifactMcp:
         ]
         assert resources.resources == []
         assert prompts.prompts == []
+        assert client.get_server_capabilities().tools is not None
+        inspect_tool = next(
+            tool for tool in tools.tools if tool.name == "artifact_inspect"
+        )
+        assert "POSIX-relative" in inspect_tool.description
+        assert str(MAX_LOGICAL_PATH_BYTES) in inspect_tool.description
+        assert str(MAX_LOGICAL_COMPONENTS) in inspect_tool.description
+        assert str(MAX_LOGICAL_COMPONENT_BYTES) in inspect_tool.description
+        path_schema = inspect_tool.inputSchema["properties"]["path"]
+        assert path_schema["description"].startswith(
+            "Normalized POSIX-relative"
+        )
 
     @pytest.mark.anyio
     async def test_calls_representative_tools_and_envelopes_artifact_strings(
@@ -728,7 +993,10 @@ class TestArtifactMcp:
             "UNTRUSTED_TEXT",
         }
 
-        async with Client(server, raise_exceptions=True) as client:
+        async with create_connected_server_and_client_session(
+            server,
+            raise_exceptions=True,
+        ) as client:
             results = [
                 await client.call_tool("artifact_inventory", {}),
                 await client.call_tool(
@@ -757,7 +1025,10 @@ class TestArtifactMcp:
         _write_pdf(evidence / "report.pdf")
         server = artifact_mcp.create_server(str(evidence), str(scratch))
 
-        async with Client(server, raise_exceptions=True) as client:
+        async with create_connected_server_and_client_session(
+            server,
+            raise_exceptions=True,
+        ) as client:
             unsafe = await client.call_tool(
                 "artifact_inspect",
                 {"path": "../UNTRUSTED_ESCAPE.pdf"},
@@ -792,7 +1063,10 @@ class TestArtifactMcp:
             max_extract_chars=500,
         )
 
-        async with Client(server, raise_exceptions=True) as client:
+        async with create_connected_server_and_client_session(
+            server,
+            raise_exceptions=True,
+        ) as client:
             result = await client.call_tool(
                 "artifact_render",
                 {"path": "report.pdf", "max_pixels": 101},
@@ -803,6 +1077,117 @@ class TestArtifactMcp:
         assert "maximum" in envelope["error"]
 
     @pytest.mark.anyio
+    async def test_response_budget_uses_minimum_of_request_and_server(
+        self, tmp_path, fake_pdf_inspector
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        server_max = MIN_RESPONSE_BYTES + 128
+        server = artifact_mcp.create_server(
+            str(evidence),
+            str(scratch),
+            max_response_bytes=server_max,
+        )
+
+        async with create_connected_server_and_client_session(
+            server,
+            raise_exceptions=True,
+        ) as client:
+            result = await client.call_tool(
+                "artifact_inspect",
+                {
+                    "path": "report.pdf",
+                    "max_response_bytes": MAX_RESPONSE_BYTES,
+                },
+            )
+
+        envelope = _structured_payload(result)["untrusted_evidence"]
+        assert envelope["status"] == "ok"
+        text = next(
+            content.text
+            for content in result.content
+            if isinstance(content, TextContent)
+        )
+        assert len(text.encode("utf-8")) <= server_max
+
+    @pytest.mark.anyio
+    async def test_selected_response_budget_bounds_mcp_error(
+        self, tmp_path, fake_pdf_inspector
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        fake_pdf_inspector.inspect_value = "界" * 10_000
+        server = artifact_mcp.create_server(str(evidence), str(scratch))
+
+        async with create_connected_server_and_client_session(
+            server,
+            raise_exceptions=True,
+        ) as client:
+            result = await client.call_tool(
+                "artifact_inspect",
+                {
+                    "path": "report.pdf",
+                    "max_response_bytes": MIN_RESPONSE_BYTES,
+                },
+            )
+
+        envelope = _structured_payload(result)["untrusted_evidence"]
+        assert envelope["status"] == "error"
+        text = next(
+            content.text
+            for content in result.content
+            if isinstance(content, TextContent)
+        )
+        assert len(text.encode("utf-8")) <= MIN_RESPONSE_BYTES
+        assert json.loads(text) == result.structuredContent
+
+    @pytest.mark.anyio
+    async def test_mcp_response_budget_below_minimum_skips_inspector(
+        self, tmp_path, fake_pdf_inspector
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        server = artifact_mcp.create_server(str(evidence), str(scratch))
+
+        async with create_connected_server_and_client_session(
+            server,
+            raise_exceptions=True,
+        ) as client:
+            result = await client.call_tool(
+                "artifact_inspect",
+                {
+                    "path": "report.pdf",
+                    "max_response_bytes": MIN_RESPONSE_BYTES - 1,
+                },
+            )
+
+        envelope = _structured_payload(result)["untrusted_evidence"]
+        assert envelope["status"] == "error"
+        assert "at least" in envelope["error"]
+        assert fake_pdf_inspector.calls == []
+
+    @pytest.mark.anyio
+    async def test_mcp_path_limit_rejects_before_inspector(
+        self, tmp_path, fake_pdf_inspector
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        server = artifact_mcp.create_server(str(evidence), str(scratch))
+
+        async with create_connected_server_and_client_session(
+            server,
+            raise_exceptions=True,
+        ) as client:
+            result = await client.call_tool(
+                "artifact_inspect",
+                {"path": "界" * 86},
+            )
+
+        envelope = _structured_payload(result)["untrusted_evidence"]
+        assert envelope["status"] == "error"
+        assert "component" in envelope["error"]
+        assert fake_pdf_inspector.calls == []
+
+    @pytest.mark.anyio
     async def test_render_returns_png_image_content_without_host_path(
         self, tmp_path, fake_pdf_inspector
     ) -> None:
@@ -810,7 +1195,10 @@ class TestArtifactMcp:
         _write_pdf(evidence / "UNTRUSTED_FILENAME.pdf")
         server = artifact_mcp.create_server(str(evidence), str(scratch))
 
-        async with Client(server, raise_exceptions=True) as client:
+        async with create_connected_server_and_client_session(
+            server,
+            raise_exceptions=True,
+        ) as client:
             result = await client.call_tool(
                 "artifact_render",
                 {
@@ -838,7 +1226,7 @@ class TestArtifactMcp:
             content for content in result.content if isinstance(content, ImageContent)
         ]
         assert len(images) == 1
-        assert images[0].mime_type == "image/png"
+        assert images[0].mimeType == "image/png"
 
     @pytest.mark.anyio
     async def test_render_rejects_non_png_and_oversized_media(
@@ -855,7 +1243,10 @@ class TestArtifactMcp:
             max_media_bytes=10,
         )
 
-        async with Client(server, raise_exceptions=True) as client:
+        async with create_connected_server_and_client_session(
+            server,
+            raise_exceptions=True,
+        ) as client:
             result = await client.call_tool(
                 "artifact_render",
                 {"path": "report.pdf"},

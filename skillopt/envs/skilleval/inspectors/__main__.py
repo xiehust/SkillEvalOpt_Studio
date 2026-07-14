@@ -18,18 +18,36 @@ from .base import (
     MAX_EXTRACT_CHARS,
     MAX_RENDER_PIXELS,
     MAX_RESPONSE_BYTES,
+    MIN_RESPONSE_BYTES,
     bounded_diagnostic,
     normalize_selectors,
+    validate_logical_path,
     validate_roots,
 )
+
+
+class _HelpRequested(Exception):
+    def __init__(self, help_text: str):
+        super().__init__("help requested")
+        self.help_text = help_text
 
 
 class _JSONArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         raise InspectionError(f"argument error: {message}")
 
+    def print_help(self, file=None) -> None:
+        raise _HelpRequested(self.format_help())
 
-def _bounded_int(name: str, maximum: int):
+    def exit(self, status: int = 0, message: str | None = None) -> None:
+        if status == 0:
+            raise _HelpRequested(self.format_help())
+        raise InspectionError(
+            f"argument error: {message or f'parser exited {status}'}"
+        )
+
+
+def _bounded_int(name: str, maximum: int, minimum: int = 1):
     def parse(value: str) -> int:
         try:
             parsed = int(value)
@@ -37,6 +55,10 @@ def _bounded_int(name: str, maximum: int):
             raise argparse.ArgumentTypeError(f"{name} must be an integer") from exc
         if parsed <= 0:
             raise argparse.ArgumentTypeError(f"{name} must be positive")
+        if parsed < minimum:
+            raise argparse.ArgumentTypeError(
+                f"{name} must be at least {minimum}"
+            )
         if parsed > maximum:
             raise argparse.ArgumentTypeError(
                 f"{name} exceeds maximum {maximum}"
@@ -51,7 +73,11 @@ def _add_roots(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--scratch", required=True)
     parser.add_argument(
         "--max-response-bytes",
-        type=_bounded_int("max response bytes", MAX_RESPONSE_BYTES),
+        type=_bounded_int(
+            "max response bytes",
+            MAX_RESPONSE_BYTES,
+            MIN_RESPONSE_BYTES,
+        ),
         default=DEFAULT_RESPONSE_BYTES,
     )
 
@@ -97,6 +123,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _response_limit_from_argv(argv: list[str]) -> int:
+    parser = _JSONArgumentParser(add_help=False)
+    parser.add_argument(
+        "--max-response-bytes",
+        type=_bounded_int(
+            "max response bytes",
+            MAX_RESPONSE_BYTES,
+            MIN_RESPONSE_BYTES,
+        ),
+        default=DEFAULT_RESPONSE_BYTES,
+    )
+    args, _ = parser.parse_known_args(argv)
+    return args.max_response_bytes
+
+
 def _serialize(payload: dict, maximum: int) -> str:
     encoded = json.dumps(
         payload,
@@ -109,12 +150,76 @@ def _serialize(payload: dict, maximum: int) -> str:
     return encoded
 
 
+def _serialize_help(help_text: str, maximum: int) -> str:
+    def render(text: str) -> str:
+        return _serialize(
+            {"status": "ok", "result": {"help": text}},
+            maximum,
+        )
+
+    try:
+        return render(help_text)
+    except InspectionError:
+        pass
+
+    marker = "...[truncated]"
+    low = 0
+    high = len(help_text)
+    best = render(marker)
+    while low <= high:
+        middle = (low + high) // 2
+        try:
+            candidate = render(help_text[:middle] + marker)
+        except InspectionError:
+            high = middle - 1
+        else:
+            best = candidate
+            low = middle + 1
+    return best
+
+
+def _serialize_error(exc: Exception, maximum: int) -> str:
+    full_error = f"{type(exc).__name__}: {bounded_diagnostic(exc)}"
+
+    def render(error: str) -> str:
+        return json.dumps(
+            {"status": "error", "error": error},
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+
+    output = render(full_error)
+    if len(output.encode("utf-8")) <= maximum:
+        return output
+
+    marker = "...[truncated]"
+    low = 0
+    high = len(full_error)
+    best = render("InspectionError: bounded failure")
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = render(full_error[:middle] + marker)
+        if len(candidate.encode("utf-8")) <= maximum:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    if len(best.encode("utf-8")) > maximum:  # pragma: no cover
+        raise InspectionError("minimum response budget is too small")
+    return best
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run one operation and emit exactly one JSON object on stdout."""
     response_limit = DEFAULT_RESPONSE_BYTES
+    cli_args = list(sys.argv[1:] if argv is None else argv)
     try:
-        args = parse_args(argv)
+        response_limit = _response_limit_from_argv(cli_args)
+        args = parse_args(cli_args)
         response_limit = args.max_response_bytes
+        if args.command != "inventory":
+            validate_logical_path(args.artifact)
         validate_roots(args.evidence, args.scratch)
         if args.command == "inventory":
             result = inventory_artifacts(
@@ -153,19 +258,11 @@ def main(argv: list[str] | None = None) -> int:
             response_limit,
         )
         exit_code = 0
+    except _HelpRequested as exc:
+        output = _serialize_help(exc.help_text, response_limit)
+        exit_code = 0
     except Exception as exc:
-        error = f"{type(exc).__name__}: {bounded_diagnostic(exc)}"
-        payload = {"status": "error", "error": error}
-        try:
-            output = _serialize(payload, max(response_limit, 2_000))
-        except Exception:
-            output = json.dumps(
-                {
-                    "status": "error",
-                    "error": "InspectionError: bounded error response failed",
-                },
-                separators=(",", ":"),
-            )
+        output = _serialize_error(exc, response_limit)
         exit_code = 2
     sys.stdout.write(output + "\n")
     return exit_code

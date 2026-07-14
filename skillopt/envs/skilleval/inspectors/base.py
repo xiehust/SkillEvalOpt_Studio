@@ -15,6 +15,8 @@ from typing import Protocol, TypeAlias, cast
 
 MAX_RENDER_PIXELS = 500_000_000
 DEFAULT_RESPONSE_BYTES = 1_000_000
+# Leaves room for the smallest trusted CLI error or MCP envelope as valid JSON.
+MIN_RESPONSE_BYTES = 512
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 DEFAULT_EXTRACT_CHARS = 500_000
 MAX_EXTRACT_CHARS = 4_000_000
@@ -22,6 +24,10 @@ MAX_COMMAND_OUTPUT_CHARS = 64_000
 MAX_SELECTORS = 256
 MAX_SELECTOR_CHARS = 256
 MAX_COMMAND_TIMEOUT_SECONDS = 3_600
+MAX_LOGICAL_PATH_CHARS = 4_096
+MAX_LOGICAL_PATH_BYTES = 4_096
+MAX_LOGICAL_COMPONENTS = 64
+MAX_LOGICAL_COMPONENT_BYTES = 255
 
 JSONScalar: TypeAlias = str | int | float | bool | None
 JSONValue: TypeAlias = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
@@ -65,6 +71,10 @@ class ResponseBudget:
 
     def __post_init__(self) -> None:
         _positive_int(self.max_bytes, "response byte", MAX_RESPONSE_BYTES)
+        if self.max_bytes < MIN_RESPONSE_BYTES:
+            raise InspectionError(
+                f"response byte budget must be at least {MIN_RESPONSE_BYTES}"
+            )
         _positive_int(
             self.max_extract_chars,
             "extraction character",
@@ -242,7 +252,8 @@ def validate_roots(evidence_dir: str, scratch_dir: str) -> tuple[str, str]:
     return evidence, scratch
 
 
-def _logical_parts(logical_path: object) -> tuple[str, ...]:
+def validate_logical_path(logical_path: object) -> tuple[str, ...]:
+    """Validate a bounded normalized POSIX-relative artifact path."""
     if (
         not isinstance(logical_path, str)
         or not logical_path
@@ -251,6 +262,20 @@ def _logical_parts(logical_path: object) -> tuple[str, ...]:
     ):
         raise InspectionError(
             "artifact path must be a non-empty logical POSIX relative path"
+        )
+    if len(logical_path) > MAX_LOGICAL_PATH_CHARS:
+        raise InspectionError(
+            "artifact path character length exceeds maximum "
+            f"{MAX_LOGICAL_PATH_CHARS}"
+        )
+    try:
+        encoded = logical_path.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise InspectionError("artifact path must be valid UTF-8") from exc
+    if len(encoded) > MAX_LOGICAL_PATH_BYTES:
+        raise InspectionError(
+            "artifact path UTF-8 length exceeds maximum "
+            f"{MAX_LOGICAL_PATH_BYTES} bytes"
         )
     logical = PurePosixPath(logical_path)
     parts = logical.parts
@@ -263,6 +288,17 @@ def _logical_parts(logical_path: object) -> tuple[str, ...]:
         raise InspectionError(
             "artifact path must be a normalized logical POSIX relative path"
         )
+    if len(parts) > MAX_LOGICAL_COMPONENTS:
+        raise InspectionError(
+            "artifact path component count exceeds maximum "
+            f"{MAX_LOGICAL_COMPONENTS}"
+        )
+    for part in parts:
+        if len(part.encode("utf-8")) > MAX_LOGICAL_COMPONENT_BYTES:
+            raise InspectionError(
+                "artifact path component UTF-8 length exceeds maximum "
+                f"{MAX_LOGICAL_COMPONENT_BYTES} bytes"
+            )
     return parts
 
 
@@ -289,7 +325,7 @@ def _open_child(
 def resolve_evidence_path(evidence_dir: str, logical_path: str) -> str:
     """Resolve a logical artifact path beneath evidence without symlinks."""
     evidence = _absolute_path(evidence_dir, "evidence root")
-    parts = _logical_parts(logical_path)
+    parts = validate_logical_path(logical_path)
     descriptor = _open_real_directory(evidence, "evidence root")
     try:
         for part in parts[:-1]:
@@ -347,9 +383,9 @@ def resolve_scratch_path(
         if relative == os.pardir or relative.startswith(os.pardir + os.sep):
             raise InspectionError("derived path is outside scratch")
         logical = relative.replace(os.sep, "/")
-        parts = _logical_parts(logical)
+        parts = validate_logical_path(logical)
     else:
-        parts = _logical_parts(derived_path)
+        parts = validate_logical_path(derived_path)
         candidate = os.path.join(scratch, *parts)
 
     descriptor = _open_real_directory(scratch, "scratch root")
@@ -536,8 +572,13 @@ __all__ = [
     "JSONValue",
     "MAX_COMMAND_OUTPUT_CHARS",
     "MAX_EXTRACT_CHARS",
+    "MAX_LOGICAL_COMPONENTS",
+    "MAX_LOGICAL_COMPONENT_BYTES",
+    "MAX_LOGICAL_PATH_BYTES",
+    "MAX_LOGICAL_PATH_CHARS",
     "MAX_RENDER_PIXELS",
     "MAX_RESPONSE_BYTES",
+    "MIN_RESPONSE_BYTES",
     "RenderBudget",
     "ResponseBudget",
     "bounded_diagnostic",
@@ -546,5 +587,6 @@ __all__ = [
     "resolve_scratch_path",
     "safe_run",
     "validate_json_result",
+    "validate_logical_path",
     "validate_roots",
 ]
