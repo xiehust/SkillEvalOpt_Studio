@@ -31,6 +31,7 @@ external/
 # Local dev-tooling state (codegraph index, supergoal run artifacts)
 .codegraph/
 .supergoal/
+.worktrees/
 
 /BabyVision/
 /MMRB/
