@@ -5,17 +5,19 @@ import ctypes
 import json
 import os
 import resource
+import select
 import signal
 import subprocess
 import sys
 import time
 
-from skillopt.envs.skilleval.inspectors._scratch import (
+from skillopt.envs.skilleval.inspectors._scratch_root import (
     ScratchLimits,
     _scan_descriptor,
 )
 
 _PR_SET_CHILD_SUBREAPER = 36
+_PR_SET_PDEATHSIG = 1
 _POLL_SECONDS = 0.01
 _CLEANUP_SECONDS = 3.0
 _termination_requested = False
@@ -31,6 +33,18 @@ def _set_subreaper() -> None:
     if libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
+
+
+def _set_parent_death_signal(
+    signum: int,
+    expected_parent: int,
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(_PR_SET_PDEATHSIG, signum, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    if os.getppid() != expected_parent:
+        os.kill(os.getpid(), signum)
 
 
 def _children(pid: int) -> list[int]:
@@ -90,7 +104,11 @@ def _kill_and_reap(process: subprocess.Popen[bytes]) -> bool:
     return False
 
 
-def _preexec(max_file_bytes: int | None) -> None:
+def _preexec(
+    max_file_bytes: int | None,
+    expected_parent: int,
+) -> None:
+    _set_parent_death_signal(signal.SIGKILL, expected_parent)
     if max_file_bytes is not None:
         resource.setrlimit(
             resource.RLIMIT_FSIZE,
@@ -108,7 +126,19 @@ def _write_status(descriptor: int, payload: dict) -> None:
         view = view[written:]
 
 
-def supervise(config: dict) -> dict:
+def _parent_is_alive(descriptor: int) -> bool:
+    readable, _writable, _exceptional = select.select(
+        [descriptor],
+        [],
+        [],
+        0,
+    )
+    if not readable:
+        return True
+    return bool(os.read(descriptor, 1))
+
+
+def supervise(config: dict, parent_liveness_fd: int) -> dict:
     _set_subreaper()
     signal.signal(signal.SIGTERM, _request_termination)
     signal.signal(signal.SIGINT, _request_termination)
@@ -127,6 +157,7 @@ def supervise(config: dict) -> dict:
         "LANG": "C.UTF-8",
     }
     inherited = tuple(config.get("pass_fds", ()))
+    supervisor_pid = os.getpid()
     try:
         process = subprocess.Popen(
             config["command"],
@@ -139,9 +170,19 @@ def supervise(config: dict) -> dict:
             close_fds=True,
             pass_fds=inherited,
             preexec_fn=(
-                (lambda: _preexec(config["max_file_bytes"]))
+                (
+                    lambda: _preexec(
+                        config["max_file_bytes"],
+                        supervisor_pid,
+                    )
+                )
                 if limits is not None
-                else None
+                else (
+                    lambda: _set_parent_death_signal(
+                        signal.SIGKILL,
+                        supervisor_pid,
+                    )
+                )
             ),
         )
     except OSError as exc:
@@ -156,6 +197,10 @@ def supervise(config: dict) -> dict:
     detail = ""
     returncode = None
     while True:
+        if not _parent_is_alive(parent_liveness_fd):
+            reason = "cancelled"
+            detail = "safe_run caller exited"
+            break
         if _termination_requested:
             reason = "cancelled"
             detail = "supervisor termination requested"
@@ -190,21 +235,26 @@ def supervise(config: dict) -> dict:
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
+    if len(sys.argv) != 4:
         return 2
     config_fd = int(sys.argv[1])
     status_fd = int(sys.argv[2])
+    parent_liveness_fd = int(sys.argv[3])
     try:
         with os.fdopen(config_fd, "rb", closefd=True) as source:
             config = json.loads(source.read().decode("utf-8"))
-        status = supervise(config)
+        status = supervise(config, parent_liveness_fd)
     except BaseException as exc:
         status = {
             "reason": "supervisor",
             "detail": f"{type(exc).__name__}: {exc}",
             "returncode": None,
         }
-    _write_status(status_fd, status)
+    os.close(parent_liveness_fd)
+    try:
+        _write_status(status_fd, status)
+    except BrokenPipeError:
+        pass
     os.close(status_fd)
     return 0
 

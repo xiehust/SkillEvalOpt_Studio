@@ -1,6 +1,7 @@
 """Bounded subprocess execution for trusted inspector adapters."""
 from __future__ import annotations
 
+import ctypes
 import json
 import math
 import os
@@ -11,6 +12,7 @@ import sys
 import threading
 
 from ._scratch import current_scratch_transaction
+from ._secure_files import current_evidence_fds
 from .base import (
     MAX_COMMAND_OUTPUT_CHARS,
     MAX_COMMAND_TIMEOUT_SECONDS,
@@ -19,6 +21,20 @@ from .base import (
     _open_real_directory,
     bounded_diagnostic,
 )
+
+_PR_SET_PDEATHSIG = 1
+
+
+def _set_parent_death_signal(
+    signum: int,
+    expected_parent: int,
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(_PR_SET_PDEATHSIG, signum, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    if os.getppid() != expected_parent:
+        os.kill(os.getpid(), signum)
 
 
 def _bounded_pipe_reader(
@@ -73,6 +89,14 @@ def _supervisor_config(
 ) -> tuple[dict, tuple[int, ...]]:
     transaction = current_scratch_transaction()
     inherited = set(pass_fds)
+    inherited.update(current_evidence_fds())
+    for descriptor in inherited:
+        try:
+            os.fstat(descriptor)
+        except OSError as exc:
+            raise InspectionError(
+                "pass_fds contains an unavailable descriptor"
+            ) from exc
     config = {
         "command": command,
         "timeout": timeout,
@@ -84,13 +108,20 @@ def _supervisor_config(
     }
     if transaction is not None:
         inherited.add(transaction.descriptor)
+        inherited.add(transaction.root_descriptor)
         config.update(
             {
-                "transaction_fd": transaction.descriptor,
+                "transaction_fd": transaction.root_descriptor,
                 "max_file_bytes": transaction.remaining_bytes(),
-                "max_scratch_bytes": transaction.limits.max_bytes,
-                "max_scratch_entries": transaction.limits.max_entries,
-                "max_scratch_depth": transaction.limits.max_depth,
+                "max_scratch_bytes": (
+                    transaction.requested_limits.max_bytes
+                ),
+                "max_scratch_entries": (
+                    transaction.requested_limits.max_entries
+                ),
+                "max_scratch_depth": (
+                    transaction.requested_limits.max_depth
+                ),
             }
         )
     config["pass_fds"] = sorted(inherited)
@@ -100,11 +131,13 @@ def _supervisor_config(
 def _start_supervisor(
     config: dict,
     inherited_fds: tuple[int, ...],
-) -> tuple[subprocess.Popen[bytes], int]:
+) -> tuple[subprocess.Popen[bytes], int, int]:
     config_read, config_write = os.pipe()
     status_read, status_write = os.pipe()
+    liveness_read, liveness_write = os.pipe()
     supervisor_script = Path(__file__).with_name("_supervisor.py")
     repo_root = str(Path(__file__).resolve().parents[4])
+    parent_pid = os.getpid()
     supervisor_env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": config["home"],
@@ -118,6 +151,7 @@ def _start_supervisor(
                 str(supervisor_script),
                 str(config_read),
                 str(status_write),
+                str(liveness_read),
             ],
             cwd=os.path.abspath(os.sep),
             env=supervisor_env,
@@ -129,18 +163,26 @@ def _start_supervisor(
             pass_fds=(
                 config_read,
                 status_write,
+                liveness_read,
                 *inherited_fds,
             ),
             start_new_session=True,
+            preexec_fn=lambda: _set_parent_death_signal(
+                signal.SIGTERM,
+                parent_pid,
+            ),
         )
     except Exception:
         os.close(config_read)
         os.close(config_write)
         os.close(status_read)
         os.close(status_write)
+        os.close(liveness_read)
+        os.close(liveness_write)
         raise
     os.close(config_read)
     os.close(status_write)
+    os.close(liveness_read)
     try:
         payload = json.dumps(config, separators=(",", ":")).encode("utf-8")
         with os.fdopen(config_write, "wb", closefd=True) as destination:
@@ -149,8 +191,26 @@ def _start_supervisor(
         process.terminate()
         process.wait()
         os.close(status_read)
+        os.close(liveness_write)
         raise
-    return process, status_read
+    return process, status_read, liveness_write
+
+
+def _terminate_and_wait(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=4)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
 
 
 def safe_run(
@@ -199,7 +259,10 @@ def safe_run(
         pass_fds=pass_fds,
     )
     try:
-        process, status_fd = _start_supervisor(config, inherited_fds)
+        process, status_fd, liveness_fd = _start_supervisor(
+            config,
+            inherited_fds,
+        )
     except OSError as exc:
         raise InspectionError(
             "inspector command could not start: "
@@ -239,70 +302,69 @@ def safe_run(
         reader.start()
 
     try:
-        process.wait(timeout=timeout + 8)
-    except subprocess.TimeoutExpired:
         try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            process.wait(timeout=4)
+            process.wait(timeout=timeout + 8)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
-    for reader in readers:
-        reader.join(timeout=2)
-    if any(reader.is_alive() for reader in readers):
-        os.close(status_fd)
-        raise InspectionError(
-            "inspector command output reader did not finish"
-        )
-    if reader_errors:
-        os.close(status_fd)
-        raise InspectionError(
-            "inspector command output could not be read: "
-            f"{bounded_diagnostic(reader_errors[0])}"
-        )
-    stdout = _decode_output(stdout_chunks, stdout_total[0])
-    stderr = _decode_output(stderr_chunks, stderr_total[0])
-    with os.fdopen(status_fd, "rb", closefd=True) as source:
-        status_data = source.read()
-    try:
-        status = json.loads(status_data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise InspectionError(
-            "inspector supervisor returned an invalid status"
-        ) from exc
+            _terminate_and_wait(process)
+        for reader in readers:
+            reader.join(timeout=2)
+        if any(reader.is_alive() for reader in readers):
+            raise InspectionError(
+                "inspector command output reader did not finish"
+            )
+        if reader_errors:
+            raise InspectionError(
+                "inspector command output could not be read: "
+                f"{bounded_diagnostic(reader_errors[0])}"
+            )
+        stdout = _decode_output(stdout_chunks, stdout_total[0])
+        stderr = _decode_output(stderr_chunks, stderr_total[0])
+        with os.fdopen(status_fd, "rb", closefd=True) as source:
+            status_data = source.read()
+        status_fd = -1
+        try:
+            status = json.loads(status_data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise InspectionError(
+                "inspector supervisor returned an invalid status"
+            ) from exc
 
-    reason = status.get("reason")
-    if reason == "timeout":
-        raise InspectionError(
-            f"inspector command timed out after {timeout} seconds"
+        reason = status.get("reason")
+        if reason == "timeout":
+            raise InspectionError(
+                f"inspector command timed out after {timeout} seconds"
+            )
+        if reason == "start":
+            raise InspectionError(
+                "inspector command could not start: "
+                f"{bounded_diagnostic(status.get('detail', ''))}"
+            )
+        if reason is not None:
+            raise InspectionError(
+                f"inspector command {reason} failure: "
+                f"{bounded_diagnostic(status.get('detail', ''))}"
+            )
+        returncode = status.get("returncode")
+        completed = subprocess.CompletedProcess(
+            command,
+            int(returncode),
+            stdout=stdout,
+            stderr=stderr,
         )
-    if reason == "start":
-        raise InspectionError(
-            "inspector command could not start: "
-            f"{bounded_diagnostic(status.get('detail', ''))}"
-        )
-    if reason is not None:
-        raise InspectionError(
-            f"inspector command {reason} failure: "
-            f"{bounded_diagnostic(status.get('detail', ''))}"
-        )
-    returncode = status.get("returncode")
-    completed = subprocess.CompletedProcess(
-        command,
-        int(returncode),
-        stdout=stdout,
-        stderr=stderr,
-    )
-    if returncode != 0:
-        diagnostic = stderr or stdout or "(no output)"
-        raise InspectionError(
-            f"inspector command exited {returncode}: "
-            f"{bounded_diagnostic(diagnostic, MAX_COMMAND_OUTPUT_CHARS)}"
-        )
-    return completed
+        if returncode != 0:
+            diagnostic = stderr or stdout or "(no output)"
+            raise InspectionError(
+                f"inspector command exited {returncode}: "
+                f"{bounded_diagnostic(diagnostic, MAX_COMMAND_OUTPUT_CHARS)}"
+            )
+        return completed
+    finally:
+        try:
+            os.close(liveness_fd)
+        except OSError:
+            pass
+        _terminate_and_wait(process)
+        if status_fd >= 0:
+            os.close(status_fd)
+        for reader in readers:
+            reader.join(timeout=2)

@@ -1,6 +1,7 @@
 """Stable descriptor handoff for untrusted evidence and rendered files."""
 from __future__ import annotations
 
+import contextvars
 import os
 import stat
 from contextlib import contextmanager
@@ -25,6 +26,9 @@ _CREATE_FLAGS = (
 )
 _FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
 _COPY_CHUNK_BYTES = 1024 * 1024
+_inherited_evidence_fds: contextvars.ContextVar[tuple[int, ...]] = (
+    contextvars.ContextVar("artifact_inherited_evidence_fds", default=())
+)
 
 
 @dataclass(frozen=True)
@@ -32,6 +36,11 @@ class StagedEvidence:
     detection_path: str
     inspector_path: str
     descriptor: int
+
+
+def current_evidence_fds() -> tuple[int, ...]:
+    """Return stable evidence descriptors inherited by inspector commands."""
+    return _inherited_evidence_fds.get()
 
 
 def _same_object(left: os.stat_result, right: os.stat_result) -> bool:
@@ -83,8 +92,7 @@ def _derived_parts(scratch_dir: str, derived_path: str) -> tuple[str, ...]:
     return validate_logical_path(relative.replace(os.sep, "/"))
 
 
-def open_scratch_file(scratch_dir: str, derived_path: str) -> int:
-    """Open one regular scratch file without a validate/reopen gap."""
+def _open_scratch_file(scratch_dir: str, derived_path: str) -> int:
     parts = _derived_parts(scratch_dir, derived_path)
     descriptor = _open_real_directory(scratch_dir, "scratch root")
     try:
@@ -107,6 +115,19 @@ def open_scratch_file(scratch_dir: str, derived_path: str) -> int:
             os.close(output)
             raise InspectionError("derived path must be a regular file")
         return output
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def open_scratch_file(
+    scratch_dir: str,
+    derived_path: str,
+) -> Iterator[int]:
+    """Hold one stable regular-file descriptor beneath scratch."""
+    descriptor = _open_scratch_file(scratch_dir, derived_path)
+    try:
+        yield descriptor
     finally:
         os.close(descriptor)
 
@@ -136,6 +157,19 @@ def _open_evidence_file(evidence_dir: str, logical_path: str) -> int:
                 f"artifact must be a regular file: {logical_path!r}"
             )
         return artifact
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def open_evidence_file(
+    evidence_dir: str,
+    logical_path: str,
+) -> Iterator[int]:
+    """Hold one stable regular-file descriptor beneath evidence."""
+    descriptor = _open_evidence_file(evidence_dir, logical_path)
+    try:
+        yield descriptor
     finally:
         os.close(descriptor)
 
@@ -206,6 +240,7 @@ def staged_evidence_path(
     source = _open_evidence_file(evidence_dir, logical_path)
     destination = -1
     stable = -1
+    token: contextvars.Token[tuple[int, ...]] | None = None
     basename = parts[-1]
     try:
         try:
@@ -237,12 +272,17 @@ def staged_evidence_path(
         )
         if not _same_object(written, os.fstat(stable)):
             raise InspectionError("staged evidence changed before inspection")
+        token = _inherited_evidence_fds.set(
+            (*_inherited_evidence_fds.get(), stable)
+        )
         yield StagedEvidence(
             detection_path=f"{transaction.proc_path}/{basename}",
             inspector_path=f"/proc/self/fd/{stable}",
             descriptor=stable,
         )
     finally:
+        if token is not None:
+            _inherited_evidence_fds.reset(token)
         if stable >= 0:
             os.close(stable)
         if destination >= 0:

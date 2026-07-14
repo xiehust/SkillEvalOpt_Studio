@@ -5,7 +5,6 @@ import errno
 import json
 import math
 import os
-import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -362,113 +361,6 @@ def _open_child(
         raise InspectionError(f"{label} {detail}") from exc
 
 
-def resolve_evidence_path(evidence_dir: str, logical_path: str) -> str:
-    """Resolve a logical artifact path beneath evidence without symlinks."""
-    evidence = _absolute_path(evidence_dir, "evidence root")
-    parts = validate_logical_path(logical_path)
-    descriptor = _open_real_directory(evidence, "evidence root")
-    try:
-        for part in parts[:-1]:
-            child = _open_child(
-                descriptor,
-                part,
-                directory=True,
-                label=f"artifact path {logical_path!r}",
-            )
-            os.close(descriptor)
-            descriptor = child
-        artifact_fd = _open_child(
-            descriptor,
-            parts[-1],
-            directory=False,
-            label=f"artifact path {logical_path!r}",
-        )
-        try:
-            if not stat.S_ISREG(os.fstat(artifact_fd).st_mode):
-                raise InspectionError(
-                    f"artifact must be a regular file: {logical_path!r}"
-                )
-        finally:
-            os.close(artifact_fd)
-    finally:
-        os.close(descriptor)
-    return os.path.join(evidence, *parts)
-
-
-def resolve_scratch_path(
-    scratch_dir: str,
-    derived_path: str,
-    *,
-    must_exist: bool = True,
-) -> str:
-    """Resolve and validate an inspector-derived path beneath scratch."""
-    scratch = _absolute_path(scratch_dir, "scratch root")
-    if (
-        not isinstance(derived_path, str)
-        or not derived_path
-        or "\x00" in derived_path
-        or "\\" in derived_path
-    ):
-        raise InspectionError(
-            "derived path must be non-empty and contain no backslash or NUL"
-        )
-    if os.path.isabs(derived_path):
-        if os.path.normpath(derived_path) != derived_path:
-            raise InspectionError("derived path must be normalized")
-        candidate = os.path.abspath(derived_path)
-        try:
-            relative = os.path.relpath(candidate, scratch)
-        except ValueError as exc:
-            raise InspectionError("derived path is outside scratch") from exc
-        if relative == os.pardir or relative.startswith(os.pardir + os.sep):
-            raise InspectionError("derived path is outside scratch")
-        logical = relative.replace(os.sep, "/")
-        parts = validate_logical_path(logical)
-    else:
-        parts = validate_logical_path(derived_path)
-        candidate = os.path.join(scratch, *parts)
-
-    descriptor = _open_real_directory(scratch, "scratch root")
-    try:
-        for part in parts[:-1]:
-            child = _open_child(
-                descriptor,
-                part,
-                directory=True,
-                label=f"derived path {derived_path!r}",
-            )
-            os.close(descriptor)
-            descriptor = child
-        if not must_exist:
-            try:
-                info = os.stat(
-                    parts[-1],
-                    dir_fd=descriptor,
-                    follow_symlinks=False,
-                )
-            except FileNotFoundError:
-                return candidate
-            if stat.S_ISLNK(info.st_mode):
-                raise InspectionError("derived path contains a symlink")
-            if not stat.S_ISREG(info.st_mode):
-                raise InspectionError("derived path must be a regular file")
-            return candidate
-        output_fd = _open_child(
-            descriptor,
-            parts[-1],
-            directory=False,
-            label=f"derived path {derived_path!r}",
-        )
-        try:
-            if not stat.S_ISREG(os.fstat(output_fd).st_mode):
-                raise InspectionError("derived path must be a regular file")
-        finally:
-            os.close(output_fd)
-    finally:
-        os.close(descriptor)
-    return candidate
-
-
 def safe_run(
     command: list[str],
     *,
@@ -514,8 +406,6 @@ __all__ = [
     "ResponseBudget",
     "bounded_diagnostic",
     "normalize_selectors",
-    "resolve_evidence_path",
-    "resolve_scratch_path",
     "safe_run",
     "validate_json_result",
     "validate_logical_path",

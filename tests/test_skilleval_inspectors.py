@@ -4,8 +4,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import multiprocessing
 import os
 import signal
+import subprocess
 import sys
 import time
 import types
@@ -30,6 +32,7 @@ from skillopt.envs.skilleval.inspectors import (
 )
 from skillopt.envs.skilleval.inspectors.__main__ import main as artifactctl_main
 from skillopt.envs.skilleval.inspectors._scratch import scratch_transaction
+from skillopt.envs.skilleval.inspectors._secure_files import open_evidence_file
 from skillopt.envs.skilleval.inspectors.base import (
     MAX_COMMAND_OUTPUT_CHARS,
     MAX_LOGICAL_COMPONENTS,
@@ -42,7 +45,6 @@ from skillopt.envs.skilleval.inspectors.base import (
     RenderBudget,
     ResponseBudget,
     normalize_selectors,
-    resolve_evidence_path,
     safe_run,
     validate_logical_path,
     validate_roots,
@@ -74,6 +76,42 @@ def test_package_metadata_targets_stable_mcp_and_python_310() -> None:
 def _write_pdf(path: Path, body: bytes = b"content") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"%PDF-1.4\n" + body)
+
+
+def _scratch_commit_worker(
+    scratch: str,
+    barrier,
+    entered,
+    results,
+) -> None:
+    try:
+        barrier.wait(timeout=5)
+        with scratch_transaction(
+            scratch,
+            max_bytes=100,
+            max_entries=20,
+            max_depth=4,
+        ) as transaction:
+            with entered.get_lock():
+                entered.value += 1
+            deadline = time.monotonic() + 0.5
+            while entered.value < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            output = Path(transaction.proc_path) / "render.bin"
+            output.write_bytes(b"x" * 80)
+            transaction.commit_outputs([str(output)])
+        results.put("ok")
+    except BaseException as exc:
+        results.put(f"error:{type(exc).__name__}:{exc}")
+
+
+def _wait_for_pid_exit(pid: int, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not Path(f"/proc/{pid}").exists():
+            return True
+        time.sleep(0.02)
+    return not Path(f"/proc/{pid}").exists()
 
 
 class _FakePdfInspector:
@@ -401,6 +439,79 @@ class TestSafeRun:
                 except ProcessLookupError:
                     pass
 
+    @pytest.mark.parametrize(
+        "termination_signal",
+        [signal.SIGTERM, signal.SIGINT],
+    )
+    def test_caller_termination_removes_supervisor_and_payload(
+        self, tmp_path, termination_signal
+    ) -> None:
+        payload_pid_file = tmp_path / "payload.pid"
+        payload_code = (
+            "import os, pathlib, sys, time; "
+            "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+            "time.sleep(60)"
+        )
+        caller_code = (
+            "import sys; "
+            "from skillopt.envs.skilleval.inspectors.base import safe_run; "
+            "safe_run([sys.executable, '-c', sys.argv[1], sys.argv[2]], "
+            "timeout=120, cwd=sys.argv[3], home=sys.argv[3])"
+        )
+        caller = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                caller_code,
+                payload_code,
+                str(payload_pid_file),
+                str(tmp_path),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        supervisor_pid = None
+        payload_pid = None
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                children_path = Path(
+                    f"/proc/{caller.pid}/task/{caller.pid}/children"
+                )
+                if children_path.exists():
+                    children = children_path.read_text(
+                        encoding="ascii"
+                    ).split()
+                    if children:
+                        supervisor_pid = int(children[0])
+                if payload_pid_file.exists():
+                    payload_pid = int(
+                        payload_pid_file.read_text(encoding="ascii")
+                    )
+                if supervisor_pid is not None and payload_pid is not None:
+                    break
+                time.sleep(0.02)
+            assert supervisor_pid is not None
+            assert payload_pid is not None
+
+            os.kill(caller.pid, termination_signal)
+            caller.wait(timeout=5)
+
+            assert _wait_for_pid_exit(supervisor_pid)
+            assert _wait_for_pid_exit(payload_pid)
+        finally:
+            if caller.poll() is None:
+                caller.kill()
+                caller.wait()
+            for pid in (payload_pid, supervisor_pid):
+                if pid is not None:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
 
 class TestSecurePaths:
     def test_logical_path_boundaries_are_accepted(self) -> None:
@@ -484,7 +595,8 @@ class TestSecurePaths:
         (evidence / "linked").symlink_to(outside, target_is_directory=True)
 
         with pytest.raises(InspectionError, match="symlink"):
-            resolve_evidence_path(str(evidence), "linked/report.pdf")
+            with open_evidence_file(str(evidence), "linked/report.pdf"):
+                pass
 
     @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO unsupported")
     def test_rejects_nonregular_artifact(self, tmp_path) -> None:
@@ -492,7 +604,12 @@ class TestSecurePaths:
         os.mkfifo(evidence / "pipe.pdf")
 
         with pytest.raises(InspectionError, match="regular"):
-            resolve_evidence_path(str(evidence), "pipe.pdf")
+            with open_evidence_file(str(evidence), "pipe.pdf"):
+                pass
+
+    def test_unstable_path_resolvers_are_not_public(self) -> None:
+        assert not hasattr(inspector_base, "resolve_evidence_path")
+        assert not hasattr(inspector_base, "resolve_scratch_path")
 
     def test_rejects_render_output_escape(
         self, tmp_path, fake_pdf_inspector
@@ -1010,6 +1127,109 @@ class TestRegistry:
 
         assert not escaped_marker.exists()
         assert list(scratch.iterdir()) == []
+
+    def test_scratch_root_escape_is_budgeted_and_rolled_back(
+        self, tmp_path, fake_pdf_inspector, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf", b"")
+        script = (
+            "from pathlib import Path; "
+            "Path('../escape-a.bin').write_bytes(b'a' * 40); "
+            "Path('../escape-b.bin').write_bytes(b'b' * 40)"
+        )
+
+        def process_inspect(self, path, scratch_dir, *, response_budget):
+            safe_run(
+                [sys.executable, "-c", script],
+                timeout=5,
+                cwd=scratch_dir,
+                home=scratch_dir,
+            )
+            return {"ok": True}
+
+        monkeypatch.setattr(_FakePdfInspector, "inspect", process_inspect)
+
+        with pytest.raises(InspectionError, match="scratch"):
+            inspect_artifact(
+                "report.pdf",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+                max_scratch_bytes=64,
+            )
+
+        assert list(scratch.iterdir()) == []
+
+    def test_stable_evidence_fd_is_inherited_by_real_child(
+        self, tmp_path, fake_pdf_inspector, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf", b"ORIGINAL")
+
+        def process_inspect(self, path, scratch_dir, *, response_budget):
+            process = safe_run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "from pathlib import Path; import sys; "
+                        "sys.stdout.buffer.write(Path(sys.argv[1]).read_bytes())"
+                    ),
+                    path,
+                ],
+                timeout=5,
+                cwd=scratch_dir,
+                home=scratch_dir,
+            )
+            return {"payload": process.stdout}
+
+        monkeypatch.setattr(_FakePdfInspector, "inspect", process_inspect)
+
+        result = inspect_artifact(
+            "report.pdf",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        assert "ORIGINAL" in result["payload"]
+        assert list(scratch.iterdir()) == []
+
+    def test_scratch_root_budget_serializes_process_transactions(
+        self, tmp_path
+    ) -> None:
+        _evidence, scratch = _roots(tmp_path)
+        context = multiprocessing.get_context("fork")
+        barrier = context.Barrier(2)
+        entered = context.Value("i", 0)
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=_scratch_commit_worker,
+                args=(str(scratch), barrier, entered, results),
+            )
+            for _ in range(2)
+        ]
+        for process in processes:
+            process.start()
+        try:
+            for process in processes:
+                process.join(timeout=10)
+                assert not process.is_alive()
+                assert process.exitcode == 0
+            outcomes = sorted(
+                [results.get(timeout=2), results.get(timeout=2)]
+            )
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.kill()
+                    process.join()
+
+        assert outcomes[0].startswith("error:InspectionError:scratch")
+        assert outcomes[1] == "ok"
+        files = [path for path in scratch.rglob("*") if path.is_file()]
+        assert len(files) == 1
+        assert files[0].stat().st_size == 80
 
     @pytest.mark.parametrize(
         ("limit_name", "limit_value", "script"),
@@ -2215,8 +2435,8 @@ server.run(transport="stdio")
             )
 
     @pytest.mark.anyio
-    async def test_render_full_result_budget_rejects_oversized_image_payload(
-        self, tmp_path, fake_pdf_inspector
+    async def test_render_full_result_budget_rejects_before_reading_media(
+        self, tmp_path, fake_pdf_inspector, monkeypatch
     ) -> None:
         evidence, scratch = _roots(tmp_path)
         _write_pdf(evidence / "report.pdf")
@@ -2227,6 +2447,21 @@ server.run(transport="stdio")
             compress_level=0,
         )
         fake_pdf_inspector.render_bytes = large.read_bytes()
+        read_called = False
+        image_called = False
+
+        def unexpected_read(*args, **kwargs):
+            nonlocal read_called
+            read_called = True
+            raise AssertionError("oversized media must not be read")
+
+        def unexpected_image(*args, **kwargs):
+            nonlocal image_called
+            image_called = True
+            raise AssertionError("oversized media must not be encoded")
+
+        monkeypatch.setattr(artifact_mcp, "_read_png", unexpected_read)
+        monkeypatch.setattr(artifact_mcp, "Image", unexpected_image)
         server = artifact_mcp.create_server(str(evidence), str(scratch))
 
         async with create_connected_server_and_client_session(
@@ -2247,6 +2482,8 @@ server.run(transport="stdio")
         assert "response" in envelope["error"].lower()
         assert result.isError is True
         assert _serialized_mcp_result_bytes(result) <= MIN_RESPONSE_BYTES
+        assert read_called is False
+        assert image_called is False
         assert not any(
             isinstance(content, ImageContent) for content in result.content
         )

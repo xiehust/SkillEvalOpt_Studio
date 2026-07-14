@@ -1,4 +1,4 @@
-"""Request-local scratch transactions with bounded rollback."""
+"""Request-local scratch transactions over an exclusively locked root."""
 from __future__ import annotations
 
 import contextvars
@@ -14,151 +14,25 @@ from .base import (
     _open_real_directory,
     validate_logical_path,
 )
+from ._scratch_root import (
+    ScratchLimits,
+    ScratchRootLease,
+    ScratchSnapshot,
+    ScratchUsage,
+    _remove_tree,
+    _same_object,
+    _scan_descriptor,
+    _snapshot_descriptor,
+    acquire_root_lease,
+    cleanup_new_entries,
+    verify_baseline,
+)
 
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
 _FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
 _current_transaction: contextvars.ContextVar[ScratchTransaction | None] = (
     contextvars.ContextVar("artifact_scratch_transaction", default=None)
 )
-
-
-def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
-    return (
-        left.st_dev,
-        left.st_ino,
-        stat.S_IFMT(left.st_mode),
-    ) == (
-        right.st_dev,
-        right.st_ino,
-        stat.S_IFMT(right.st_mode),
-    )
-
-
-@dataclass(frozen=True)
-class ScratchLimits:
-    max_bytes: int
-    max_entries: int
-    max_depth: int
-
-
-@dataclass(frozen=True)
-class ScratchUsage:
-    bytes: int = 0
-    entries: int = 0
-    depth: int = 0
-
-    def plus(self, other: ScratchUsage) -> ScratchUsage:
-        return ScratchUsage(
-            bytes=self.bytes + other.bytes,
-            entries=self.entries + other.entries,
-            depth=max(self.depth, other.depth),
-        )
-
-
-@dataclass
-class _RemovalFrame:
-    descriptor: int
-    names: list[str]
-    parent_descriptor: int | None = None
-    name: str = ""
-    identity: os.stat_result | None = None
-    owned: bool = False
-    index: int = 0
-
-
-def _raise_if_over(usage: ScratchUsage, limits: ScratchLimits) -> None:
-    if usage.bytes > limits.max_bytes:
-        raise InspectionError(
-            "scratch byte budget exceeded: "
-            f"{usage.bytes} > {limits.max_bytes}"
-        )
-    if usage.entries > limits.max_entries:
-        raise InspectionError(
-            "scratch entry budget exceeded: "
-            f"{usage.entries} > {limits.max_entries}"
-        )
-    if usage.depth > limits.max_depth:
-        raise InspectionError(
-            "scratch depth budget exceeded: "
-            f"{usage.depth} > {limits.max_depth}"
-        )
-
-
-def _scan_tree(
-    descriptor: int,
-    limits: ScratchLimits,
-    *,
-    depth: int = 0,
-    logical: str = "",
-) -> ScratchUsage:
-    with os.scandir(descriptor) as entries:
-        names = sorted(entry.name for entry in entries)
-    usage = ScratchUsage()
-    for name in names:
-        path = f"{logical}/{name}" if logical else name
-        before = os.stat(
-            name,
-            dir_fd=descriptor,
-            follow_symlinks=False,
-        )
-        entry_depth = depth + 1
-        child_usage = ScratchUsage(entries=1, depth=entry_depth)
-        _raise_if_over(usage.plus(child_usage), limits)
-        if stat.S_ISLNK(before.st_mode):
-            raise InspectionError(f"scratch contains a symlink: {path}")
-        if stat.S_ISDIR(before.st_mode):
-            child = os.open(name, _DIRECTORY_FLAGS, dir_fd=descriptor)
-            try:
-                opened = os.fstat(child)
-                if not _same_file(before, opened):
-                    raise InspectionError(
-                        f"scratch directory changed while scanning: {path}"
-                    )
-                child_usage = child_usage.plus(
-                    _scan_tree(
-                        child,
-                        limits,
-                        depth=entry_depth,
-                        logical=path,
-                    )
-                )
-            finally:
-                os.close(child)
-        elif stat.S_ISREG(before.st_mode):
-            child = os.open(name, _FILE_FLAGS, dir_fd=descriptor)
-            try:
-                opened = os.fstat(child)
-                if not _same_file(before, opened):
-                    raise InspectionError(
-                        f"scratch file changed while scanning: {path}"
-                    )
-                child_usage = ScratchUsage(
-                    bytes=opened.st_size,
-                    entries=1,
-                    depth=entry_depth,
-                )
-            finally:
-                os.close(child)
-        else:
-            raise InspectionError(
-                f"scratch contains a non-regular entry: {path}"
-            )
-        usage = usage.plus(child_usage)
-        _raise_if_over(usage, limits)
-    return usage
-
-
-def _scan_descriptor(
-    descriptor: int,
-    limits: ScratchLimits,
-) -> ScratchUsage:
-    scan = os.open(".", _DIRECTORY_FLAGS, dir_fd=descriptor)
-    try:
-        usage = _scan_tree(scan, limits)
-    finally:
-        os.close(scan)
-    _raise_if_over(usage, limits)
-    return usage
 
 
 def scratch_bytes(scratch_dir: str, maximum: int) -> int:
@@ -176,80 +50,6 @@ def scratch_bytes(scratch_dir: str, maximum: int) -> int:
         return usage.bytes
     finally:
         os.close(descriptor)
-
-
-def _remove_tree(descriptor: int) -> None:
-    with os.scandir(descriptor) as entries:
-        root_names = sorted(entry.name for entry in entries)
-    stack = [_RemovalFrame(descriptor, root_names)]
-    try:
-        while stack:
-            frame = stack[-1]
-            if frame.index < len(frame.names):
-                name = frame.names[frame.index]
-                frame.index += 1
-                info = os.stat(
-                    name,
-                    dir_fd=frame.descriptor,
-                    follow_symlinks=False,
-                )
-                if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(
-                    info.st_mode
-                ):
-                    child = os.open(
-                        name,
-                        _DIRECTORY_FLAGS,
-                        dir_fd=frame.descriptor,
-                    )
-                    opened = os.fstat(child)
-                    if not _same_file(info, opened):
-                        os.close(child)
-                        raise InspectionError(
-                            "scratch entry changed during rollback"
-                        )
-                    with os.scandir(child) as entries:
-                        child_names = sorted(
-                            entry.name for entry in entries
-                        )
-                    stack.append(
-                        _RemovalFrame(
-                            child,
-                            child_names,
-                            parent_descriptor=frame.descriptor,
-                            name=name,
-                            identity=opened,
-                            owned=True,
-                        )
-                    )
-                else:
-                    os.unlink(name, dir_fd=frame.descriptor)
-                continue
-            if frame.parent_descriptor is not None:
-                current = os.stat(
-                    frame.name,
-                    dir_fd=frame.parent_descriptor,
-                    follow_symlinks=False,
-                )
-                if (
-                    frame.identity is None
-                    or not _same_file(frame.identity, current)
-                ):
-                    raise InspectionError(
-                        "scratch directory changed during rollback"
-                    )
-                os.rmdir(frame.name, dir_fd=frame.parent_descriptor)
-                os.close(frame.descriptor)
-                frame.owned = False
-            stack.pop()
-    except BaseException:
-        for frame in reversed(stack):
-            if frame.owned:
-                try:
-                    os.close(frame.descriptor)
-                except OSError:
-                    pass
-                frame.owned = False
-        raise
 
 
 def _open_relative_parent(
@@ -284,7 +84,7 @@ class ScratchFile:
 
 
 class ScratchTransaction:
-    """One isolated request tree that is removed unless outputs are committed."""
+    """One request holding exclusive ownership of the configured scratch root."""
 
     def __init__(
         self,
@@ -304,10 +104,9 @@ class ScratchTransaction:
         self.root_descriptor = -1
         self.descriptor = -1
         self.name = ""
-        self._root_identity: os.stat_result | None = None
-        self._transaction_identity: os.stat_result | None = None
+        self._lease: ScratchRootLease | None = None
+        self._baseline: ScratchSnapshot | None = None
         self._committed_name = ""
-        self._committed_identity: os.stat_result | None = None
         self._token: contextvars.Token[ScratchTransaction | None] | None = None
 
     @property
@@ -318,15 +117,13 @@ class ScratchTransaction:
 
     def __enter__(self) -> ScratchTransaction:
         try:
-            self.root_descriptor = _open_real_directory(
+            self._lease = acquire_root_lease(
                 self.root_path,
-                "scratch root",
-            )
-            self._root_identity = os.fstat(self.root_descriptor)
-            baseline = _scan_descriptor(
-                self.root_descriptor,
                 self.requested_limits,
             )
+            self.root_descriptor = self._lease.descriptor
+            self._baseline = self._lease.baseline
+            baseline = self._baseline.usage
             self.limits = ScratchLimits(
                 max_bytes=self.requested_limits.max_bytes - baseline.bytes,
                 max_entries=(
@@ -353,42 +150,49 @@ class ScratchTransaction:
                     os.rmdir(name, dir_fd=self.root_descriptor)
                     self.name = ""
                     raise
-                self._transaction_identity = os.fstat(self.descriptor)
+                self.check()
                 self._token = _current_transaction.set(self)
                 return self
             raise InspectionError("could not allocate scratch transaction")
-        except Exception:
-            try:
-                if self.descriptor >= 0:
-                    os.close(self.descriptor)
-                    self.descriptor = -1
-                if self.name and self.root_descriptor >= 0:
-                    try:
-                        os.rmdir(self.name, dir_fd=self.root_descriptor)
-                    except FileNotFoundError:
-                        pass
-                    self.name = ""
-            finally:
-                if self.root_descriptor >= 0:
-                    os.close(self.root_descriptor)
-                    self.root_descriptor = -1
+        except BaseException:
+            self._close_failed_entry()
             raise
 
+    def _close_failed_entry(self) -> None:
+        try:
+            if self.descriptor >= 0:
+                os.close(self.descriptor)
+                self.descriptor = -1
+            if self.name and self.root_descriptor >= 0:
+                try:
+                    os.rmdir(self.name, dir_fd=self.root_descriptor)
+                except FileNotFoundError:
+                    pass
+                self.name = ""
+        finally:
+            if self._lease is not None:
+                self._lease.release()
+                self._lease = None
+            self.root_descriptor = -1
+
     def check(self) -> ScratchUsage:
-        if self.descriptor < 0:
+        if self.root_descriptor < 0:
             raise InspectionError("scratch transaction is not active")
-        return _scan_descriptor(self.descriptor, self.limits)
+        return _scan_descriptor(
+            self.root_descriptor,
+            self.requested_limits,
+        )
 
     def remaining_bytes(self) -> int:
-        return self.limits.max_bytes - self.check().bytes
+        return self.requested_limits.max_bytes - self.check().bytes
 
     def validate_root_identity(self) -> None:
-        if self._root_identity is None:
+        if self._lease is None:
             raise InspectionError("scratch transaction is not active")
         current = _open_real_directory(self.root_path, "scratch root")
         try:
-            if not _same_file(
-                self._root_identity,
+            if not _same_object(
+                self._lease.identity,
                 os.fstat(current),
             ):
                 raise InspectionError(
@@ -447,10 +251,6 @@ class ScratchTransaction:
             raise InspectionError("scratch transaction already committed outputs")
         self.validate_root_identity()
         self.check()
-        if paths and self.requested_limits.max_depth < 2:
-            raise InspectionError(
-                "scratch depth budget is too small to commit rendered output"
-            )
         outputs = self.open_outputs(paths)
         if not outputs:
             return []
@@ -478,7 +278,7 @@ class ScratchTransaction:
                         dir_fd=parent,
                         follow_symlinks=False,
                     )
-                    if not _same_file(named, os.fstat(output.descriptor)):
+                    if not _same_object(named, os.fstat(output.descriptor)):
                         raise InspectionError(
                             "rendered output changed before commit"
                         )
@@ -498,9 +298,9 @@ class ScratchTransaction:
                         destination,
                     )
                 )
+            self.check()
             self.validate_root_identity()
             self._committed_name = output_name
-            self._committed_identity = os.fstat(output_descriptor)
             return committed
         except Exception:
             if output_descriptor >= 0:
@@ -519,58 +319,19 @@ class ScratchTransaction:
             for output in outputs:
                 output.close()
 
-    def _rollback_committed(self) -> None:
-        if not self._committed_name:
-            return
-        descriptor = os.open(
-            self._committed_name,
-            _DIRECTORY_FLAGS,
-            dir_fd=self.root_descriptor,
+    def _restore_root(self, preserve: frozenset[str]) -> None:
+        if self._baseline is None:
+            raise InspectionError("scratch transaction has no baseline")
+        cleanup_new_entries(
+            self.root_descriptor,
+            self._baseline,
+            preserve_top_level=preserve,
         )
-        try:
-            if (
-                self._committed_identity is None
-                or not _same_file(
-                    self._committed_identity,
-                    os.fstat(descriptor),
-                )
-            ):
-                raise InspectionError(
-                    "committed scratch output changed during rollback"
-                )
-            _remove_tree(descriptor)
-        finally:
-            os.close(descriptor)
-        current = os.stat(
-            self._committed_name,
-            dir_fd=self.root_descriptor,
-            follow_symlinks=False,
+        current = _snapshot_descriptor(
+            self.root_descriptor,
+            self.requested_limits,
         )
-        if not _same_file(self._committed_identity, current):
-            raise InspectionError(
-                "committed scratch output changed during rollback"
-            )
-        os.rmdir(self._committed_name, dir_fd=self.root_descriptor)
-        self._committed_name = ""
-        self._committed_identity = None
-
-    def _rollback(self) -> None:
-        if self.descriptor < 0:
-            return
-        _remove_tree(self.descriptor)
-        current = os.stat(
-            self.name,
-            dir_fd=self.root_descriptor,
-            follow_symlinks=False,
-        )
-        if (
-            self._transaction_identity is None
-            or not _same_file(self._transaction_identity, current)
-        ):
-            raise InspectionError(
-                "scratch transaction changed during rollback"
-            )
-        os.rmdir(self.name, dir_fd=self.root_descriptor)
+        verify_baseline(current, self._baseline)
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
         if self._token is not None:
@@ -583,23 +344,29 @@ class ScratchTransaction:
                 self.validate_root_identity()
             except BaseException as check_error:
                 pending = check_error
+        preserve = (
+            frozenset({self._committed_name})
+            if exc_type is None and pending is None and self._committed_name
+            else frozenset()
+        )
         try:
             try:
-                self._rollback()
+                self._restore_root(preserve)
             except BaseException as cleanup_error:
                 pending = pending or cleanup_error
-            if exc_type is not None or pending is not None:
-                try:
-                    self._rollback_committed()
-                except BaseException as cleanup_error:
-                    pending = pending or cleanup_error
+                if preserve:
+                    try:
+                        self._restore_root(frozenset())
+                    except BaseException as rollback_error:
+                        pending = pending or rollback_error
         finally:
             if self.descriptor >= 0:
                 os.close(self.descriptor)
                 self.descriptor = -1
-            if self.root_descriptor >= 0:
-                os.close(self.root_descriptor)
-                self.root_descriptor = -1
+            if self._lease is not None:
+                self._lease.release()
+                self._lease = None
+            self.root_descriptor = -1
         if pending is not None:
             raise pending
         return False

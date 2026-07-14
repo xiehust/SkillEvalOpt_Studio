@@ -12,6 +12,7 @@ from pydantic import Field, WithJsonSchema
 from ._artifact_mcp_media import (
     DEFAULT_MAX_MEDIA_BYTES,
     MAX_MEDIA_BYTES,
+    preflight_png_response as _preflight_png_response,
     read_png as _read_png,
 )
 from ._artifact_mcp_results import (
@@ -425,6 +426,12 @@ def create_server(
                 max_scratch_entries=scratch_entries_limit,
                 max_scratch_depth=scratch_depth_limit,
             ) as outputs:
+                _preflight_png_response(
+                    [output.descriptor for output in outputs],
+                    response_limit=response_limit,
+                    media_byte_limit=server_media_max,
+                    max_pixels=pixel_limit,
+                )
                 metadata = []
                 images = []
                 used_pixels = 0
