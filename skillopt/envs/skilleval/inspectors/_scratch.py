@@ -282,31 +282,37 @@ class ScratchTransaction:
             self.descriptor = -1
         try:
             if self.outer_descriptor >= 0:
-                _remove_tree(self.outer_descriptor)
-                if (
-                    self.outer_identity is None
-                    or not _same_object(
-                        self.outer_identity,
-                        os.fstat(self.outer_descriptor),
-                    )
-                ):
-                    raise InspectionError(
-                        "scratch transaction outer changed during cleanup"
-                    )
-                if self.outer_name and self.outer_parent_descriptor >= 0:
-                    current = os.stat(
-                        self.outer_name,
-                        dir_fd=self.outer_parent_descriptor,
-                        follow_symlinks=False,
-                    )
-                    if not _same_object(self.outer_identity, current):
+                try:
+                    _remove_tree(self.outer_descriptor)
+                except BaseException as exc:
+                    pending = pending or exc
+                try:
+                    if (
+                        self.outer_identity is None
+                        or not _same_object(
+                            self.outer_identity,
+                            os.fstat(self.outer_descriptor),
+                        )
+                    ):
                         raise InspectionError(
                             "scratch transaction outer changed during cleanup"
                         )
-                    os.rmdir(
-                        self.outer_name,
-                        dir_fd=self.outer_parent_descriptor,
-                    )
+                    if self.outer_name and self.outer_parent_descriptor >= 0:
+                        current = os.stat(
+                            self.outer_name,
+                            dir_fd=self.outer_parent_descriptor,
+                            follow_symlinks=False,
+                        )
+                        if not _same_object(self.outer_identity, current):
+                            raise InspectionError(
+                                "scratch transaction outer changed during cleanup"
+                            )
+                        os.rmdir(
+                            self.outer_name,
+                            dir_fd=self.outer_parent_descriptor,
+                        )
+                except BaseException as exc:
+                    pending = pending or exc
             elif self.outer_name and self.outer_parent_descriptor >= 0:
                 os.rmdir(
                     self.outer_name,

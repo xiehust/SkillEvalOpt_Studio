@@ -11,6 +11,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import types
 from pathlib import Path
@@ -1241,6 +1242,43 @@ class TestRegistry:
 
         assert list(scratch.iterdir()) == []
 
+    def test_zero_mode_subtree_is_removed_after_safe_run_failure(
+        self, tmp_path, fake_pdf_inspector, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        temporary_root = Path(tempfile.gettempdir())
+        before = set(temporary_root.glob(".skillopt-artifact-*"))
+        script = (
+            "from pathlib import Path; import os, time; "
+            "nested = Path('sealed/inner'); "
+            "nested.mkdir(parents=True); "
+            "(nested / 'payload.bin').write_bytes(b'x'); "
+            "os.chmod('sealed', 0); "
+            "time.sleep(2)"
+        )
+
+        def process_inspect(self, path, scratch_dir, *, response_budget):
+            safe_run(
+                [sys.executable, "-c", script],
+                timeout=5,
+                cwd=scratch_dir,
+                home=scratch_dir,
+            )
+            return {"ok": True}
+
+        monkeypatch.setattr(_FakePdfInspector, "inspect", process_inspect)
+
+        with pytest.raises(InspectionError, match="scratch"):
+            inspect_artifact(
+                "report.pdf",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+
+        assert set(temporary_root.glob(".skillopt-artifact-*")) == before
+        assert list(scratch.iterdir()) == []
+
     @pytest.mark.parametrize(
         "operation",
         ["delete", "overwrite", "truncate", "rename"],
@@ -1263,15 +1301,23 @@ class TestRegistry:
         ):
             target = Path(scratch_dir) / ".." / "existing.bin"
             destination = Path(scratch_dir) / ".." / "moved.bin"
+            target.write_bytes(b"OUTER")
             if operation == "delete":
-                target.unlink(missing_ok=True)
+                target.unlink()
+                happened = not target.exists()
             elif operation == "overwrite":
                 target.write_bytes(b"CHANGED")
+                happened = target.read_bytes() == b"CHANGED"
             elif operation == "truncate":
                 target.open("wb").close()
-            elif target.exists():
+                happened = target.stat().st_size == 0
+            else:
                 target.rename(destination)
-            return {"ok": True}
+                happened = (
+                    not target.exists()
+                    and destination.read_bytes() == b"OUTER"
+                )
+            return {"ok": True, "branch_happened": happened}
 
         monkeypatch.setattr(
             _FakePdfInspector,
@@ -1285,7 +1331,7 @@ class TestRegistry:
             scratch_dir=str(scratch),
         )
 
-        assert result == {"ok": True}
+        assert result == {"ok": True, "branch_happened": True}
         assert existing.read_bytes() == b"ORIGINAL"
         assert not moved.exists()
 

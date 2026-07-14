@@ -11,6 +11,11 @@ from .base import InspectionError, _open_real_directory
 
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
 _FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+_PATH_DIRECTORY_FLAGS = (
+    getattr(os, "O_PATH", os.O_RDONLY)
+    | os.O_DIRECTORY
+    | getattr(os, "O_NOFOLLOW", 0)
+)
 
 
 @dataclass(frozen=True)
@@ -186,7 +191,17 @@ def _scan_tree(
                 f"scratch contains a symlink: {'/'.join(child_parts)}"
             )
         if stat.S_ISDIR(before.st_mode):
-            child = os.open(name, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            try:
+                child = os.open(
+                    name,
+                    _DIRECTORY_FLAGS,
+                    dir_fd=descriptor,
+                )
+            except OSError as exc:
+                raise InspectionError(
+                    "scratch directory could not be scanned: "
+                    f"{'/'.join(child_parts)}"
+                ) from exc
             try:
                 opened = os.fstat(child)
                 if not _same_object(before, opened):
@@ -243,68 +258,120 @@ def _scan_descriptor(
     return usage
 
 
+def _open_owned_directory_for_cleanup(
+    parent_descriptor: int,
+    name: str,
+    expected: os.stat_result,
+) -> tuple[int, os.stat_result]:
+    path_descriptor = os.open(
+        name,
+        _PATH_DIRECTORY_FLAGS,
+        dir_fd=parent_descriptor,
+    )
+    try:
+        opened = os.fstat(path_descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not _same_object(expected, opened)
+        ):
+            raise InspectionError(
+                "scratch directory changed during cleanup"
+            )
+        if opened.st_uid != os.geteuid():
+            raise InspectionError(
+                "scratch directory owner changed during cleanup"
+            )
+        owner_mode = stat.S_IMODE(opened.st_mode) | stat.S_IRWXU
+        if owner_mode != stat.S_IMODE(opened.st_mode):
+            os.chmod(f"/proc/self/fd/{path_descriptor}", owner_mode)
+        child = os.open(
+            ".",
+            _DIRECTORY_FLAGS,
+            dir_fd=path_descriptor,
+        )
+        child_info = os.fstat(child)
+        if not _same_object(opened, child_info):
+            os.close(child)
+            raise InspectionError(
+                "scratch directory changed during cleanup"
+            )
+        return child, child_info
+    finally:
+        os.close(path_descriptor)
+
+
 def _remove_tree(descriptor: int) -> None:
     with os.scandir(descriptor) as entries:
         root_names = sorted(entry.name for entry in entries)
     stack = [_RemovalFrame(descriptor, root_names)]
+    pending: BaseException | None = None
     try:
         while stack:
             frame = stack[-1]
             if frame.index < len(frame.names):
                 name = frame.names[frame.index]
                 frame.index += 1
-                info = os.stat(
-                    name,
-                    dir_fd=frame.descriptor,
-                    follow_symlinks=False,
-                )
-                if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(
-                    info.st_mode
-                ):
-                    child = os.open(
+                child = -1
+                try:
+                    info = os.stat(
                         name,
-                        _DIRECTORY_FLAGS,
                         dir_fd=frame.descriptor,
+                        follow_symlinks=False,
                     )
-                    opened = os.fstat(child)
-                    if not _same_object(info, opened):
+                    if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(
+                        info.st_mode
+                    ):
+                        child, opened = _open_owned_directory_for_cleanup(
+                            frame.descriptor,
+                            name,
+                            info,
+                        )
+                        with os.scandir(child) as entries:
+                            child_names = sorted(
+                                entry.name for entry in entries
+                            )
+                        stack.append(
+                            _RemovalFrame(
+                                child,
+                                child_names,
+                                parent_descriptor=frame.descriptor,
+                                name=name,
+                                identity=opened,
+                                owned=True,
+                            )
+                        )
+                        child = -1
+                    else:
+                        os.unlink(name, dir_fd=frame.descriptor)
+                except BaseException as exc:
+                    pending = pending or exc
+                finally:
+                    if child >= 0:
                         os.close(child)
-                        raise InspectionError(
-                            "scratch entry changed during cleanup"
-                        )
-                    with os.scandir(child) as entries:
-                        child_names = sorted(
-                            entry.name for entry in entries
-                        )
-                    stack.append(
-                        _RemovalFrame(
-                            child,
-                            child_names,
-                            parent_descriptor=frame.descriptor,
-                            name=name,
-                            identity=opened,
-                            owned=True,
-                        )
-                    )
-                else:
-                    os.unlink(name, dir_fd=frame.descriptor)
                 continue
             if frame.parent_descriptor is not None:
-                current = os.stat(
-                    frame.name,
-                    dir_fd=frame.parent_descriptor,
-                    follow_symlinks=False,
-                )
-                if (
-                    frame.identity is None
-                    or not _same_object(frame.identity, current)
-                ):
-                    raise InspectionError(
-                        "scratch directory changed during cleanup"
+                try:
+                    current = os.stat(
+                        frame.name,
+                        dir_fd=frame.parent_descriptor,
+                        follow_symlinks=False,
                     )
-                os.rmdir(frame.name, dir_fd=frame.parent_descriptor)
-                os.close(frame.descriptor)
-                frame.owned = False
+                    if (
+                        frame.identity is None
+                        or not _same_object(frame.identity, current)
+                    ):
+                        raise InspectionError(
+                            "scratch directory changed during cleanup"
+                        )
+                    os.rmdir(
+                        frame.name,
+                        dir_fd=frame.parent_descriptor,
+                    )
+                except BaseException as exc:
+                    pending = pending or exc
+                finally:
+                    os.close(frame.descriptor)
+                    frame.owned = False
             stack.pop()
     except BaseException:
         for frame in reversed(stack):
@@ -315,6 +382,8 @@ def _remove_tree(descriptor: int) -> None:
                     pass
                 frame.owned = False
         raise
+    if pending is not None:
+        raise pending
 
 
 def _thread_lock(path: str) -> _OwnedThreadLock:
