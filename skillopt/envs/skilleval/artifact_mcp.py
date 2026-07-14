@@ -1,0 +1,464 @@
+"""Networkless stdio MCP facade for trusted artifact inspection."""
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import os
+import stat
+from typing import Callable
+
+from mcp.server.mcpserver import Image, MCPServer, ResourceSecurity
+from mcp_types import CallToolResult, ImageContent, TextContent
+from PIL import Image as PillowImage
+from PIL import UnidentifiedImageError
+
+from .inspectors import (
+    extract_artifact,
+    inspect_artifact,
+    inventory_artifacts,
+    render_artifact,
+)
+from .inspectors.base import (
+    DEFAULT_EXTRACT_CHARS,
+    DEFAULT_RESPONSE_BYTES,
+    InspectionError,
+    MAX_EXTRACT_CHARS,
+    MAX_RENDER_PIXELS,
+    MAX_RESPONSE_BYTES,
+    ResponseBudget,
+    bounded_diagnostic,
+    resolve_scratch_path,
+    validate_json_result,
+    validate_roots,
+)
+
+DEFAULT_MAX_MEDIA_BYTES = 25 * 1024 * 1024
+MAX_MEDIA_BYTES = 100 * 1024 * 1024
+_MIN_SERVER_RESPONSE_BYTES = 512
+
+
+def _positive_maximum(value: object, name: str, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise InspectionError(f"{name} must be a positive integer")
+    if value > maximum:
+        raise InspectionError(f"{name} exceeds maximum {maximum}")
+    return value
+
+
+def _request_budget(
+    value: int | None,
+    *,
+    default: int,
+    maximum: int,
+    name: str,
+) -> int:
+    selected = default if value is None else value
+    return _positive_maximum(selected, name, maximum)
+
+
+def _envelope(operation: str, *, result=None, error: str | None = None) -> dict:
+    body = {
+        "trust": "untrusted_evidence",
+        "operation": operation,
+        "status": "error" if error is not None else "ok",
+    }
+    if error is None:
+        body["result"] = result
+    else:
+        body["error"] = error
+    return {"untrusted_evidence": body}
+
+
+def _tool_result(
+    payload: dict,
+    *,
+    response_limit: int,
+    images: list[ImageContent] | None = None,
+) -> CallToolResult:
+    budget = ResponseBudget(
+        max_bytes=response_limit,
+        max_extract_chars=MAX_EXTRACT_CHARS,
+    )
+    validate_json_result(payload, budget)
+    text = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    content = [TextContent(type="text", text=text)]
+    content.extend(images or [])
+    return CallToolResult(
+        content=content,
+        structuredContent=payload,
+    )
+
+
+def _error_result(
+    operation: str,
+    exc: Exception,
+    *,
+    response_limit: int,
+) -> CallToolResult:
+    diagnostic_limit = max(80, min(512, response_limit // 2))
+    error = (
+        f"{type(exc).__name__}: "
+        f"{bounded_diagnostic(exc, diagnostic_limit)}"
+    )
+    payload = _envelope(operation, error=error)
+    try:
+        return _tool_result(payload, response_limit=response_limit)
+    except Exception:
+        fallback = _envelope(
+            operation,
+            error="InspectionError: bounded artifact operation failure",
+        )
+        return _tool_result(
+            fallback,
+            response_limit=max(
+                response_limit,
+                _MIN_SERVER_RESPONSE_BYTES,
+            ),
+        )
+
+
+def _guarded_tool(
+    operation: str,
+    response_limit: int,
+    function: Callable[[], CallToolResult],
+) -> CallToolResult:
+    try:
+        return function()
+    except Exception as exc:
+        return _error_result(
+            operation,
+            exc,
+            response_limit=response_limit,
+        )
+
+
+def _read_png(
+    path: str,
+    scratch_dir: str,
+    *,
+    remaining_pixels: int,
+    remaining_bytes: int,
+) -> tuple[bytes, dict]:
+    validated = resolve_scratch_path(scratch_dir, path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(validated, flags)
+    except OSError as exc:
+        raise InspectionError(
+            f"rendered media could not be opened: {bounded_diagnostic(exc)}"
+        ) from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise InspectionError("rendered media must be a regular file")
+        if info.st_size <= 0 or info.st_size > remaining_bytes:
+            raise InspectionError("rendered media byte budget exceeded")
+        with os.fdopen(os.dup(descriptor), "rb") as source:
+            data = source.read(remaining_bytes + 1)
+    finally:
+        os.close(descriptor)
+    if len(data) != info.st_size or len(data) > remaining_bytes:
+        raise InspectionError("rendered media byte budget exceeded")
+    try:
+        with PillowImage.open(io.BytesIO(data)) as image:
+            if image.format != "PNG":
+                raise InspectionError("rendered media must be PNG")
+            width, height = image.size
+            image.verify()
+    except InspectionError:
+        raise
+    except (OSError, ValueError, UnidentifiedImageError) as exc:
+        raise InspectionError(
+            f"rendered media is not a valid PNG: {bounded_diagnostic(exc)}"
+        ) from exc
+    pixels = width * height
+    if width <= 0 or height <= 0 or pixels > remaining_pixels:
+        raise InspectionError("rendered media pixel budget exceeded")
+    return data, {
+        "mime": "image/png",
+        "width": width,
+        "height": height,
+        "bytes": len(data),
+        "pixels": pixels,
+    }
+
+
+def create_server(
+    evidence_dir: str,
+    scratch_dir: str,
+    *,
+    max_render_pixels: int = MAX_RENDER_PIXELS,
+    max_response_bytes: int = DEFAULT_RESPONSE_BYTES,
+    max_extract_chars: int = DEFAULT_EXTRACT_CHARS,
+    max_media_bytes: int = DEFAULT_MAX_MEDIA_BYTES,
+) -> MCPServer:
+    """Create an in-memory or stdio Artifact MCP server."""
+    evidence, scratch = validate_roots(evidence_dir, scratch_dir)
+    server_render_max = _positive_maximum(
+        max_render_pixels,
+        "server render pixel maximum",
+        MAX_RENDER_PIXELS,
+    )
+    server_response_max = _positive_maximum(
+        max_response_bytes,
+        "server response byte maximum",
+        MAX_RESPONSE_BYTES,
+    )
+    if server_response_max < _MIN_SERVER_RESPONSE_BYTES:
+        raise InspectionError(
+            f"server response byte maximum must be at least "
+            f"{_MIN_SERVER_RESPONSE_BYTES}"
+        )
+    server_extract_max = _positive_maximum(
+        max_extract_chars,
+        "server extraction character maximum",
+        MAX_EXTRACT_CHARS,
+    )
+    server_media_max = _positive_maximum(
+        max_media_bytes,
+        "server media byte maximum",
+        MAX_MEDIA_BYTES,
+    )
+
+    server = MCPServer(
+        "skillopt-artifact",
+        description="Trusted bounded access to immutable evaluation artifacts.",
+        instructions=None,
+        resource_security=ResourceSecurity(exempt_params={"path"}),
+    )
+
+    @server.tool(
+        name="artifact_inventory",
+        description="List immutable evidence artifacts with bounded metadata.",
+    )
+    def artifact_inventory(
+        max_response_bytes: int | None = None,
+    ) -> CallToolResult:
+        response_limit = server_response_max
+
+        def run() -> CallToolResult:
+            nonlocal response_limit
+            response_limit = _request_budget(
+                max_response_bytes,
+                default=server_response_max,
+                maximum=server_response_max,
+                name="response byte budget",
+            )
+            result = inventory_artifacts(
+                evidence,
+                scratch,
+                max_response_bytes=response_limit,
+            )
+            return _tool_result(
+                _envelope("artifact_inventory", result=result),
+                response_limit=response_limit,
+            )
+
+        return _guarded_tool("artifact_inventory", response_limit, run)
+
+    @server.tool(
+        name="artifact_inspect",
+        description="Inspect one logical evidence-relative artifact.",
+    )
+    def artifact_inspect(
+        path: str,
+        max_response_bytes: int | None = None,
+    ) -> CallToolResult:
+        response_limit = server_response_max
+
+        def run() -> CallToolResult:
+            nonlocal response_limit
+            response_limit = _request_budget(
+                max_response_bytes,
+                default=server_response_max,
+                maximum=server_response_max,
+                name="response byte budget",
+            )
+            result = inspect_artifact(
+                path,
+                evidence_dir=evidence,
+                scratch_dir=scratch,
+                max_response_bytes=response_limit,
+            )
+            return _tool_result(
+                _envelope("artifact_inspect", result=result),
+                response_limit=response_limit,
+            )
+
+        return _guarded_tool("artifact_inspect", response_limit, run)
+
+    @server.tool(
+        name="artifact_render",
+        description="Render selected artifact units as bounded PNG content.",
+    )
+    def artifact_render(
+        path: str,
+        selectors: list[str] | None = None,
+        max_pixels: int | None = None,
+        max_response_bytes: int | None = None,
+    ) -> CallToolResult:
+        response_limit = server_response_max
+
+        def run() -> CallToolResult:
+            nonlocal response_limit
+            response_limit = _request_budget(
+                max_response_bytes,
+                default=server_response_max,
+                maximum=server_response_max,
+                name="response byte budget",
+            )
+            pixel_limit = _request_budget(
+                max_pixels,
+                default=server_render_max,
+                maximum=server_render_max,
+                name="render pixel budget",
+            )
+            paths = render_artifact(
+                path,
+                evidence_dir=evidence,
+                scratch_dir=scratch,
+                selectors=selectors,
+                max_pixels=pixel_limit,
+                max_response_bytes=response_limit,
+            )
+            metadata = []
+            images = []
+            used_pixels = 0
+            used_bytes = 0
+            for index, rendered_path in enumerate(paths):
+                data, details = _read_png(
+                    rendered_path,
+                    scratch,
+                    remaining_pixels=pixel_limit - used_pixels,
+                    remaining_bytes=server_media_max - used_bytes,
+                )
+                used_pixels += details.pop("pixels")
+                used_bytes += details["bytes"]
+                metadata.append({"index": index, **details})
+                images.append(Image(data=data, format="png").to_image_content())
+            result = {"images": metadata}
+            return _tool_result(
+                _envelope("artifact_render", result=result),
+                response_limit=response_limit,
+                images=images,
+            )
+
+        return _guarded_tool("artifact_render", response_limit, run)
+
+    @server.tool(
+        name="artifact_extract",
+        description="Extract bounded content from selected artifact units.",
+    )
+    def artifact_extract(
+        path: str,
+        selectors: list[str] | None = None,
+        max_extract_chars: int | None = None,
+        max_response_bytes: int | None = None,
+    ) -> CallToolResult:
+        response_limit = server_response_max
+
+        def run() -> CallToolResult:
+            nonlocal response_limit
+            response_limit = _request_budget(
+                max_response_bytes,
+                default=server_response_max,
+                maximum=server_response_max,
+                name="response byte budget",
+            )
+            extract_limit = _request_budget(
+                max_extract_chars,
+                default=server_extract_max,
+                maximum=server_extract_max,
+                name="extraction character budget",
+            )
+            result = extract_artifact(
+                path,
+                evidence_dir=evidence,
+                scratch_dir=scratch,
+                selectors=selectors,
+                max_extract_chars=extract_limit,
+                max_response_bytes=response_limit,
+            )
+            return _tool_result(
+                _envelope("artifact_extract", result=result),
+                response_limit=response_limit,
+            )
+
+        return _guarded_tool("artifact_extract", response_limit, run)
+
+    return server
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise InspectionError(f"{name} must be an integer") from exc
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Run only the stdio transport inside the caller-provided sandbox."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--evidence",
+        default=os.environ.get("SKILLOPT_ARTIFACT_EVIDENCE", "/evidence"),
+    )
+    parser.add_argument(
+        "--scratch",
+        default=os.environ.get("SKILLOPT_ARTIFACT_SCRATCH", "/scratch"),
+    )
+    parser.add_argument(
+        "--max-render-pixels",
+        type=int,
+        default=_env_int(
+            "SKILLOPT_ARTIFACT_MAX_RENDER_PIXELS",
+            MAX_RENDER_PIXELS,
+        ),
+    )
+    parser.add_argument(
+        "--max-response-bytes",
+        type=int,
+        default=_env_int(
+            "SKILLOPT_ARTIFACT_MAX_RESPONSE_BYTES",
+            DEFAULT_RESPONSE_BYTES,
+        ),
+    )
+    parser.add_argument(
+        "--max-extract-chars",
+        type=int,
+        default=_env_int(
+            "SKILLOPT_ARTIFACT_MAX_EXTRACT_CHARS",
+            DEFAULT_EXTRACT_CHARS,
+        ),
+    )
+    parser.add_argument(
+        "--max-media-bytes",
+        type=int,
+        default=_env_int(
+            "SKILLOPT_ARTIFACT_MAX_MEDIA_BYTES",
+            DEFAULT_MAX_MEDIA_BYTES,
+        ),
+    )
+    args = parser.parse_args(argv)
+    server = create_server(
+        args.evidence,
+        args.scratch,
+        max_render_pixels=args.max_render_pixels,
+        max_response_bytes=args.max_response_bytes,
+        max_extract_chars=args.max_extract_chars,
+        max_media_bytes=args.max_media_bytes,
+    )
+    server.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()
