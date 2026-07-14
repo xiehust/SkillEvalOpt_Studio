@@ -298,12 +298,25 @@ def _three_items():
 
 
 class TestRunBatch:
+    @staticmethod
+    def _seed_workspace(**kwargs):
+        work_dir = kwargs["work_dir"]
+        os.makedirs(work_dir, exist_ok=True)
+        with open(os.path.join(work_dir, "task.md"), "w", encoding="utf-8") as handle:
+            handle.write(kwargs.get("task_text", ""))
+        for rel_path, content in (kwargs.get("extra_files") or {}).items():
+            path = os.path.join(work_dir, rel_path)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(content)
+        return "", ""
+
     def _patch_harness(self, monkeypatch, exec_fn):
         prepared = []
 
         def fake_prepare(**kwargs):
             prepared.append(kwargs)
-            return "", ""
+            return self._seed_workspace(**kwargs)
 
         monkeypatch.setattr(rollout_mod, "prepare_workspace", fake_prepare)
         monkeypatch.setattr(rollout_mod, "run_claude_code_exec", exec_fn)
@@ -376,7 +389,7 @@ class TestRunBatch:
             seen.append(kw)
             return "ok", "raw"
 
-        monkeypatch.setattr(rollout_mod, "prepare_workspace", lambda **kw: ("", ""))
+        monkeypatch.setattr(rollout_mod, "prepare_workspace", self._seed_workspace)
         monkeypatch.setattr(rollout_mod, "run_claude_code_exec", record_exec)
         run_batch([_valid_item("t1")], "# skill", str(tmp_path))
         assert seen[0]["allow_file_edits"] is True
@@ -404,7 +417,7 @@ class TestRunBatch:
 
     def test_codex_backend_dispatches_to_codex_exec(self, tmp_path, monkeypatch) -> None:
         claude_calls, codex_calls = [], []
-        monkeypatch.setattr(rollout_mod, "prepare_workspace", lambda **kw: ("", ""))
+        monkeypatch.setattr(rollout_mod, "prepare_workspace", self._seed_workspace)
         monkeypatch.setattr(
             rollout_mod, "run_claude_code_exec",
             lambda **kw: claude_calls.append(kw) or ("claude answer", "raw"),
@@ -442,7 +455,7 @@ class TestRunBatch:
         monkeypatch.setattr(
             rollout_mod,
             "prepare_workspace",
-            lambda **kwargs: prepared.append(kwargs) or ("", ""),
+            lambda **kwargs: prepared.append(kwargs) or self._seed_workspace(**kwargs),
         )
         monkeypatch.setattr(
             rollout_mod,
@@ -491,6 +504,71 @@ class TestRunBatch:
         assert "beta" not in prepared[0]["task_text"]
         assert exec_calls[0]["prompt"] == rollout_mod.PLUGIN_GUIDE_PROMPT
         assert result["target_skills"] == ["beta"]
+
+    def test_captures_created_and_modified_outputs(self, tmp_path, monkeypatch) -> None:
+        def produce(*, work_dir, **kwargs):
+            with open(os.path.join(work_dir, "input.txt"), "w", encoding="utf-8") as handle:
+                handle.write("changed")
+            with open(os.path.join(work_dir, "report.pdf"), "wb") as handle:
+                handle.write(b"%PDF-1.4\n")
+            os.makedirs(os.path.join(work_dir, ".claude"), exist_ok=True)
+            with open(
+                os.path.join(work_dir, ".claude", "runtime.json"),
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                handle.write("{}")
+            return "done", "raw"
+
+        self._patch_harness(monkeypatch, produce)
+        result = run_batch(
+            [_valid_item("t1", files={"input.txt": "seed", "unchanged.txt": "same"})],
+            "# skill",
+            str(tmp_path),
+        )[0]
+
+        assert result["response"] == "done"
+        assert [(row["path"], row["change"]) for row in result["artifacts"]] == [
+            ("input.txt", "modified"),
+            ("report.pdf", "created"),
+        ]
+        assert result["artifacts"][1]["kind"] == "pdf"
+
+    def test_captures_outputs_when_target_fails(self, tmp_path, monkeypatch) -> None:
+        def produce_then_fail(*, work_dir, **kwargs):
+            with open(os.path.join(work_dir, "partial.pdf"), "wb") as handle:
+                handle.write(b"%PDF-1.4\n")
+            raise RuntimeError("CLI crashed")
+
+        self._patch_harness(monkeypatch, produce_then_fail)
+        result = run_batch([_valid_item("t1")], "# skill", str(tmp_path))[0]
+
+        assert "RuntimeError: CLI crashed" in result["error"]
+        assert [(row["path"], row["change"]) for row in result["artifacts"]] == [
+            ("partial.pdf", "created")
+        ]
+
+    def test_forbidden_target_entry_is_artifact_failure_and_batch_isolated(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        def produce(*, work_dir, **kwargs):
+            if work_dir.endswith("t1"):
+                os.symlink("/tmp", os.path.join(work_dir, "forbidden"))
+            else:
+                with open(os.path.join(work_dir, "ok.pdf"), "wb") as handle:
+                    handle.write(b"%PDF-1.4\n")
+            return "done", "raw"
+
+        self._patch_harness(monkeypatch, produce)
+        results = run_batch(_three_items()[:2], "# skill", str(tmp_path), workers=2)
+
+        assert results[0]["response"] == "done"
+        assert "symlink directory" in results[0]["artifact_error"]
+        assert results[0]["artifact_failure"] is True
+        assert results[0]["artifacts"] == []
+        assert "error" not in results[0]
+        assert [row["path"] for row in results[1]["artifacts"]] == ["ok.pdf"]
+        assert "artifact_error" not in results[1]
 
 
 # ── CLI / report ──────────────────────────────────────────────────────────
