@@ -2898,7 +2898,9 @@ class TestSpreadsheetInspector:
         self._save_xlsx(path)
         extension = (
             b'<extLst><ext uri="{00000000-0000-0000-0000-000000000000}">'
-            b'<x:c xmlns:x="urn:extension"><x:xf/></x:c>'
+            b'<x14:row xmlns:x14="http://schemas.microsoft.com/office/'
+            b'spreadsheetml/2009/9/main"><x14:c/><x14:mergeCells/>'
+            b"<x14:si/></x14:row>"
             b"</ext></extLst>"
         )
         self._rewrite_xlsx_member(
@@ -2912,6 +2914,94 @@ class TestSpreadsheetInspector:
         )
 
         preflight_xlsx(str(path))
+
+    def test_xlsx_rejects_main_namespace_row_in_extlst_before_load(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "extlst-main-row.xlsx"
+        self._save_xlsx(path)
+        extension = (
+            b'<extLst><ext uri="{00000000-0000-0000-0000-000000000000}">'
+            b'<row r="1048576"><c r="XFD1048576" t="n">'
+            b"<v>1</v></c></row></ext></extLst>"
+        )
+        self._rewrite_xlsx_member(
+            path,
+            "xl/worksheets/sheet1.xml",
+            lambda payload: payload.replace(
+                b"</worksheet>",
+                extension + b"</worksheet>",
+                1,
+            ),
+        )
+
+        self._assert_inspect_rejected_before_openpyxl(
+            evidence,
+            scratch,
+            path.name,
+            monkeypatch,
+            "worksheet",
+        )
+
+    def test_xlsx_rejects_huge_main_namespace_merge_in_extlst_before_load(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "extlst-main-merge.xlsx"
+        self._save_xlsx(path)
+        extension = (
+            b'<extLst><ext uri="{00000000-0000-0000-0000-000000000000}">'
+            b'<mergeCells count="1">'
+            b'<mergeCell ref="A1:XFD1048576"/>'
+            b"</mergeCells></ext></extLst>"
+        )
+        self._rewrite_xlsx_member(
+            path,
+            "xl/worksheets/sheet1.xml",
+            lambda payload: payload.replace(
+                b"</worksheet>",
+                extension + b"</worksheet>",
+                1,
+            ),
+        )
+
+        self._assert_inspect_rejected_before_openpyxl(
+            evidence,
+            scratch,
+            path.name,
+            monkeypatch,
+            "worksheet",
+        )
+
+    def test_xlsx_rejects_main_namespace_shared_string_in_extlst_before_load(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "extlst-main-shared-string.xlsx"
+        self._save_xlsx(path)
+        self._add_shared_strings_part(path)
+        extension = (
+            b'<extLst><ext uri="{00000000-0000-0000-0000-000000000000}">'
+            b"<si><t>hidden</t></si></ext></extLst>"
+        )
+        self._rewrite_xlsx_member(
+            path,
+            "xl/sharedStrings.xml",
+            lambda payload: payload.replace(
+                b"</sst>",
+                extension + b"</sst>",
+                1,
+            ),
+        )
+
+        self._assert_inspect_rejected_before_openpyxl(
+            evidence,
+            scratch,
+            path.name,
+            monkeypatch,
+            "shared string",
+        )
 
     def test_xlsx_structure_limits_follow_content_type_not_part_path(
         self, tmp_path, monkeypatch

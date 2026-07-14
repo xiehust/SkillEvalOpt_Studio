@@ -111,6 +111,102 @@ def _rewrite_always_zip64_eocd(
     path.write_bytes(prefix + zip64_record + locator + classic + comment)
 
 
+def _rewrite_with_self_consistent_zip64_collision(
+    path,
+    *,
+    prefixed: bool,
+) -> None:
+    central_header = struct.Struct("<4s6H3L5H2L")
+    payload = bytearray(path.read_bytes())
+    eocd_offset = payload.rfind(b"PK\x05\x06")
+    assert eocd_offset >= 0
+    (
+        _signature,
+        disk_number,
+        central_disk,
+        entries_on_disk,
+        total_entries,
+        central_size,
+        central_offset,
+        comment_size,
+    ) = struct.unpack_from("<4s4H2LH", payload, eocd_offset)
+    assert disk_number == central_disk == 0
+    comment = payload[eocd_offset + 22:]
+    assert len(comment) == comment_size
+
+    archive_prefix = b"MZ" + b"\x00" * 62 if prefixed else b""
+    offset_delta = len(archive_prefix)
+    cursor = central_offset
+    for _ in range(total_entries):
+        fields = list(central_header.unpack_from(payload, cursor))
+        assert fields[0] == b"PK\x01\x02"
+        fields[-1] += offset_delta
+        central_header.pack_into(payload, cursor, *fields)
+        cursor += central_header.size + sum(fields[10:13])
+    assert cursor == eocd_offset
+
+    physical_central_start = central_offset + offset_delta
+    real_zip64_offset = eocd_offset + offset_delta
+    fake_physical_offset = real_zip64_offset + 56
+    fake_central_size = fake_physical_offset - physical_central_start
+    fake_central_offset = real_zip64_offset - fake_central_size
+    assert fake_central_offset >= 0
+
+    real_record = struct.pack(
+        "<4sQ2H2L4Q",
+        b"PK\x06\x06",
+        100,
+        45,
+        45,
+        0,
+        0,
+        entries_on_disk,
+        total_entries,
+        central_size,
+        central_offset + offset_delta,
+    )
+    fake_record = struct.pack(
+        "<4sQ2H2L4Q",
+        b"PK\x06\x06",
+        44,
+        45,
+        45,
+        0,
+        0,
+        entries_on_disk,
+        total_entries,
+        fake_central_size,
+        fake_central_offset,
+    )
+    locator = struct.pack(
+        "<4sLQL",
+        b"PK\x06\x07",
+        0,
+        real_zip64_offset,
+        1,
+    )
+    classic = struct.pack(
+        "<4s4H2LH",
+        b"PK\x05\x06",
+        0,
+        0,
+        0xFFFF,
+        0xFFFF,
+        0xFFFFFFFF,
+        0xFFFFFFFF,
+        comment_size,
+    )
+    path.write_bytes(
+        archive_prefix
+        + payload[:eocd_offset]
+        + real_record
+        + fake_record
+        + locator
+        + classic
+        + comment
+    )
+
+
 def _outputs_after(work, mutate) -> list[dict]:
     before = build_manifest(str(work))
     mutate()
@@ -394,6 +490,22 @@ class TestArtifactKind:
                 path,
                 extensible_data=fake_record,
             )
+
+        with zipfile.ZipFile(path) as archive:
+            assert archive.testzip() is None
+        assert detect_artifact_kind(str(path), "application/zip") == "xlsx"
+        assert build_manifest(str(tmp_path))["artifact.xlsx"].kind == "xlsx"
+
+    @pytest.mark.parametrize("prefixed", [False, True])
+    def test_zip64_self_consistent_fake_candidate_is_ignored(
+        self, tmp_path, prefixed
+    ) -> None:
+        path = tmp_path / "artifact.xlsx"
+        _write_ooxml(path, "xlsx")
+        _rewrite_with_self_consistent_zip64_collision(
+            path,
+            prefixed=prefixed,
+        )
 
         with zipfile.ZipFile(path) as archive:
             assert archive.testzip() is None

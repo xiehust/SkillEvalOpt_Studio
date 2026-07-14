@@ -87,6 +87,9 @@ _ZIP64_EOCD_LOCATOR_SIZE = 20
 _ZIP64_EOCD_FIXED_SIZE = 56
 _MAX_ZIP64_EOCD_BYTES = 1024 * 1024
 _ZIP_LOCAL_FILE_HEADER = struct.Struct("<4s5H3L2H")
+_ZIP_CENTRAL_DIRECTORY_HEADER = struct.Struct("<4s6H3L5H2L")
+_ZIP64_EXTRA_ID = 0x0001
+_ZIP32_MAX = 0xFFFFFFFF
 _MAX_OOXML_ENTRIES = 10_000
 _MAX_OOXML_CENTRAL_DIRECTORY_BYTES = 16 * 1024 * 1024
 _HAS_REQUIRED_DIR_FD = all(
@@ -237,6 +240,212 @@ def _safe_zip_member(name: str) -> bool:
     return not path.is_absolute() and ".." not in path.parts
 
 
+def _zip64_extra_payload(extra: bytes) -> tuple[bool, bytes | None]:
+    offset = 0
+    payload = None
+    while offset < len(extra):
+        if len(extra) - offset < 4:
+            return False, None
+        field_id, field_size = struct.unpack_from("<HH", extra, offset)
+        offset += 4
+        field_end = offset + field_size
+        if field_end > len(extra):
+            return False, None
+        if field_id == _ZIP64_EXTRA_ID:
+            if payload is not None:
+                return False, None
+            payload = extra[offset:field_end]
+        offset = field_end
+    return True, payload
+
+
+def _resolve_central_zip64_fields(
+    compressed_size: int,
+    uncompressed_size: int,
+    local_header_offset: int,
+    disk_number: int,
+    extra: bytes,
+) -> tuple[int, int, int, int] | None:
+    needs_zip64 = (
+        compressed_size == _ZIP32_MAX
+        or uncompressed_size == _ZIP32_MAX
+        or local_header_offset == _ZIP32_MAX
+        or disk_number == 0xFFFF
+    )
+    valid, payload = _zip64_extra_payload(extra)
+    if not valid or (needs_zip64 and payload is None):
+        return None
+    if payload is None:
+        return (
+            compressed_size,
+            uncompressed_size,
+            local_header_offset,
+            disk_number,
+        )
+
+    offset = 0
+
+    def read_u64(value: int) -> int | None:
+        nonlocal offset
+        if value != _ZIP32_MAX:
+            return value
+        if len(payload) - offset < 8:
+            return None
+        resolved = struct.unpack_from("<Q", payload, offset)[0]
+        offset += 8
+        return resolved
+
+    resolved_uncompressed = read_u64(uncompressed_size)
+    resolved_compressed = read_u64(compressed_size)
+    resolved_local_offset = read_u64(local_header_offset)
+    if (
+        resolved_uncompressed is None
+        or resolved_compressed is None
+        or resolved_local_offset is None
+    ):
+        return None
+    if disk_number == 0xFFFF:
+        if len(payload) - offset < 4:
+            return None
+        disk_number = struct.unpack_from("<L", payload, offset)[0]
+    return (
+        resolved_compressed,
+        resolved_uncompressed,
+        resolved_local_offset,
+        disk_number,
+    )
+
+
+def _candidate_has_canonical_zip_layout(
+    descriptor: int,
+    physical_eocd_offset: int,
+    archive_prefix: int,
+    central_offset: int,
+    central_size: int,
+    total_entries: int,
+) -> bool:
+    central_start = archive_prefix + central_offset
+    if (
+        archive_prefix < 0
+        or central_start < archive_prefix
+        or central_start + central_size != physical_eocd_offset
+        or total_entries > _MAX_OOXML_ENTRIES
+        or central_size > _MAX_OOXML_CENTRAL_DIRECTORY_BYTES
+    ):
+        return False
+
+    cursor = central_start
+    local_regions: list[tuple[int, int]] = []
+    local_offsets: set[int] = set()
+    for _ in range(total_entries):
+        if cursor + _ZIP_CENTRAL_DIRECTORY_HEADER.size > physical_eocd_offset:
+            return False
+        fixed = _read_descriptor(
+            descriptor,
+            _ZIP_CENTRAL_DIRECTORY_HEADER.size,
+            cursor,
+        )
+        if len(fixed) != _ZIP_CENTRAL_DIRECTORY_HEADER.size:
+            return False
+        fields = _ZIP_CENTRAL_DIRECTORY_HEADER.unpack(fixed)
+        if fields[0] != b"PK\x01\x02":
+            return False
+        (
+            filename_size,
+            extra_size,
+            comment_size,
+            central_disk,
+        ) = fields[10:14]
+        variable_size = filename_size + extra_size + comment_size
+        entry_end = (
+            cursor
+            + _ZIP_CENTRAL_DIRECTORY_HEADER.size
+            + variable_size
+        )
+        if entry_end > physical_eocd_offset:
+            return False
+        variable = _read_descriptor(
+            descriptor,
+            variable_size,
+            cursor + _ZIP_CENTRAL_DIRECTORY_HEADER.size,
+        )
+        if len(variable) != variable_size:
+            return False
+        filename = variable[:filename_size]
+        extra = variable[filename_size:filename_size + extra_size]
+        resolved = _resolve_central_zip64_fields(
+            fields[8],
+            fields[9],
+            fields[16],
+            central_disk,
+            extra,
+        )
+        if resolved is None:
+            return False
+        compressed_size, _uncompressed_size, local_offset, disk_number = resolved
+        physical_local_offset = archive_prefix + local_offset
+        if (
+            disk_number != 0
+            or physical_local_offset in local_offsets
+            or physical_local_offset < archive_prefix
+            or physical_local_offset + _ZIP_LOCAL_FILE_HEADER.size
+            > central_start
+        ):
+            return False
+        local_offsets.add(physical_local_offset)
+        local_fixed = _read_descriptor(
+            descriptor,
+            _ZIP_LOCAL_FILE_HEADER.size,
+            physical_local_offset,
+        )
+        if len(local_fixed) != _ZIP_LOCAL_FILE_HEADER.size:
+            return False
+        local_fields = _ZIP_LOCAL_FILE_HEADER.unpack(local_fixed)
+        if (
+            local_fields[0] != b"PK\x03\x04"
+            or local_fields[2] != fields[3]
+            or local_fields[3] != fields[4]
+        ):
+            return False
+        local_filename_size, local_extra_size = local_fields[-2:]
+        local_variable_size = local_filename_size + local_extra_size
+        data_start = (
+            physical_local_offset
+            + _ZIP_LOCAL_FILE_HEADER.size
+            + local_variable_size
+        )
+        if data_start > central_start:
+            return False
+        local_variable = _read_descriptor(
+            descriptor,
+            local_variable_size,
+            physical_local_offset + _ZIP_LOCAL_FILE_HEADER.size,
+        )
+        if (
+            len(local_variable) != local_variable_size
+            or local_filename_size != filename_size
+            or local_variable[:local_filename_size] != filename
+        ):
+            return False
+        data_end = data_start + compressed_size
+        if data_end > central_start:
+            return False
+        local_regions.append((physical_local_offset, data_end))
+        cursor = entry_end
+
+    if cursor != physical_eocd_offset:
+        return False
+    ordered_regions = sorted(local_regions)
+    return all(
+        data_end <= (
+            ordered_regions[index + 1][0]
+            if index + 1 < len(ordered_regions)
+            else central_start
+        )
+        for index, (_header_start, data_end) in enumerate(ordered_regions)
+    )
+
+
 def _find_zip64_eocd_record(
     descriptor: int,
     locator_offset: int,
@@ -250,21 +459,6 @@ def _find_zip64_eocd_record(
         window_start,
     )
     if len(window) != locator_offset - window_start:
-        return None
-
-    try:
-        with os.fdopen(os.dup(descriptor), "rb") as source:
-            with zipfile.ZipFile(source) as archive:
-                parsed_central_start = archive.start_dir
-                parsed_entry_count = len(archive.infolist())
-    except (
-        OSError,
-        RuntimeError,
-        NotImplementedError,
-        ValueError,
-        zipfile.BadZipFile,
-        zipfile.LargeZipFile,
-    ):
         return None
 
     candidates: list[tuple[int, bytes, int]] = []
@@ -338,11 +532,17 @@ def _find_zip64_eocd_record(
             or archive_prefix < 0
             or central_start < archive_prefix
             or central_start + central_size != physical_offset
-            or parsed_central_start != central_start
-            or parsed_entry_count != total_entries
             or any(
                 classic not in {sentinel, resolved}
                 for classic, sentinel, resolved in classic_pairs
+            )
+            or not _candidate_has_canonical_zip_layout(
+                descriptor,
+                physical_offset,
+                archive_prefix,
+                central_offset,
+                central_size,
+                total_entries,
             )
         ):
             continue

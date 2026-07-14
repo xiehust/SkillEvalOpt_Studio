@@ -1108,16 +1108,9 @@ def _xml_local_name(tag: object) -> str:
 class _XmlStructureValidator:
     _WORKSHEET_ROOT_TAG = f"{{{_SPREADSHEET_NAMESPACE}}}worksheet"
     _STYLE_ROOT_TAG = f"{{{_SPREADSHEET_NAMESPACE}}}styleSheet"
+    _SHARED_STRING_ROOT_TAG = f"{{{_SPREADSHEET_NAMESPACE}}}sst"
     _DRAWING_ROOT_TAG = f"{{{_SPREADSHEET_DRAWING_NAMESPACE}}}wsDr"
     _CHART_ROOT_TAG = f"{{{_CHART_NAMESPACE}}}chartSpace"
-    _EXTENSION_LIST_TAGS = {
-        f"{{{namespace}}}extLst"
-        for namespace in {
-            _SPREADSHEET_NAMESPACE,
-            _SPREADSHEET_DRAWING_NAMESPACE,
-            _CHART_NAMESPACE,
-        }
-    }
     _STYLE_TAGS = {
         f"{{{_SPREADSHEET_NAMESPACE}}}{name}"
         for name in {
@@ -1247,7 +1240,6 @@ class _XmlStructureValidator:
         self._bytes = 0
         self._depth = 0
         self._tag_stack: list[str] = []
-        self._extension_depth = 0
         self._declaration_tail = b""
         self._worksheet = "worksheet" in roles
         self._shared_strings = "shared_strings" in roles
@@ -1297,6 +1289,9 @@ class _XmlStructureValidator:
         if self._worksheet:
             expected = self._WORKSHEET_ROOT_TAG
             label = "worksheet"
+        elif self._shared_strings:
+            expected = self._SHARED_STRING_ROOT_TAG
+            label = "shared strings"
         elif self._styles:
             expected = self._STYLE_ROOT_TAG
             label = "styles"
@@ -1308,6 +1303,22 @@ class _XmlStructureValidator:
             label = "chart"
         if expected is not None and tag != expected:
             raise InspectionError(f"OOXML {label} root is invalid")
+
+    def _validate_shared_string_element(
+        self,
+        tag: str,
+        local_name: str,
+        parent: str | None,
+    ) -> None:
+        if local_name != "si":
+            return
+        if (
+            tag != self._SHARED_STRING_ITEM_TAG
+            or parent != self._SHARED_STRING_ROOT_TAG
+        ):
+            raise InspectionError(
+                "OOXML shared string item has invalid namespace or nesting"
+            )
 
     def _validate_worksheet_element(
         self,
@@ -1452,6 +1463,8 @@ class _XmlStructureValidator:
         self._validate_root(tag, parent)
         if self._worksheet:
             self._validate_worksheet_element(tag, local_name, parent)
+        if self._shared_strings:
+            self._validate_shared_string_element(tag, local_name, parent)
         if self._styles:
             self._validate_style_element(tag, local_name, parent)
         if self._drawing:
@@ -1474,19 +1487,13 @@ class _XmlStructureValidator:
                     _MAX_OOXML_XML_NODES,
                     "XML node",
                 )
-                inside_extension = self._extension_depth > 0
-                if not inside_extension:
-                    self._validate_parser_sensitive_element(
-                        element.tag,
-                        local_name,
-                        parent,
-                    )
-                if inside_extension:
-                    self._extension_depth += 1
-                elif element.tag in self._EXTENSION_LIST_TAGS:
-                    self._extension_depth = 1
+                self._validate_parser_sensitive_element(
+                    element.tag,
+                    local_name,
+                    parent,
+                )
                 self._tag_stack.append(element.tag)
-                if self._worksheet and not inside_extension:
+                if self._worksheet:
                     if element.tag == self._ROW_TAG:
                         dimension_attributes = {
                             key
@@ -1514,7 +1521,6 @@ class _XmlStructureValidator:
                         self._count_merge_area(element)
                 if (
                     self._shared_strings
-                    and not inside_extension
                     and element.tag == self._SHARED_STRING_ITEM_TAG
                 ):
                     self._increment(
@@ -1524,7 +1530,6 @@ class _XmlStructureValidator:
                     )
                 if (
                     self._styles
-                    and not inside_extension
                     and element.tag in self._STYLE_TAGS
                 ):
                     self._increment(
@@ -1534,7 +1539,6 @@ class _XmlStructureValidator:
                     )
                 if (
                     self._relationships
-                    and not inside_extension
                     and element.tag == self._RELATIONSHIP_TAG
                 ):
                     self._increment(
@@ -1544,7 +1548,6 @@ class _XmlStructureValidator:
                     )
                 if (
                     self._drawing
-                    and not inside_extension
                     and element.tag in self._DRAWING_TAGS
                 ):
                     self._increment(
@@ -1552,7 +1555,7 @@ class _XmlStructureValidator:
                         _MAX_DRAWING_OBJECTS,
                         "drawing object",
                     )
-                if self._chart and not inside_extension and (
+                if self._chart and (
                     element.tag in {self._CHART_TAG, self._CHART_SERIES_TAG}
                     or (
                         element.tag.startswith(f"{{{_CHART_NAMESPACE}}}")
@@ -1565,10 +1568,8 @@ class _XmlStructureValidator:
                         "chart object",
                     )
             else:
-                inside_extension = self._extension_depth > 0
                 if (
                     self._shared_strings
-                    and not inside_extension
                     and element.tag == self._TEXT_TAG
                 ):
                     chars = len(element.text or "")
@@ -1586,8 +1587,6 @@ class _XmlStructureValidator:
                 if not self._tag_stack or self._tag_stack[-1] != element.tag:
                     raise InspectionError("OOXML XML part has invalid nesting")
                 self._tag_stack.pop()
-                if self._extension_depth > 0:
-                    self._extension_depth -= 1
                 self._depth -= 1
                 element.clear()
 
@@ -1622,7 +1621,7 @@ class _XmlStructureValidator:
                 f"OOXML XML part is malformed: "
                 f"{bounded_diagnostic(self._name)!r}"
             ) from exc
-        if self._depth != 0 or self._tag_stack or self._extension_depth:
+        if self._depth != 0 or self._tag_stack:
             raise InspectionError("OOXML XML part has invalid nesting")
 
 
