@@ -21,6 +21,7 @@ from pathlib import Path
 import yaml
 
 from skillopt.config import load_config as load_structured_config
+from skillopt.envs.skilleval.plugin import collect_plugin_state
 from skillopt.model.common import default_model_for_backend
 
 from skillopt_studio import skill_sources, tasksets
@@ -32,6 +33,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # Module-level so tests can monkeypatch them to stub CLIs.
 EVAL_SCRIPT = PROJECT_ROOT / "scripts" / "evaluate_skill.py"
 TRAIN_SCRIPT = PROJECT_ROOT / "scripts" / "train.py"
+PLUGIN_TRAIN_SCRIPT = PROJECT_ROOT / "scripts" / "train_plugin.py"
 GEN_SCRIPT = PROJECT_ROOT / "scripts" / "generate_tasks.py"
 TRAIN_BASE_CONFIG = PROJECT_ROOT / "configs" / "skilleval" / "default.yaml"
 BUNDLE_MODULE = "skillopt.envs.skilleval.bundle"
@@ -101,6 +103,7 @@ PARAM_RANGES = {
     "limit": (0, 10000),
     "num_epochs": (1, 10),
     "learning_rate": (1, 16),
+    "max_skills_per_candidate": (1, 8),
     "count": (1, 30),
 }
 
@@ -115,6 +118,24 @@ def _validated_int(params: dict, key: str) -> int | None:
     except (TypeError, ValueError):
         raise ValueError(f"{key} must be an integer, got {value!r}") from None
     low, high = PARAM_RANGES[key]
+    if not low <= number <= high:
+        raise ValueError(f"{key} must be between {low} and {high}, got {number}")
+    return number
+
+
+def _validated_float(
+    params: dict,
+    key: str,
+    low: float,
+    high: float,
+) -> float | None:
+    value = params.get(key)
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be a number, got {value!r}") from None
     if not low <= number <= high:
         raise ValueError(f"{key} must be between {low} and {high}, got {number}")
     return number
@@ -236,10 +257,18 @@ def _materialize_split_dir(config: StudioConfig, taskset_id: str, job_dir: Path)
 def build_train_command(config: StudioConfig, params: dict, job_dir: Path) -> list[str]:
     """Write <job_dir>/config.yaml and return the argv (or bash pipeline when
     a bundle step must run first) for scripts/train.py."""
-    _require_script(TRAIN_SCRIPT)
+    plugin_mode = params.get("skill_ids") is not None
+    _require_script(PLUGIN_TRAIN_SCRIPT if plugin_mode else TRAIN_SCRIPT)
     if not TRAIN_BASE_CONFIG.is_file():
         raise ValueError(f"base train config not found: {TRAIN_BASE_CONFIG}")
-    skill = _resolve_skill(config, str(params.get("skill_id", "")))
+    skills = _resolve_skill_selection(config, params)
+    skill = skills[0]
+    runtime_names_by_id: dict[str, str] = {}
+    if plugin_mode:
+        plugin_state = collect_plugin_state([item.path for item in skills])
+        runtime_names_by_id = dict(
+            zip((item.id for item in skills), plugin_state.names, strict=True)
+        )
     taskset_id = str(params.get("taskset_id", ""))
     taskset = tasksets.get_taskset(config, taskset_id)
     if taskset is None:
@@ -271,8 +300,47 @@ def build_train_command(config: StudioConfig, params: dict, job_dir: Path) -> li
         cfg["evaluation"]["gate_metric"] = gate_metric
 
     trainable_files = [str(f) for f in (params.get("trainable_files") or []) if str(f).strip()]
+    if plugin_mode and trainable_files:
+        raise ValueError("Plugin training does not support trainable_files")
     bundle_path = job_dir / "seed_bundle.md"
-    if trainable_files:
+    if plugin_mode:
+        cfg["env"].pop("skill_init", None)
+        cfg["env"].pop("skill_dir", None)
+        cfg["env"].pop("trainable_files", None)
+        raw_trainable_ids = params.get("trainable_skill_ids")
+        if raw_trainable_ids is None:
+            trainable_ids = [item.id for item in skills]
+        elif not isinstance(raw_trainable_ids, list):
+            raise ValueError("trainable_skill_ids must be a list")
+        elif any(not isinstance(skill_id, str) or not skill_id for skill_id in raw_trainable_ids):
+            raise ValueError("trainable_skill_ids must contain non-empty strings")
+        else:
+            trainable_ids = list(dict.fromkeys(raw_trainable_ids))
+        selected_by_id = {item.id: item for item in skills}
+        unknown_trainable = sorted(set(trainable_ids) - set(selected_by_id))
+        if unknown_trainable:
+            raise ValueError(
+                f"trainable_skill_ids must be selected Plugin skills: {unknown_trainable}"
+            )
+        if not trainable_ids:
+            raise ValueError("select at least one trainable Plugin Skill")
+        trainable_skills = [selected_by_id[skill_id] for skill_id in trainable_ids]
+        max_skills = _validated_int(params, "max_skills_per_candidate")
+        if max_skills is not None:
+            if max_skills > len(trainable_skills):
+                raise ValueError(
+                    "max_skills_per_candidate cannot exceed the trainable Skill count"
+                )
+            cfg["optimizer"]["max_skills_per_candidate"] = max_skills
+        max_regression = _validated_float(
+            params,
+            "max_skill_regression",
+            0.0,
+            1.0,
+        )
+        if max_regression is not None:
+            cfg["evaluation"]["max_skill_regression"] = max_regression
+    elif trainable_files:
         cfg["env"]["skill_init"] = str(bundle_path)
         cfg["env"]["trainable_files"] = trainable_files
     else:
@@ -308,8 +376,13 @@ def build_train_command(config: StudioConfig, params: dict, job_dir: Path) -> li
         yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), encoding="utf-8"
     )
 
-    train_argv = [
-        PYTHON, str(TRAIN_SCRIPT),
+    train_argv = [PYTHON, str(PLUGIN_TRAIN_SCRIPT if plugin_mode else TRAIN_SCRIPT)]
+    if plugin_mode:
+        for selected in skills:
+            train_argv += ["--skill", selected.path]
+        for trainable in trainable_skills:
+            train_argv += ["--train-skill", runtime_names_by_id[trainable.id]]
+    train_argv += [
         "--config", str(config_path),
         "--out_root", str(job_dir / "out"),
     ]

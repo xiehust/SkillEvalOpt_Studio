@@ -150,6 +150,73 @@ with open(os.path.join(out, "config_echo.json"), "w", encoding="utf-8") as f:
 print("  [STEP 2 done] epoch=1 action=reject current=0.5 best=0.5", flush=True)
 """
 
+FAKE_PLUGIN_TRAIN_SCRIPT = """\
+import argparse, json, os, shutil, yaml
+p = argparse.ArgumentParser()
+p.add_argument("--config")
+p.add_argument("--out_root")
+p.add_argument("--skill", action="append", default=[])
+p.add_argument("--train-skill", action="append", default=[])
+a = p.parse_args()
+with open(a.config, encoding="utf-8") as f:
+    cfg = yaml.safe_load(f)
+out = a.out_root
+os.makedirs(out, exist_ok=True)
+def skill_name(path):
+    with open(os.path.join(path, "SKILL.md"), encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("name:"):
+                return line.split(":", 1)[1].strip().strip("'\\\"")
+    return os.path.basename(path)
+names = [skill_name(path) for path in a.skill]
+for root_name in ("plugin_versions/plugin_v0000", "best_plugin"):
+    root = os.path.join(out, root_name)
+    os.makedirs(root, exist_ok=True)
+    for path, name in zip(a.skill, names):
+        destination = os.path.join(root, name)
+        shutil.copytree(path, destination, dirs_exist_ok=True)
+        if root_name == "best_plugin" and name in a.train_skill:
+            with open(os.path.join(destination, "SKILL.md"), "a", encoding="utf-8") as f:
+                f.write("\\n## Learned Plugin rule\\n")
+    with open(os.path.join(root, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump({"schema_version": 1, "skill_names": names,
+                   "trainable_skill_names": a.train_skill}, f)
+history = [{
+    "step": 1, "epoch": 1, "action": "accept_new_best",
+    "selected_skills": a.train_skill[:2],
+    "attribution_counts": {"execution": 2},
+    "current_score": 0.75, "best_score": 0.75, "best_step": 1,
+    "current_skill_scores": {name: 0.75 for name in names},
+    "regressions": {name: 0.0 for name in names}, "wall_time_s": 1.0,
+}]
+with open(os.path.join(out, "history.json"), "w", encoding="utf-8") as f:
+    json.dump(history, f)
+summary = {
+    "mode": "plugin", "skill_names": names,
+    "trainable_skill_names": a.train_skill,
+    "baseline_aggregates": {
+        "overall": {"count": 2, "hard": 0.5, "soft": 0.5},
+        "by_skill": {name: {"count": 1, "hard": 0.5, "soft": 0.5} for name in names},
+    },
+    "best_aggregates": {
+        "overall": {"count": 2, "hard": 0.75, "soft": 0.8},
+        "by_skill": {name: {"count": 1, "hard": 0.75, "soft": 0.8} for name in names},
+    },
+    "test_aggregates": None,
+    "best_selection_score": 0.75,
+    "best_skill_scores": {name: 0.75 for name in names},
+    "best_step": 1, "total_steps": 1, "total_accepts": 1,
+    "total_rejects": 0, "total_skips": 0,
+    "token_summary": {"_total": {"total_tokens": 321, "prompt_tokens": 250,
+                                 "completion_tokens": 71, "calls": 3}},
+}
+with open(os.path.join(out, "summary.json"), "w", encoding="utf-8") as f:
+    json.dump(summary, f)
+with open(os.path.join(out, "config_echo.json"), "w", encoding="utf-8") as f:
+    json.dump(cfg, f)
+print("  [PLUGIN STEP 1/1] action=accept_new_best score=0.7500", flush=True)
+"""
+
 
 FAKE_GEN_SCRIPT = """\
 import argparse, json, os
@@ -192,16 +259,24 @@ def stub_scripts(tmp_path: Path, monkeypatch) -> dict[str, Path]:
     eval_path.write_text(FAKE_EVAL_SCRIPT, encoding="utf-8")
     train_path = tmp_path / "stub_train.py"
     train_path.write_text(FAKE_TRAIN_SCRIPT, encoding="utf-8")
+    plugin_train_path = tmp_path / "stub_train_plugin.py"
+    plugin_train_path.write_text(FAKE_PLUGIN_TRAIN_SCRIPT, encoding="utf-8")
     gen_path = tmp_path / "stub_generate_tasks.py"
     gen_path.write_text(FAKE_GEN_SCRIPT, encoding="utf-8")
     monkeypatch.setattr(runners, "EVAL_SCRIPT", eval_path)
     monkeypatch.setattr(runners, "TRAIN_SCRIPT", train_path)
+    monkeypatch.setattr(runners, "PLUGIN_TRAIN_SCRIPT", plugin_train_path)
     monkeypatch.setattr(runners, "GEN_SCRIPT", gen_path)
     # hermetic: pretend both exec CLIs are installed regardless of the host
     monkeypatch.setattr(
         runners, "cli_path", lambda backend: f"/stub/bin/{runners.EXEC_BACKENDS[backend]}"
     )
-    return {"eval": eval_path, "train": train_path, "taskgen": gen_path}
+    return {
+        "eval": eval_path,
+        "train": train_path,
+        "plugin_train": plugin_train_path,
+        "taskgen": gen_path,
+    }
 
 
 @pytest.fixture
@@ -497,6 +572,71 @@ class TestBuildTrainConfig:
         assert cfg["env"]["trainable_files"] == ["references/rules.md"]
         assert cfg["env"]["skill_dir"] == str(skill_dir)
 
+    def test_plugin_training_command_and_config(
+        self,
+        studio_config,
+        stub_scripts,
+        plugin_skills,
+        split_taskset,
+    ):
+        job_dir = job_dir_of(studio_config, "train-plugin")
+        (plugin_skills[0] / ".studio_sample.json").write_text(
+            json.dumps({"name": "Display-only init name"}),
+            encoding="utf-8",
+        )
+        skill_ids = [
+            "claude-plugins--knowledge-init",
+            "claude-plugins--knowledge-status",
+        ]
+        argv = build_train_command(
+            studio_config,
+            {
+                "target_mode": "plugin",
+                "skill_ids": skill_ids,
+                "trainable_skill_ids": [skill_ids[0]],
+                "plugin": "knowledge",
+                "taskset_id": "split-set",
+                "max_skills_per_candidate": 1,
+                "max_skill_regression": 0.05,
+            },
+            job_dir,
+        )
+        assert argv[:2] == [runners.PYTHON, str(stub_scripts["plugin_train"])]
+        assert [argv[index + 1] for index, value in enumerate(argv) if value == "--skill"] == [
+            str(path) for path in plugin_skills
+        ]
+        assert [
+            argv[index + 1]
+            for index, value in enumerate(argv)
+            if value == "--train-skill"
+        ] == ["knowledge-init"]
+        cfg = yaml.safe_load((job_dir / "config.yaml").read_text(encoding="utf-8"))
+        assert "skill_init" not in cfg["env"]
+        assert cfg["optimizer"]["max_skills_per_candidate"] == 1
+        assert cfg["evaluation"]["max_skill_regression"] == 0.05
+
+    def test_plugin_training_rejects_trainable_skill_outside_selection(
+        self,
+        studio_config,
+        stub_scripts,
+        plugin_skills,
+        split_taskset,
+    ):
+        with pytest.raises(ValueError, match="trainable_skill_ids"):
+            build_train_command(
+                studio_config,
+                {
+                    "skill_ids": [
+                        "claude-plugins--knowledge-init",
+                        "claude-plugins--knowledge-status",
+                    ],
+                    "trainable_skill_ids": ["claude-plugins--ghost"],
+                    "plugin": "knowledge",
+                    "taskset_id": "split-set",
+                },
+                job_dir_of(studio_config, "train-plugin-invalid"),
+            )
+
 
 class TestBuildTaskgenCommand:
     def test_argv_full_params(self, studio_config, stub_scripts, claude_skill):
@@ -719,11 +859,56 @@ class TestStudioApiE2E:
         assert body["summary"]["test_scores"] == {"baseline": 0.2, "best": 0.6, "final": 0.55}
         assert body["summary"]["token_totals"]["total_tokens"] == 1234
         assert "+## Learned rule" in body["skill_diff"]
+        assert body["plugin_diffs"] == {}
 
         # the stub echoes the config it received — proves the generated YAML reached the CLI
         echo = client.get(f"/api/jobs/{job_id}/artifacts", params={"path": "config_echo.json"}).json()
         assert echo["kind"] == "text"
         assert json.loads(echo["content"])["env"]["name"] == "skilleval"
+
+    def test_plugin_train_job_end_to_end(
+        self,
+        studio_config,
+        client,
+        plugin_skills,
+        split_taskset,
+    ):
+        skill_ids = [
+            "claude-plugins--knowledge-init",
+            "claude-plugins--knowledge-status",
+        ]
+        response = client.post(
+            "/api/jobs",
+            json={
+                "type": "train",
+                "params": {
+                    "target_mode": "plugin",
+                    "plugin": "knowledge",
+                    "skill_ids": skill_ids,
+                    "trainable_skill_ids": [skill_ids[0]],
+                    "taskset_id": "split-set",
+                    "num_epochs": 1,
+                },
+            },
+        )
+        assert response.status_code == 200, response.text
+        job_id = response.json()["id"]
+        self._wait_status(client, job_id, "succeeded")
+
+        body = client.get(f"/api/jobs/{job_id}/results").json()
+        assert body["summary"]["mode"] == "plugin"
+        assert body["summary"]["plugin"]["skill_names"] == [
+            "knowledge-init",
+            "knowledge-status",
+        ]
+        assert body["summary"]["plugin"]["trainable_skill_names"] == [
+            "knowledge-init"
+        ]
+        assert body["summary"]["steps"][0]["selected_skills"] == [
+            "knowledge-init"
+        ]
+        assert "+## Learned Plugin rule" in body["plugin_diffs"]["knowledge-init"]
+        assert "knowledge-status" not in body["plugin_diffs"]
 
     def test_taskgen_job_end_to_end(self, studio_config, client, claude_skill):
         response = client.post(
@@ -919,6 +1104,38 @@ class TestArtifactsFunctions:
         assert summary["finished"] is False
         assert summary["best_step"] == 1
         assert len(summary["steps"]) == 1
+
+    def test_plugin_train_summary_mid_run_uses_job_mode(self, studio_config):
+        job = self._fake_job(studio_config, name="job-plugin-mid").model_copy(
+            update={
+                "params": {
+                    "target_mode": "plugin",
+                    "skill_ids": ["skill-a", "skill-b"],
+                }
+            }
+        )
+        out = Path(job.out_root)
+        history = [
+            {
+                "step": 1,
+                "epoch": 1,
+                "action": "reject",
+                "candidate_aggregates": {
+                    "overall": {"count": 2, "hard": 0.5, "soft": 0.6}
+                },
+                "current_score": 0.4,
+                "best_score": 0.4,
+                "best_step": 0,
+            }
+        ]
+        (out / "history.json").write_text(json.dumps(history), encoding="utf-8")
+
+        summary = artifacts.train_summary(studio_config, job)
+
+        assert summary["mode"] == "plugin"
+        assert summary["finished"] is False
+        assert summary["steps"][0]["selection_hard"] == 0.5
+        assert summary["steps"][0]["selection_soft"] == 0.6
 
     def test_read_artifact_binary_returns_meta_only(self, studio_config):
         job = self._fake_job(studio_config, name="job-bin")

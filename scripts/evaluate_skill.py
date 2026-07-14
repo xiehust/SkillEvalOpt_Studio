@@ -22,7 +22,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 
 import yaml
@@ -34,7 +33,14 @@ if _PROJECT_ROOT not in sys.path:
 
 from skillopt.envs.skilleval.dataloader import load_tasks
 from skillopt.envs.skilleval.evaluator import artifacts_listing, judge, merge_scores  # noqa: F401 — merge_scores re-exported for tests/importers
-from skillopt.envs.skilleval.rollout import RuntimeSkill, collect_support_files, run_batch
+from skillopt.envs.skilleval.plugin import (
+    _collect_skill as _collect_skill_source,
+    aggregate_results,
+    collect_runtime_skills,
+    normalize_plugin_tasks,
+    skill_name as _skill_name,
+)
+from skillopt.envs.skilleval.rollout import run_batch
 from skillopt.model import (
     configure_claude_code_exec,
     set_optimizer_backend,
@@ -72,128 +78,25 @@ def parse_args() -> argparse.Namespace:
 
 
 def _collect_skill(path: str) -> tuple[str, list[tuple[str, str]]]:
-    """Resolve --skill into (SKILL.md content, supporting files).
-
-    A file path is single-file mode (no supporting files). A directory must
-    contain SKILL.md; every other regular file in it is collected by
-    ``collect_support_files`` (hidden entries, tooling caches, and symlinks
-    are skipped — a workspace must never reach back into the source skill).
-    """
-    if os.path.isdir(path):
-        skill_md_path = os.path.join(path, "SKILL.md")
-        if not os.path.isfile(skill_md_path):
-            sys.exit(f"error: skill directory has no SKILL.md: {path}")
-        return _read_skill_file(skill_md_path), collect_support_files(path)
-    return _read_skill_file(path), []
-
-
-def _skill_name(content: str, path: str) -> str:
-    match = re.match(r"\A---\s*\n(.*?)\n---(?:\s*\n|\Z)", content, re.DOTALL)
-    if match:
-        frontmatter = yaml.safe_load(match.group(1)) or {}
-        name = frontmatter.get("name") if isinstance(frontmatter, dict) else None
-        if isinstance(name, str) and name.strip():
-            return name.strip()
-    if os.path.isdir(path):
-        return os.path.basename(os.path.normpath(path))
-    return os.path.splitext(os.path.basename(path))[0]
-
-
-def collect_runtime_skills(paths: list[str]) -> list[RuntimeSkill]:
-    skills: list[RuntimeSkill] = []
-    seen: set[str] = set()
-    for path in paths:
-        content, files = _collect_skill(path)
-        name = _skill_name(content, path)
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
-            raise ValueError(f"skill name must be filesystem-safe: {name!r}")
-        if name in seen:
-            raise ValueError(f"duplicate skill name: {name!r}")
-        seen.add(name)
-        skills.append({"name": name, "content": content, "files": files})
-    return skills
-
-
-def normalize_plugin_tasks(items: list[dict], skill_names: set[str]) -> None:
-    for index, item in enumerate(items):
-        raw = item.get("target_skills")
-        if raw is None:
-            item["target_skills"] = []
-        elif (
-            not isinstance(raw, list)
-            or not raw
-            or any(not isinstance(name, str) or not name.strip() for name in raw)
-        ):
-            raise ValueError(f"item #{index} target_skills must be a non-empty string array")
-        else:
-            targets = list(dict.fromkeys(name.strip() for name in raw))
-            unknown = sorted(set(targets) - skill_names)
-            if unknown:
-                raise ValueError(f"item #{index} target_skills contains unknown skills: {unknown}")
-            item["target_skills"] = targets
-        raw_task_type = item.get("task_type")
-        if raw_task_type is None:
-            item["task_type"] = "default"
-        elif not isinstance(raw_task_type, str):
-            raise ValueError(f"item #{index} task_type must be a string")
-        else:
-            item["task_type"] = raw_task_type.strip() or "default"
+    """Compatibility wrapper around the shared Plugin Skill collector."""
+    try:
+        content, files, _source_dir = _collect_skill_source(path)
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
+    return content, files
 
 
 def _read_skill_file(path: str) -> str:
-    if not os.path.isfile(path):
-        sys.exit(f"error: skill file not found: {path}")
-    with open(path, encoding="utf-8") as f:
-        content = f.read()
-    if not content.strip():
-        sys.exit(f"error: skill file is empty: {path}")
+    """Compatibility helper retained for importers of this CLI module."""
+    try:
+        content, _files, _source_dir = _collect_skill_source(path)
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
     return content
 
 
 def _mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
-
-
-def _metrics(results: list[dict]) -> dict:
-    return {
-        "count": len(results),
-        "hard": _mean([float(result.get("hard", 0)) for result in results]),
-        "soft": _mean([float(result.get("soft", 0.0)) for result in results]),
-    }
-
-
-def aggregate_results(results: list[dict], skill_names: list[str]) -> dict:
-    by_skill = {
-        name: _metrics([result for result in results if name in result.get("target_skills", [])])
-        for name in skill_names
-    }
-    by_type = {
-        task_type: _metrics([result for result in results if result.get("task_type", "default") == task_type])
-        for task_type in sorted({str(result.get("task_type", "default")) for result in results})
-    }
-    routing = [result for result in results if result.get("task_type") == "routing"]
-    integration = [
-        result for result in results
-        if result.get("task_type") == "integration" or len(result.get("target_skills", [])) > 1
-    ]
-    weakest = min(
-        ((name, metrics) for name, metrics in by_skill.items() if metrics["count"]),
-        key=lambda entry: (entry[1]["hard"], entry[1]["soft"], entry[0]),
-        default=None,
-    )
-    return {
-        "mode": "plugin" if len(skill_names) > 1 else "skill",
-        "skill_count": len(skill_names),
-        "skill_names": list(skill_names),
-        "overall": _metrics(results),
-        "by_skill": by_skill,
-        "by_task_type": by_type,
-        "routing": _metrics(routing) if routing else None,
-        "integration": _metrics(integration) if integration else None,
-        "weakest_skill": (
-            {"name": weakest[0], **weakest[1]} if weakest is not None else None
-        ),
-    }
 
 
 def build_report(results: list[dict]) -> str:

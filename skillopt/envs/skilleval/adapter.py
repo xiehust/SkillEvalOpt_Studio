@@ -17,6 +17,7 @@ from skillopt.envs.base import EnvAdapter
 from skillopt.envs.skilleval.bundle import SKILL_MD, normalize_rel_path, split_bundle
 from skillopt.envs.skilleval.dataloader import SkillEvalDataLoader
 from skillopt.envs.skilleval.evaluator import artifacts_listing, judge, merge_scores
+from skillopt.envs.skilleval.plugin import PluginState
 from skillopt.envs.skilleval.rollout import collect_support_files, run_batch
 from skillopt.model import azure_openai as _llm
 
@@ -118,6 +119,33 @@ class SkillEvalAdapter(EnvAdapter):
             skill_docs=skill_docs,
         )
         results = merge_scores(items, rollout_results, judge)
+        self._persist_trajectories(items, results, out_dir)
+        return results
+
+    def rollout_plugin(
+        self,
+        env_manager,
+        plugin_state: PluginState,
+        out_dir: str,
+        **kwargs,
+    ) -> list[dict]:
+        """Run and judge tasks with every named Plugin Skill installed."""
+        del kwargs
+        items: list[dict] = env_manager
+        runtime_skills = plugin_state.runtime_skills()
+        rollout_results = run_batch(
+            items,
+            runtime_skills[0]["content"],
+            out_dir,
+            workers=self.workers,
+            timeout=self.timeout,
+            model=_llm.TARGET_DEPLOYMENT,
+            runtime_skills=runtime_skills,
+        )
+        results = merge_scores(items, rollout_results, judge)
+        for item, result in zip(items, results):
+            result["target_skills"] = list(item.get("target_skills") or [])
+            result["task_type"] = item.get("task_type", "default")
         self._persist_trajectories(items, results, out_dir)
         return results
 

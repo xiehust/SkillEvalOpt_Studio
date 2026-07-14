@@ -174,11 +174,26 @@ export interface TrainStep {
   best_step: number | null;
   skill_len: number | null;
   wall_time_s: number | null;
+  selected_skills?: string[] | null;
+  attribution_counts?: Record<string, number> | null;
+  current_skill_scores?: Record<string, number> | null;
+  regressions?: Record<string, number> | null;
+  gate_reasons?: string[] | null;
+}
+
+export interface PluginTrainMetrics {
+  skill_names: string[];
+  trainable_skill_names: string[];
+  baseline: EvalAggregates | null;
+  best: EvalAggregates | null;
+  test: EvalAggregates | null;
+  best_skill_scores: Record<string, number>;
 }
 
 export interface TrainResults {
   type: "train";
   summary: {
+    mode: "skill" | "plugin";
     steps: TrainStep[];
     best_step: number | null;
     best_score: number | null;
@@ -193,8 +208,10 @@ export interface TrainResults {
     };
     token_totals: Record<string, number>;
     finished: boolean;
+    plugin?: PluginTrainMetrics;
   };
   skill_diff: string;
+  plugin_diffs: Record<string, string>;
 }
 
 export interface TaskgenSummary {

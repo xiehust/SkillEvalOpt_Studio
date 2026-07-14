@@ -149,7 +149,12 @@ def get_job_results(
                 status_code=404,
                 detail=f"results not available yet (job status: {job.status})",
             )
-        return {"type": "train", "summary": summary, "skill_diff": artifacts.skill_diff(config, job)}
+        return {
+            "type": "train",
+            "summary": summary,
+            "skill_diff": artifacts.skill_diff(config, job),
+            "plugin_diffs": artifacts.plugin_skill_diffs(config, job),
+        }
     if job.type == "taskgen":
         results = artifacts.taskgen_results(config, job)
         if results is None:

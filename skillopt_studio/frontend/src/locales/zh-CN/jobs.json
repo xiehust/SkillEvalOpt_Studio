@@ -105,6 +105,7 @@
   },
   "train": {
     "steps": "步数",
+    "skills": "Skill 数",
     "accepts": "接受",
     "rejects": "拒绝",
     "bestStepScore": "最优步 / 分数",
@@ -114,9 +115,18 @@
     "legendValSoft": "验证软分",
     "legendBest": "历史最优",
     "timelineTitle": "步骤时间线",
+    "pluginBreakdownTitle": "Plugin 闸门分项",
+    "trainable": "可训练",
+    "baseline": "基线硬分 / 软分",
+    "best": "最优硬分 / 软分",
+    "yes": "是",
+    "no": "否",
+    "selectedSkills": "定向 Skill",
     "noSteps": "还没有完成的步骤。",
     "skillDiffTitle": "技能变化(seed → best)",
-    "noDiff": "暂无差异(best_skill.md 尚未产出或与种子一致)。"
+    "pluginDiffTitle": "Plugin Skill 变化(seed → best)",
+    "noDiff": "暂无差异(best_skill.md 尚未产出或与种子一致)。",
+    "noPluginDiff": "没有 Plugin Skill 相对初始快照发生变化。"
   },
   "artifacts": {
     "directory": "目录",

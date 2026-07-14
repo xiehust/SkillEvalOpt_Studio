@@ -22,12 +22,14 @@ gradient:
 
 optimizer:
   learning_rate: 4
+  max_skills_per_candidate: 2
   # short demo run: skip epoch-level extras to keep the model-call budget small
   use_slow_update: false
   use_meta_skill: false
 
 evaluation:
   use_gate: true
+  max_skill_regression: 0.0
   sel_env_num: 0     # full val split
   test_env_num: 0    # full test split
   eval_test: true

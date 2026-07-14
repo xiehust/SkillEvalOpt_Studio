@@ -20,6 +20,8 @@ MAX_TEXT_ARTIFACT_BYTES = 512 * 1024
 _STEP_FIELDS = (
     "step", "epoch", "action", "selection_hard", "selection_soft",
     "current_score", "best_score", "best_step", "skill_len", "wall_time_s",
+    "selected_skills", "attribution_counts", "current_skill_scores",
+    "regressions", "gate_reasons",
 )
 
 _ROW_FIELDS = (
@@ -145,21 +147,39 @@ def train_summary(config: StudioConfig, job: JobInfo) -> dict | None:
     if not history and not summary:
         return None
 
-    steps = [
-        {key: rec.get(key) for key in _STEP_FIELDS}
-        for rec in history
-        if isinstance(rec, dict)
-    ]
+    mode = (
+        "plugin"
+        if summary.get("mode") == "plugin"
+        or job.params.get("target_mode") == "plugin"
+        or job.params.get("skill_ids") is not None
+        else "skill"
+    )
+    steps = []
+    for rec in history:
+        if not isinstance(rec, dict):
+            continue
+        row = {key: rec.get(key) for key in _STEP_FIELDS}
+        if mode == "plugin":
+            aggregates = rec.get("candidate_aggregates") or rec.get("train_aggregates") or {}
+            overall = aggregates.get("overall") if isinstance(aggregates, dict) else {}
+            if isinstance(overall, dict):
+                row["selection_hard"] = overall.get("hard")
+                row["selection_soft"] = overall.get("soft")
+        steps.append(row)
     best_step = summary.get("best_step")
     if best_step is None and steps:
         best_step = steps[-1].get("best_step")
 
     token_summary = summary.get("token_summary") or {}
     token_totals = token_summary.get("_total") or {}
-    return {
+    result = {
+        "mode": mode,
         "steps": steps,
         "best_step": best_step,
-        "best_score": summary.get("best_selection_hard", (steps[-1].get("best_score") if steps else None)),
+        "best_score": summary.get(
+            "best_selection_score",
+            summary.get("best_selection_hard", (steps[-1].get("best_score") if steps else None)),
+        ),
         "baseline_selection_hard": summary.get("baseline_selection_hard"),
         "test_scores": {
             "baseline": summary.get("baseline_test_hard"),
@@ -176,6 +196,29 @@ def train_summary(config: StudioConfig, job: JobInfo) -> dict | None:
         "token_totals": token_totals,
         "finished": bool(summary),
     }
+    if mode == "plugin":
+        baseline = summary.get("baseline_aggregates")
+        best = summary.get("best_aggregates")
+        test = summary.get("test_aggregates")
+        baseline_overall = baseline.get("overall") if isinstance(baseline, dict) else None
+        test_overall = test.get("overall") if isinstance(test, dict) else None
+        result["baseline_selection_hard"] = (
+            baseline_overall.get("hard") if isinstance(baseline_overall, dict) else None
+        )
+        result["test_scores"] = {
+            "baseline": None,
+            "best": test_overall.get("hard") if isinstance(test_overall, dict) else None,
+            "final": test_overall.get("hard") if isinstance(test_overall, dict) else None,
+        }
+        result["plugin"] = {
+            "skill_names": summary.get("skill_names") or [],
+            "trainable_skill_names": summary.get("trainable_skill_names") or [],
+            "baseline": baseline,
+            "best": best,
+            "test": test,
+            "best_skill_scores": summary.get("best_skill_scores") or {},
+        }
+    return result
 
 
 # Finished jobs' artifacts are immutable, so token aggregation is cached by
@@ -282,6 +325,41 @@ def skill_diff(config: StudioConfig, job: JobInfo) -> str:
     return "".join(
         difflib.unified_diff(seed, best, fromfile="skills/skill_v0000.md", tofile="best_skill.md")
     )
+
+
+def plugin_skill_diffs(config: StudioConfig, job: JobInfo) -> dict[str, str]:
+    """Per-Skill diffs between Plugin version zero and best_plugin."""
+    out = job_out_root(config, job)
+    initial = out / "plugin_versions" / "plugin_v0000"
+    best = out / "best_plugin"
+    manifest = _read_json(best / "manifest.json")
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("skill_names"), list):
+        return {}
+    diffs: dict[str, str] = {}
+    for raw_name in manifest["skill_names"]:
+        if not isinstance(raw_name, str) or not raw_name:
+            continue
+        seed_path = initial / raw_name / "SKILL.md"
+        best_path = best / raw_name / "SKILL.md"
+        if not seed_path.is_file() or not best_path.is_file():
+            continue
+        seed_lines = seed_path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines(keepends=True)
+        best_lines = best_path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines(keepends=True)
+        diff = "".join(
+            difflib.unified_diff(
+                seed_lines,
+                best_lines,
+                fromfile=f"plugin_v0000/{raw_name}/SKILL.md",
+                tofile=f"best_plugin/{raw_name}/SKILL.md",
+            )
+        )
+        if diff:
+            diffs[raw_name] = diff
+    return diffs
 
 
 _PROGRESS_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (

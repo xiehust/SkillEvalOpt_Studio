@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { api, ApiError, BackendStatus, SkillInfo, TaskSetInfo } from "../api";
+import { buildPluginGroups, filterPluginGroups } from "../components/pluginGroups";
 import { BackendSelect, Card, ErrorBanner, Mono, PageHeader, SourceFilterChips, SourceTag, Spinner } from "../components/ui";
 
 export default function Evaluate() {
@@ -62,31 +63,10 @@ export default function Evaluate() {
   }, [skills, skillQuery, skillSource]);
 
   const pluginGroups = useMemo(() => {
-    const grouped = new Map<string, { key: string; name: string; source: string; skills: SkillInfo[] }>();
-    for (const skill of skills ?? []) {
-      if (!skill.plugin) continue;
-      const key = `${skill.source}::${skill.plugin}`;
-      const group = grouped.get(key) ?? { key, name: skill.plugin, source: skill.source, skills: [] };
-      group.skills.push(skill);
-      grouped.set(key, group);
-    }
-    return [...grouped.values()]
-      .filter((group) => group.skills.length >= 2)
-      .map((group) => ({ ...group, skills: group.skills.sort((a, b) => a.name.localeCompare(b.name)) }))
-      .sort((a, b) => a.name.localeCompare(b.name));
+    return buildPluginGroups(skills ?? []);
   }, [skills]);
   const filteredPluginGroups = useMemo(() => {
-    const query = skillQuery.trim().toLowerCase();
-    if (!query) return pluginGroups;
-    return pluginGroups.filter(
-      (group) =>
-        group.name.toLowerCase().includes(query)
-        || group.skills.some(
-          (skill) =>
-            skill.name.toLowerCase().includes(query)
-            || skill.id.toLowerCase().includes(query),
-        ),
-    );
+    return filterPluginGroups(pluginGroups, skillQuery);
   }, [pluginGroups, skillQuery]);
   const selectedPlugin = pluginGroups.find((group) => group.key === pluginKey);
 

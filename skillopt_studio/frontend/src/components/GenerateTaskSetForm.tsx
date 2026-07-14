@@ -2,16 +2,10 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { api, ApiError, BackendStatus, SkillInfo } from "../api";
+import { buildPluginGroups, filterPluginGroups, PluginGroup } from "./pluginGroups";
 import { BackendSelect, ErrorBanner, Mono, SourceTag, Spinner } from "./ui";
 
 type TargetMode = "skill" | "plugin";
-
-interface PluginGroup {
-  key: string;
-  name: string;
-  source: string;
-  skills: SkillInfo[];
-}
 
 /**
  * “AI 自动生成”标签页:选定单个技能或同一 Plugin 下的多个技能,提交 taskgen 作业。
@@ -67,40 +61,11 @@ export default function GenerateTaskSetForm() {
   }, [skills, skillQuery]);
 
   const pluginGroups = useMemo<PluginGroup[]>(() => {
-    const grouped = new Map<string, PluginGroup>();
-    for (const skill of skills ?? []) {
-      if (!skill.plugin) continue;
-      const key = `${skill.source}::${skill.plugin}`;
-      const group = grouped.get(key) ?? {
-        key,
-        name: skill.plugin,
-        source: skill.source,
-        skills: [],
-      };
-      group.skills.push(skill);
-      grouped.set(key, group);
-    }
-    return [...grouped.values()]
-      .filter((group) => group.skills.length >= 2)
-      .map((group) => ({
-        ...group,
-        skills: [...group.skills].sort((a, b) => a.name.localeCompare(b.name)),
-      }))
-      .sort((a, b) => a.name.localeCompare(b.name));
+    return buildPluginGroups(skills ?? []);
   }, [skills]);
 
   const filteredPluginGroups = useMemo(() => {
-    const q = skillQuery.trim().toLowerCase();
-    if (!q) return pluginGroups;
-    return pluginGroups.filter(
-      (group) =>
-        group.name.toLowerCase().includes(q) ||
-        group.skills.some(
-          (skill) =>
-            skill.name.toLowerCase().includes(q) ||
-            skill.id.toLowerCase().includes(q),
-        ),
-    );
+    return filterPluginGroups(pluginGroups, skillQuery);
   }, [pluginGroups, skillQuery]);
 
   const selectedPlugin = pluginGroups.find((group) => group.key === pluginKey);

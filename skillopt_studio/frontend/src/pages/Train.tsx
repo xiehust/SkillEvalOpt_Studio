@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { api, ApiError, BackendStatus, SkillInfo, TaskSetInfo } from "../api";
+import { buildPluginGroups, filterPluginGroups } from "../components/pluginGroups";
 import { BackendSelect, Card, ErrorBanner, Mono, PageHeader, SourceFilterChips, SourceTag, Spinner } from "../components/ui";
 
 export default function Train() {
@@ -12,7 +13,11 @@ export default function Train() {
   const [tasksets, setTasksets] = useState<TaskSetInfo[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
+  const [targetMode, setTargetMode] = useState<"skill" | "plugin">("skill");
   const [skillId, setSkillId] = useState(searchParams.get("skill") ?? "");
+  const [pluginKey, setPluginKey] = useState("");
+  const [pluginSkillIds, setPluginSkillIds] = useState<string[]>([]);
+  const [trainablePluginSkillIds, setTrainablePluginSkillIds] = useState<string[]>([]);
   const [skillQuery, setSkillQuery] = useState("");
   const [skillSource, setSkillSource] = useState("");
   const [mdFiles, setMdFiles] = useState<string[]>([]);
@@ -23,6 +28,8 @@ export default function Train() {
   const [numEpochs, setNumEpochs] = useState(2);
   const [gateMetric, setGateMetric] = useState("soft");
   const [learningRate, setLearningRate] = useState(4);
+  const [maxSkillsPerCandidate, setMaxSkillsPerCandidate] = useState(2);
+  const [maxSkillRegression, setMaxSkillRegression] = useState(0);
   const [evalTest, setEvalTest] = useState(false);
   const [targetBackend, setTargetBackend] = useState("claude_code_exec");
   const [backends, setBackends] = useState<BackendStatus[] | null>(null);
@@ -51,23 +58,24 @@ export default function Train() {
   };
 
   useEffect(() => {
+    if (targetMode !== "skill") return;
     const skill = skills?.find((s) => s.id === skillId);
     if (skill) applyBackend(skill.source === "codex" ? "codex_exec" : "claude_code_exec");
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [skillId, skills]);
+  }, [skillId, skills, targetMode]);
 
   // trainable_files candidates: .md files inside the skill dir, minus SKILL.md
   useEffect(() => {
     setTrainableFiles([]);
     setMdFiles([]);
-    if (!skillId) return;
+    if (targetMode !== "skill" || !skillId) return;
     api
       .skillDetail(skillId)
       .then((detail) => {
         setMdFiles(detail.file_tree.filter((f) => f.toLowerCase().endsWith(".md") && f !== "SKILL.md"));
       })
       .catch(() => setMdFiles([]));
-  }, [skillId]);
+  }, [skillId, targetMode]);
 
   const filteredSkills = useMemo(() => {
     const q = skillQuery.trim().toLowerCase();
@@ -78,6 +86,16 @@ export default function Train() {
     );
   }, [skills, skillQuery, skillSource]);
 
+  const pluginGroups = useMemo(
+    () => buildPluginGroups(skills ?? []),
+    [skills],
+  );
+  const filteredPluginGroups = useMemo(
+    () => filterPluginGroups(pluginGroups, skillQuery),
+    [pluginGroups, skillQuery],
+  );
+  const selectedPlugin = pluginGroups.find((group) => group.key === pluginKey);
+
   const selectedTaskset = tasksets?.find((taskset) => taskset.id === tasksetId);
   const selectedSkill = skills?.find((skill) => skill.id === skillId);
 
@@ -87,9 +105,35 @@ export default function Train() {
     );
   };
 
+  const selectPlugin = (key: string) => {
+    const group = pluginGroups.find((item) => item.key === key);
+    if (!group) return;
+    const ids = group.skills.map((skill) => skill.id);
+    setPluginKey(group.key);
+    setPluginSkillIds(ids);
+    setTrainablePluginSkillIds(ids);
+    setMaxSkillsPerCandidate(Math.min(2, ids.length));
+    applyBackend(group.source === "codex" ? "codex_exec" : "claude_code_exec");
+  };
+
+  const toggleTrainablePluginSkill = (id: string) => {
+    setTrainablePluginSkillIds((current) => {
+      const next = current.includes(id)
+        ? current.filter((skillIdToKeep) => skillIdToKeep !== id)
+        : [...current, id];
+      setMaxSkillsPerCandidate((value) => Math.min(value, Math.max(1, next.length)));
+      return next;
+    });
+  };
+
   const onSubmit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!skillId || !tasksetId) {
+    const hasTarget = targetMode === "skill"
+      ? Boolean(skillId)
+      : Boolean(selectedPlugin)
+        && pluginSkillIds.length >= 2
+        && trainablePluginSkillIds.length >= 1;
+    if (!hasTarget || !tasksetId) {
       setFormError(t("train.errNoSkillTaskset"));
       return;
     }
@@ -99,6 +143,17 @@ export default function Train() {
     }
     if (learningRate < 1 || learningRate > 16) {
       setFormError(t("train.errLearningRateRange", { min: 1, max: 16 }));
+      return;
+    }
+    if (
+      targetMode === "plugin"
+      && (maxSkillsPerCandidate < 1 || maxSkillsPerCandidate > trainablePluginSkillIds.length)
+    ) {
+      setFormError(t("train.errMaxSkillsRange"));
+      return;
+    }
+    if (targetMode === "plugin" && (maxSkillRegression < 0 || maxSkillRegression > 1)) {
+      setFormError(t("train.errRegressionRange"));
       return;
     }
     if (workers < 1 || workers > 8) {
@@ -117,7 +172,16 @@ export default function Train() {
     setSubmitting(true);
     try {
       const job = await api.createJob("train", {
-        skill_id: skillId,
+        target_mode: targetMode,
+        ...(targetMode === "skill"
+          ? { skill_id: skillId }
+          : {
+              skill_ids: pluginSkillIds,
+              trainable_skill_ids: trainablePluginSkillIds,
+              plugin: selectedPlugin?.name,
+              max_skills_per_candidate: maxSkillsPerCandidate,
+              max_skill_regression: maxSkillRegression,
+            }),
         taskset_id: tasksetId,
         target_backend: targetBackend,
         target_model: targetModel.trim(),
@@ -128,7 +192,9 @@ export default function Train() {
         eval_test: evalTest,
         workers,
         timeout: timeout_,
-        ...(trainableFiles.length > 0 ? { trainable_files: trainableFiles } : {}),
+        ...(targetMode === "skill" && trainableFiles.length > 0
+          ? { trainable_files: trainableFiles }
+          : {}),
         ...(selectedTaskset?.mode === "single" ? { split_ratio: splitRatio } : {}),
       });
       navigate(`/jobs/${job.id}`);
@@ -149,77 +215,180 @@ export default function Train() {
 
       {skills !== null && tasksets !== null && (
         <form onSubmit={onSubmit} noValidate className="space-y-6" data-testid="train-form">
-          <Card title={t("picker.selectSkillTitle")}>
+          <Card title={t("train.selectTargetTitle")}>
+            <div className="inline-flex border border-line bg-panel2 mb-3" data-testid="train-target-mode">
+              {(["skill", "plugin"] as const).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  className={`min-w-28 px-3 py-2 text-sm transition-colors ${
+                    targetMode === mode ? "bg-amber/15 text-amber" : "text-muted hover:text-text"
+                  }`}
+                  onClick={() => {
+                    setTargetMode(mode);
+                    setSkillQuery("");
+                    setFormError(null);
+                  }}
+                  data-testid={`train-mode-${mode}`}
+                >
+                  {t(`taskgen.mode.${mode}`)}
+                </button>
+              ))}
+            </div>
             <div className="flex flex-wrap items-center gap-3 mb-3">
               <input
                 className="input max-w-sm !w-auto flex-1 min-w-[14rem]"
-                placeholder={t("picker.searchSkillPlaceholder")}
+                placeholder={
+                  targetMode === "skill"
+                    ? t("picker.searchSkillPlaceholder")
+                    : t("taskgen.searchPluginPlaceholder")
+                }
                 value={skillQuery}
                 onChange={(event) => setSkillQuery(event.target.value)}
               />
-              <SourceFilterChips skills={skills} value={skillSource} onChange={setSkillSource} />
+              {targetMode === "skill" && (
+                <SourceFilterChips skills={skills} value={skillSource} onChange={setSkillSource} />
+              )}
             </div>
-            <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3 max-h-72 overflow-y-auto pr-1">
-              {filteredSkills.map((skill) => (
-                <label
-                  key={skill.id}
-                  data-skill-option={skill.id}
-                  className={`flex items-start gap-2.5 p-3 border cursor-pointer transition-colors ${
-                    skillId === skill.id
-                      ? "border-amber bg-amber/[.13]"
-                      : "border-line bg-panel2 hover:border-muted"
-                  }`}
-                >
-                  <input
-                    type="radio"
-                    name="skill"
-                    className="mt-1 accent-amber"
-                    checked={skillId === skill.id}
-                    onChange={() => setSkillId(skill.id)}
-                  />
-                  <span className="min-w-0">
-                    <span className="flex items-center gap-2 text-sm font-medium">
-                      <span className="truncate">{skill.name}</span>
-                      <SourceTag source={skill.source} />
+            {targetMode === "skill" ? (
+              <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3 max-h-72 overflow-y-auto pr-1">
+                {filteredSkills.map((skill) => (
+                  <label
+                    key={skill.id}
+                    data-skill-option={skill.id}
+                    className={`flex min-w-0 items-start gap-2.5 p-3 border cursor-pointer transition-colors ${
+                      skillId === skill.id
+                        ? "border-amber bg-amber/[.13]"
+                        : "border-line bg-panel2 hover:border-muted"
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="skill"
+                      className="mt-1 accent-amber"
+                      checked={skillId === skill.id}
+                      onChange={() => setSkillId(skill.id)}
+                    />
+                    <span className="min-w-0">
+                      <span className="flex items-center gap-2 text-sm font-medium">
+                        <span className="truncate">{skill.name}</span>
+                        <SourceTag source={skill.source} />
+                      </span>
+                      <Mono className="block text-[11px] text-muted/70 truncate mt-0.5">{skill.id}</Mono>
                     </span>
-                    <Mono className="block text-[11px] text-muted/70 truncate mt-0.5">{skill.id}</Mono>
-                  </span>
-                </label>
-              ))}
-            </div>
+                  </label>
+                ))}
+              </div>
+            ) : (
+              <div className="grid gap-2 md:grid-cols-2 max-h-72 overflow-y-auto pr-1">
+                {filteredPluginGroups.map((group) => (
+                  <label
+                    key={group.key}
+                    data-plugin-option={group.name}
+                    className={`flex min-w-0 items-start gap-2.5 p-3 border cursor-pointer transition-colors ${
+                      pluginKey === group.key
+                        ? "border-amber bg-amber/[.13]"
+                        : "border-line bg-panel2 hover:border-muted"
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="train-plugin"
+                      className="mt-1 accent-amber"
+                      checked={pluginKey === group.key}
+                      onChange={() => selectPlugin(group.key)}
+                    />
+                    <span className="min-w-0">
+                      <span className="flex flex-wrap items-center gap-2 text-sm font-medium">
+                        <span className="truncate">{group.name}</span>
+                        <SourceTag source={group.source} />
+                      </span>
+                      <span className="block text-xs text-muted mt-0.5">
+                        {t("taskgen.pluginSkillCount", { count: group.skills.length })}
+                      </span>
+                    </span>
+                  </label>
+                ))}
+                {filteredPluginGroups.length === 0 && (
+                  <p className="text-sm text-muted py-4 md:col-span-2">
+                    {t("taskgen.noPluginMatch")}
+                  </p>
+                )}
+              </div>
+            )}
           </Card>
 
-          <Card title={t("train.trainableFilesTitle")}>
-            {!skillId && <p className="text-sm text-muted">{t("train.selectSkillFirst")}</p>}
-            {skillId && mdFiles.length === 0 && (
-              <p className="text-sm text-muted" data-testid="no-trainable-hint">
-                {selectedSkill?.has_support_files
-                  ? t("train.noTrainableSupport")
-                  : t("train.singleFileSkill")}
-              </p>
-            )}
-            {skillId && mdFiles.length > 0 && (
-              <div data-testid="trainable-files">
+          <Card
+            title={
+              targetMode === "skill"
+                ? t("train.trainableFilesTitle")
+                : t("train.trainableSkillsTitle")
+            }
+          >
+            {targetMode === "skill" ? (
+              <>
+                {!skillId && <p className="text-sm text-muted">{t("train.selectSkillFirst")}</p>}
+                {skillId && mdFiles.length === 0 && (
+                  <p className="text-sm text-muted" data-testid="no-trainable-hint">
+                    {selectedSkill?.has_support_files
+                      ? t("train.noTrainableSupport")
+                      : t("train.singleFileSkill")}
+                  </p>
+                )}
+                {skillId && mdFiles.length > 0 && (
+                  <div data-testid="trainable-files">
+                    <p className="text-xs text-muted mb-3">
+                      {t("train.trainableHint")}
+                    </p>
+                    <div className="grid gap-2 md:grid-cols-2">
+                      {mdFiles.map((file) => (
+                        <label
+                          key={file}
+                          className="flex min-w-0 items-center gap-2.5 p-2.5 border border-line bg-panel2 cursor-pointer hover:border-faint"
+                        >
+                          <input
+                            type="checkbox"
+                            className="accent-amber"
+                            checked={trainableFiles.includes(file)}
+                            onChange={() => toggleTrainable(file)}
+                          />
+                          <Mono className="text-xs">{file}</Mono>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
+            ) : selectedPlugin ? (
+              <div data-testid="trainable-plugin-skills">
                 <p className="text-xs text-muted mb-3">
-                  {t("train.trainableHint")}
+                  {t("train.trainableSkillsHint", {
+                    selected: trainablePluginSkillIds.length,
+                    total: selectedPlugin.skills.length,
+                  })}
                 </p>
                 <div className="grid gap-2 md:grid-cols-2">
-                  {mdFiles.map((file) => (
+                  {selectedPlugin.skills.map((skill) => (
                     <label
-                      key={file}
-                      className="flex items-center gap-2.5 p-2.5 border border-line bg-panel2 cursor-pointer hover:border-faint"
+                      key={skill.id}
+                      className="flex min-w-0 items-center gap-2.5 p-2.5 border border-line bg-panel2 cursor-pointer hover:border-faint"
                     >
                       <input
                         type="checkbox"
                         className="accent-amber"
-                        checked={trainableFiles.includes(file)}
-                        onChange={() => toggleTrainable(file)}
+                        checked={trainablePluginSkillIds.includes(skill.id)}
+                        onChange={() => toggleTrainablePluginSkill(skill.id)}
                       />
-                      <Mono className="text-xs">{file}</Mono>
+                      <span className="min-w-0">
+                        <span className="block text-sm">{skill.name}</span>
+                        <Mono className="block text-[11px] text-muted truncate">{skill.id}</Mono>
+                      </span>
                     </label>
                   ))}
                 </div>
               </div>
+            ) : (
+              <p className="text-sm text-muted">{t("train.selectPluginFirst")}</p>
             )}
           </Card>
 
@@ -236,7 +405,7 @@ export default function Train() {
                   <label
                     key={taskset.id}
                     data-taskset-option={taskset.id}
-                    className={`flex items-start gap-2.5 p-3 border cursor-pointer transition-colors ${
+                    className={`flex min-w-0 items-start gap-2.5 p-3 border cursor-pointer transition-colors ${
                       tasksetId === taskset.id
                         ? "border-amber bg-amber/[.13]"
                         : "border-line bg-panel2 hover:border-muted"
@@ -307,6 +476,37 @@ export default function Train() {
                 />
                 <p className="text-xs text-muted mt-1.5">{t("train.learningRateHint")}</p>
               </div>
+              {targetMode === "plugin" && (
+                <>
+                  <div>
+                    <label className="label">{t("train.maxSkillsLabel")}</label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={Math.max(1, trainablePluginSkillIds.length)}
+                      className="input font-mono"
+                      value={maxSkillsPerCandidate}
+                      onChange={(event) => setMaxSkillsPerCandidate(Number(event.target.value))}
+                    />
+                    <p className="text-xs text-muted mt-1.5">{t("train.maxSkillsHint")}</p>
+                  </div>
+                  <div>
+                    <label className="label">{t("train.maxRegressionLabel")}</label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={1}
+                      step={0.01}
+                      className="input font-mono"
+                      value={maxSkillRegression}
+                      onChange={(event) => setMaxSkillRegression(Number(event.target.value))}
+                    />
+                    <p className="text-xs text-muted mt-1.5">
+                      {t("train.maxRegressionHint")}
+                    </p>
+                  </div>
+                </>
+              )}
               <BackendSelect value={targetBackend} onChange={applyBackend} statuses={backends} />
               <div>
                 <label className="label">{t("picker.targetModelLabel")}</label>

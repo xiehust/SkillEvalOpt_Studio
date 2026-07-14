@@ -510,11 +510,42 @@ const ACTION_STYLES: Record<string, string> = {
   accept: "border-good/50 text-good",
   accept_new_best: "border-good/50 text-good",
   reject: "border-crit/50 text-critText",
+  skip_no_attribution: "border-muted text-muted",
+  skip_no_applied_edits: "border-muted text-muted",
 };
+
+function DiffBlock({ diff, testId }: { diff: string; testId: string }) {
+  return (
+    <pre
+      className="bg-codebg border border-grid p-4 text-xs font-mono leading-relaxed overflow-auto max-h-[28rem]"
+      data-testid={testId}
+    >
+      {diff.split("\n").map((line, index) => (
+        <div
+          key={index}
+          className={
+            line.startsWith("+++") || line.startsWith("---")
+              ? "text-muted"
+              : line.startsWith("+")
+                ? "text-good bg-good/5"
+                : line.startsWith("-")
+                  ? "text-critText bg-crit/5"
+                  : line.startsWith("@@")
+                    ? "text-s1"
+                    : "text-text/70"
+          }
+        >
+          {line || " "}
+        </div>
+      ))}
+    </pre>
+  );
+}
 
 function TrainResultsView({ results }: { results: TrainResults }) {
   const { t } = useTranslation("jobs");
-  const { summary, skill_diff } = results;
+  const { summary, skill_diff, plugin_diffs } = results;
+  const plugin = summary.mode === "plugin" ? summary.plugin : undefined;
   const chartData = summary.steps.map((step) => ({
     step: step.step,
     sel_soft: step.selection_soft,
@@ -531,6 +562,9 @@ function TrainResultsView({ results }: { results: TrainResults }) {
           value={`#${summary.best_step ?? "—"} / ${summary.best_score?.toFixed(3) ?? "—"}`}
           tone="s2"
         />
+        {plugin && (
+          <StatBadge label={t("train.skills")} value={plugin.skill_names.length} tone="s5" />
+        )}
         {summary.test_scores.best != null && (
           <StatBadge
             label={t("train.testBaselineBest")}
@@ -542,6 +576,43 @@ function TrainResultsView({ results }: { results: TrainResults }) {
 
       {!summary.finished && (
         <p className="text-xs text-amber">{t("train.inProgress")}</p>
+      )}
+
+      {plugin?.best && (
+        <Card title={t("train.pluginBreakdownTitle")}>
+          <div className="overflow-x-auto">
+            <table className="w-full" data-testid="train-plugin-metrics">
+              <thead>
+                <tr>
+                  <th className="th">{t("eval.skill")}</th>
+                  <th className="th">{t("train.trainable")}</th>
+                  <th className="th">{t("train.baseline")}</th>
+                  <th className="th">{t("train.best")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {plugin.skill_names.map((name) => {
+                  const baseline = plugin.baseline?.by_skill[name];
+                  const best = plugin.best?.by_skill[name];
+                  return (
+                    <tr key={name}>
+                      <td className="td"><Mono className="text-s1">{name}</Mono></td>
+                      <td className="td">
+                        {plugin.trainable_skill_names.includes(name) ? t("train.yes") : t("train.no")}
+                      </td>
+                      <td className="td">
+                        <Mono>{baseline ? `${(baseline.hard * 100).toFixed(0)}% / ${baseline.soft.toFixed(3)}` : "—"}</Mono>
+                      </td>
+                      <td className="td">
+                        <Mono>{best ? `${(best.hard * 100).toFixed(0)}% / ${best.soft.toFixed(3)}` : "—"}</Mono>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </Card>
       )}
 
       <Card title={t("train.valCurveTitle")}>
@@ -579,39 +650,41 @@ function TrainResultsView({ results }: { results: TrainResults }) {
                 sel {step.selection_hard?.toFixed(2) ?? "—"} / {step.selection_soft?.toFixed(2) ?? "—"}
               </Mono>
               <Mono className="text-xs text-text/80">best {step.best_score?.toFixed(2) ?? "—"}</Mono>
-              <Mono className="text-xs text-muted">len {step.skill_len ?? "—"}</Mono>
+              {step.selected_skills && step.selected_skills.length > 0 ? (
+                <Mono className="text-xs text-s5">
+                  {t("train.selectedSkills")}: {step.selected_skills.join(", ")}
+                </Mono>
+              ) : (
+                <Mono className="text-xs text-muted">len {step.skill_len ?? "—"}</Mono>
+              )}
               <Mono className="text-xs text-muted">{formatDuration(step.wall_time_s)}</Mono>
+              {step.gate_reasons && step.gate_reasons.length > 0 && (
+                <span className="basis-full text-xs text-critText">
+                  {step.gate_reasons.join("; ")}
+                </span>
+              )}
             </div>
           ))}
           {summary.steps.length === 0 && <p className="text-sm text-muted">{t("train.noSteps")}</p>}
         </div>
       </Card>
 
-      <Card title={t("train.skillDiffTitle")}>
-        {skill_diff ? (
-          <pre
-            className="bg-codebg border border-grid p-4 text-xs font-mono leading-relaxed overflow-auto max-h-[28rem]"
-            data-testid="skill-diff"
-          >
-            {skill_diff.split("\n").map((line, index) => (
-              <div
-                key={index}
-                className={
-                  line.startsWith("+++") || line.startsWith("---")
-                    ? "text-muted"
-                    : line.startsWith("+")
-                      ? "text-good bg-good/5"
-                      : line.startsWith("-")
-                        ? "text-critText bg-crit/5"
-                        : line.startsWith("@@")
-                          ? "text-s1"
-                          : "text-text/70"
-                }
-              >
-                {line || " "}
-              </div>
-            ))}
-          </pre>
+      <Card title={plugin ? t("train.pluginDiffTitle") : t("train.skillDiffTitle")}>
+        {plugin ? (
+          Object.keys(plugin_diffs).length > 0 ? (
+            <div className="space-y-5">
+              {Object.entries(plugin_diffs).map(([name, diff]) => (
+                <section key={name}>
+                  <Mono className="block text-sm text-s1 mb-2">{name}</Mono>
+                  <DiffBlock diff={diff} testId={`plugin-diff-${name}`} />
+                </section>
+              ))}
+            </div>
+          ) : (
+            <p className="text-sm text-muted">{t("train.noPluginDiff")}</p>
+          )
+        ) : skill_diff ? (
+          <DiffBlock diff={skill_diff} testId="skill-diff" />
         ) : (
           <p className="text-sm text-muted">{t("train.noDiff")}</p>
         )}

@@ -126,19 +126,19 @@ export default function App() {
   return (
     <div className="min-h-screen">
       <Topbar />
-      <div className="grid grid-cols-[132px_minmax(0,1fr)] min-h-[calc(100vh-52px)] sm:grid-cols-[216px_minmax(0,1fr)]">
-        <aside className="border-r border-line py-4 flex flex-col gap-0.5 sticky top-[52px] h-[calc(100vh-52px)]">
-          <div className="font-mono text-[9.5px] tracking-[0.22em] text-faint px-3 pt-2 pb-1.5 sm:px-5">
+      <div className="grid grid-cols-1 min-h-[calc(100vh-52px)] sm:grid-cols-[216px_minmax(0,1fr)]">
+        <aside className="sticky top-[52px] z-40 flex min-w-0 max-w-full flex-row gap-0.5 overflow-x-auto border-b border-line bg-[#0b0e0d] sm:h-[calc(100vh-52px)] sm:flex-col sm:overflow-visible sm:border-b-0 sm:border-r sm:py-4">
+          <div className="hidden font-mono text-[9.5px] tracking-[0.22em] text-faint px-5 pt-2 pb-1.5 sm:block">
             CONSOLE
           </div>
-          <nav className="flex-1">
+          <nav className="flex w-max sm:block sm:w-auto sm:flex-1">
             {NAV_ITEMS.map((item, index) => (
               <NavLink
                 key={item.to}
                 to={item.to}
                 end={item.to === "/"}
                 className={({ isActive }) =>
-                  `flex items-center gap-2 px-3 py-[9px] text-[12px] font-medium border-l-2 sm:gap-3 sm:px-5 sm:text-[13px] ${
+                  `flex shrink-0 items-center gap-2 border-b-2 border-l-0 px-3 py-[9px] text-[12px] font-medium sm:gap-3 sm:border-b-0 sm:border-l-2 sm:px-5 sm:text-[13px] ${
                     isActive
                       ? "border-amber text-amber bg-gradient-to-r from-amber/[.13] to-transparent"
                       : "border-transparent text-muted hover:text-text hover:bg-white/[.02]"

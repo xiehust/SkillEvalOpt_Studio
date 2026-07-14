@@ -105,6 +105,7 @@
   },
   "train": {
     "steps": "Steps",
+    "skills": "Skills",
     "accepts": "Accepts",
     "rejects": "Rejects",
     "bestStepScore": "Best step / score",
@@ -114,9 +115,18 @@
     "legendValSoft": "Val soft score",
     "legendBest": "All-time best",
     "timelineTitle": "Step timeline",
+    "pluginBreakdownTitle": "Plugin gate breakdown",
+    "trainable": "Trainable",
+    "baseline": "Baseline hard / soft",
+    "best": "Best hard / soft",
+    "yes": "Yes",
+    "no": "No",
+    "selectedSkills": "Directed Skills",
     "noSteps": "No completed steps yet.",
     "skillDiffTitle": "Skill diff (seed → best)",
-    "noDiff": "No diff yet (best_skill.md not produced, or identical to seed)."
+    "pluginDiffTitle": "Plugin Skill diffs (seed → best)",
+    "noDiff": "No diff yet (best_skill.md not produced, or identical to seed).",
+    "noPluginDiff": "No Plugin Skill changed from the seed snapshot."
   },
   "artifacts": {
     "directory": "Directory",
