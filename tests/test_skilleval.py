@@ -122,6 +122,9 @@ class TestLoadTasks:
         task = load_tasks(path)[0]
         assert task["task_type"] == "default"
         assert task["files"] == {}
+        assert task["judge_mode"] == "auto"
+        assert task["_judge_mode_explicit"] is False
+        assert task["artifact_checks"] == []
 
     def test_normalization_preserves_values(self, tmp_path) -> None:
         path = _write_tasks(

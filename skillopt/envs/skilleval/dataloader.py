@@ -23,6 +23,7 @@ from skillopt.datasets.base import (
     _compute_weighted_counts,
     _load_json_or_jsonl,
 )
+from skillopt.envs.skilleval.contracts import normalize_judge_contract
 from skillopt.envs.skilleval.plugin import normalize_plugin_tasks
 
 _REQUIRED_FIELDS = ("id", "question", "rubric")
@@ -116,6 +117,13 @@ def _normalize_items(raw_items: list, source: str) -> list[dict]:
         normalized = dict(item)
         normalized["files"] = _validate_files(index, item)
         normalized["task_type"] = raw_task_type or _DEFAULT_TASK_TYPE
+        judge_mode, artifact_checks, mode_explicit = normalize_judge_contract(
+            index,
+            item,
+        )
+        normalized["judge_mode"] = judge_mode
+        normalized["_judge_mode_explicit"] = mode_explicit
+        normalized["artifact_checks"] = artifact_checks
         tasks.append(normalized)
     return tasks
 
