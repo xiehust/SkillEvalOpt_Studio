@@ -5,7 +5,6 @@ import errno
 import hashlib
 import json
 import os
-import shutil
 import stat
 import subprocess
 import zipfile
@@ -101,6 +100,28 @@ class EvidenceSnapshot:
 
 class EvidenceLimitError(ValueError):
     """Raised when candidate evidence exceeds its configured byte limit."""
+
+
+@dataclass
+class _JudgeDirs:
+    root_path: str
+    evidence_path: str
+    scratch_path: str
+    root_name: str
+    parent_descriptor: int
+    root_descriptor: int
+    evidence_descriptor: int
+    scratch_descriptor: int
+
+    def close(self) -> None:
+        for descriptor in (
+            self.scratch_descriptor,
+            self.evidence_descriptor,
+            self.root_descriptor,
+            self.parent_descriptor,
+        ):
+            if descriptor >= 0:
+                os.close(descriptor)
 
 
 def _normalized_mime(mime: str | None) -> str:
@@ -329,6 +350,8 @@ def _scan_directory(
     *,
     skip_runtime: bool,
     require_single_link: bool,
+    required_file_mode: int | None,
+    required_directory_mode: int | None,
 ) -> None:
     with os.scandir(directory_descriptor) as entries:
         names = sorted(entry.name for entry in entries)
@@ -340,8 +363,6 @@ def _scan_directory(
                 f"symlink directory or file is not allowed in artifact workspace: {rel}"
             )
         if stat.S_ISDIR(info.st_mode):
-            if skip_runtime and name in _SKIP_ROOTS:
-                continue
             try:
                 child_descriptor = os.open(name, _directory_flags(), dir_fd=directory_descriptor)
             except OSError as exc:
@@ -350,15 +371,35 @@ def _scan_directory(
                 opened = os.fstat(child_descriptor)
                 if _stat_identity(info) != _stat_identity(opened):
                     raise ValueError(f"artifact directory changed while manifest was built: {rel}")
-                directories.add(rel)
-                _scan_directory(
-                    child_descriptor,
-                    (*rel_parts, name),
-                    rows,
-                    directories,
-                    skip_runtime=skip_runtime,
-                    require_single_link=require_single_link,
+                if (
+                    required_directory_mode is not None
+                    and stat.S_IMODE(opened.st_mode) != required_directory_mode
+                ):
+                    raise ValueError(f"artifact directory has invalid mode: {rel}")
+                if not (skip_runtime and name in _SKIP_ROOTS):
+                    directories.add(rel)
+                    _scan_directory(
+                        child_descriptor,
+                        (*rel_parts, name),
+                        rows,
+                        directories,
+                        skip_runtime=skip_runtime,
+                        require_single_link=require_single_link,
+                        required_file_mode=required_file_mode,
+                        required_directory_mode=required_directory_mode,
+                    )
+                current = os.stat(
+                    name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
                 )
+                if not stat.S_ISDIR(current.st_mode) or not _same_filesystem_object(
+                    opened,
+                    current,
+                ):
+                    raise ValueError(
+                        f"artifact directory changed while manifest was built: {rel}"
+                    )
             finally:
                 os.close(child_descriptor)
             continue
@@ -374,6 +415,11 @@ def _scan_directory(
             opened = os.fstat(descriptor)
             if _stat_identity(info) != _stat_identity(opened):
                 raise ValueError(f"artifact changed while manifest was built: {rel}")
+            if (
+                required_file_mode is not None
+                and stat.S_IMODE(opened.st_mode) != required_file_mode
+            ):
+                raise ValueError(f"artifact file has invalid mode: {rel}")
             rows[rel] = _manifest_entry_from_descriptor(
                 descriptor,
                 rel,
@@ -388,22 +434,52 @@ def _scan_manifest(
     *,
     skip_runtime: bool,
     require_single_link: bool,
+    required_file_mode: int | None = None,
+    required_directory_mode: int | None = None,
 ) -> tuple[dict[str, ManifestEntry], set[str]]:
     root = os.path.abspath(os.fspath(root))
     root_descriptor = _open_absolute_directory(root)
+    try:
+        return _scan_manifest_descriptor(
+            root_descriptor,
+            skip_runtime=skip_runtime,
+            require_single_link=require_single_link,
+            required_file_mode=required_file_mode,
+            required_directory_mode=required_directory_mode,
+        )
+    finally:
+        os.close(root_descriptor)
+
+
+def _scan_manifest_descriptor(
+    root_descriptor: int,
+    *,
+    skip_runtime: bool,
+    require_single_link: bool,
+    required_file_mode: int | None = None,
+    required_directory_mode: int | None = None,
+) -> tuple[dict[str, ManifestEntry], set[str]]:
+    scan_descriptor = os.open(".", _directory_flags(), dir_fd=root_descriptor)
     rows: dict[str, ManifestEntry] = {}
     directories: set[str] = set()
     try:
+        if (
+            required_directory_mode is not None
+            and stat.S_IMODE(os.fstat(scan_descriptor).st_mode) != required_directory_mode
+        ):
+            raise ValueError("artifact root directory has invalid mode")
         _scan_directory(
-            root_descriptor,
+            scan_descriptor,
             (),
             rows,
             directories,
             skip_runtime=skip_runtime,
             require_single_link=require_single_link,
+            required_file_mode=required_file_mode,
+            required_directory_mode=required_directory_mode,
         )
     finally:
-        os.close(root_descriptor)
+        os.close(scan_descriptor)
     return {path: rows[path] for path in sorted(rows)}, directories
 
 
@@ -473,20 +549,22 @@ def _logical_parts(raw_path: object) -> tuple[str, ...]:
     return parts
 
 
-def _ensure_real_directory(path: str) -> None:
-    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    current = os.open(os.path.abspath(os.sep), directory_flags)
+def _ensure_real_directory(path: str) -> int:
+    path = os.path.abspath(path)
+    current = os.open(os.path.abspath(os.sep), _directory_flags())
     try:
-        for part in os.path.abspath(path).split(os.sep)[1:]:
+        for part in path.split(os.sep)[1:]:
+            if not part:
+                continue
             try:
-                next_descriptor = os.open(part, directory_flags, dir_fd=current)
+                next_descriptor = os.open(part, _directory_flags(), dir_fd=current)
             except FileNotFoundError:
                 try:
                     os.mkdir(part, 0o755, dir_fd=current)
                 except FileExistsError:
                     pass
                 try:
-                    next_descriptor = os.open(part, directory_flags, dir_fd=current)
+                    next_descriptor = os.open(part, _directory_flags(), dir_fd=current)
                 except OSError as exc:
                     raise ValueError(
                         f"destination parent must be a real directory: {path}"
@@ -497,47 +575,141 @@ def _ensure_real_directory(path: str) -> None:
                 ) from exc
             os.close(current)
             current = next_descriptor
-    finally:
+        return current
+    except Exception:
         os.close(current)
+        raise
 
 
-def _make_tree_removable(root: str) -> None:
-    for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
-        current_info = os.lstat(current)
-        if stat.S_ISDIR(current_info.st_mode):
-            os.chmod(current, 0o700)
-        safe_dirs: list[str] = []
-        for name in dirs:
-            full = os.path.join(current, name)
-            info = os.lstat(full)
-            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
-                safe_dirs.append(name)
-        dirs[:] = safe_dirs
-        for name in files:
-            full = os.path.join(current, name)
-            info = os.lstat(full)
-            if stat.S_ISREG(info.st_mode):
-                os.chmod(full, 0o600)
+def _same_filesystem_object(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        left.st_dev,
+        left.st_ino,
+        stat.S_IFMT(left.st_mode),
+    ) == (
+        right.st_dev,
+        right.st_ino,
+        stat.S_IFMT(right.st_mode),
+    )
 
 
-def _prepare_judge_dirs(judge_root: str) -> tuple[str, str, str]:
+def _remove_directory_at(parent_descriptor: int, name: str) -> None:
+    before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+        raise ValueError(f"refusing to remove non-directory entry: {name}")
+    try:
+        directory_descriptor = os.open(name, _directory_flags(), dir_fd=parent_descriptor)
+    except OSError as exc:
+        raise ValueError(f"refusing to follow directory during cleanup: {name}") from exc
+    try:
+        opened = os.fstat(directory_descriptor)
+        if not _same_filesystem_object(before, opened):
+            raise ValueError(f"directory changed during cleanup: {name}")
+        os.fchmod(directory_descriptor, 0o700)
+        with os.scandir(directory_descriptor) as entries:
+            child_names = sorted(entry.name for entry in entries)
+        for child_name in child_names:
+            child_info = os.stat(
+                child_name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            if stat.S_ISDIR(child_info.st_mode) and not stat.S_ISLNK(child_info.st_mode):
+                _remove_directory_at(directory_descriptor, child_name)
+            else:
+                os.unlink(child_name, dir_fd=directory_descriptor)
+        current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if not stat.S_ISDIR(current.st_mode) or not _same_filesystem_object(opened, current):
+            raise ValueError(f"directory changed during cleanup: {name}")
+    finally:
+        os.close(directory_descriptor)
+    os.rmdir(name, dir_fd=parent_descriptor)
+
+
+def _open_created_directory(parent_descriptor: int, name: str, mode: int) -> int:
+    os.mkdir(name, mode, dir_fd=parent_descriptor)
+    descriptor = os.open(name, _directory_flags(), dir_fd=parent_descriptor)
+    named = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    opened = os.fstat(descriptor)
+    if not stat.S_ISDIR(named.st_mode) or not _same_filesystem_object(named, opened):
+        os.close(descriptor)
+        raise ValueError(f"created directory changed unexpectedly: {name}")
+    return descriptor
+
+
+def _validate_absolute_directory_identity(path: str, expected_descriptor: int) -> None:
+    current_descriptor = _open_absolute_directory(path)
+    try:
+        if not _same_filesystem_object(
+            os.fstat(expected_descriptor),
+            os.fstat(current_descriptor),
+        ):
+            raise ValueError(f"directory path changed after validation: {path}")
+    finally:
+        os.close(current_descriptor)
+
+
+def _prepare_judge_dirs(judge_root: str) -> _JudgeDirs:
     judge_root = os.path.abspath(os.fspath(judge_root))
     parent = os.path.dirname(judge_root)
-    _ensure_real_directory(parent)
-    if os.path.lexists(judge_root):
-        info = os.lstat(judge_root)
-        if stat.S_ISLNK(info.st_mode):
-            raise ValueError(f"judge root must not be a symlink: {judge_root}")
-        if not stat.S_ISDIR(info.st_mode):
-            raise ValueError(f"judge root must be a directory: {judge_root}")
-        _make_tree_removable(judge_root)
-        shutil.rmtree(judge_root)
-    os.mkdir(judge_root, 0o755)
+    root_name = os.path.basename(judge_root)
+    if not root_name:
+        raise ValueError("judge root must not be the filesystem root")
+    parent_descriptor = _ensure_real_directory(parent)
+    root_descriptor = -1
+    evidence_descriptor = -1
+    scratch_descriptor = -1
+    created_root = False
+    try:
+        try:
+            existing = os.stat(
+                root_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            if stat.S_ISLNK(existing.st_mode):
+                raise ValueError(f"judge root must not be a symlink: {judge_root}")
+            if not stat.S_ISDIR(existing.st_mode):
+                raise ValueError(f"judge root must be a directory: {judge_root}")
+            _remove_directory_at(parent_descriptor, root_name)
+        root_descriptor = _open_created_directory(parent_descriptor, root_name, 0o755)
+        created_root = True
+        evidence_descriptor = _open_created_directory(root_descriptor, "evidence", 0o700)
+        scratch_descriptor = _open_created_directory(root_descriptor, "scratch", 0o700)
+        _validate_absolute_directory_identity(parent, parent_descriptor)
+        named_root = os.stat(
+            root_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not _same_filesystem_object(named_root, os.fstat(root_descriptor)):
+            raise ValueError("judge root changed after creation")
+    except Exception:
+        for descriptor in (scratch_descriptor, evidence_descriptor, root_descriptor):
+            if descriptor >= 0:
+                os.close(descriptor)
+        if created_root:
+            try:
+                _remove_directory_at(parent_descriptor, root_name)
+            except (FileNotFoundError, ValueError, OSError):
+                pass
+        os.close(parent_descriptor)
+        raise
     evidence = os.path.join(judge_root, "evidence")
     scratch = os.path.join(judge_root, "scratch")
-    os.mkdir(evidence, 0o700)
-    os.mkdir(scratch, 0o700)
-    return judge_root, evidence, scratch
+    return _JudgeDirs(
+        root_path=judge_root,
+        evidence_path=evidence,
+        scratch_path=scratch,
+        root_name=root_name,
+        parent_descriptor=parent_descriptor,
+        root_descriptor=root_descriptor,
+        evidence_descriptor=evidence_descriptor,
+        scratch_descriptor=scratch_descriptor,
+    )
 
 
 def _open_relative_file(root_descriptor: int, parts: tuple[str, ...]) -> int:
@@ -660,15 +832,47 @@ def _copy_validated_file(
         raise ValueError(f"copied evidence must be a single-link regular file: {rel}")
 
 
-def _lock_evidence_directories(evidence: str) -> None:
-    for current, dirs, _files in os.walk(evidence, topdown=False, followlinks=False):
-        for name in dirs:
-            full = os.path.join(current, name)
-            info = os.lstat(full)
-            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
-                raise RuntimeError(f"invalid evidence directory after copy: {full}")
-            os.chmod(full, 0o555)
-        os.chmod(current, 0o555)
+def _lock_evidence_directories(evidence_descriptor: int) -> None:
+    with os.scandir(evidence_descriptor) as entries:
+        names = sorted(entry.name for entry in entries)
+    for name in names:
+        before = os.stat(name, dir_fd=evidence_descriptor, follow_symlinks=False)
+        if stat.S_ISLNK(before.st_mode):
+            raise RuntimeError(f"symlink appeared while locking evidence: {name}")
+        if stat.S_ISDIR(before.st_mode):
+            child_descriptor = os.open(name, _directory_flags(), dir_fd=evidence_descriptor)
+            try:
+                opened = os.fstat(child_descriptor)
+                if not _same_filesystem_object(before, opened):
+                    raise RuntimeError(f"evidence directory changed while locking: {name}")
+                _lock_evidence_directories(child_descriptor)
+                current = os.stat(
+                    name,
+                    dir_fd=evidence_descriptor,
+                    follow_symlinks=False,
+                )
+                if not stat.S_ISDIR(current.st_mode) or not _same_filesystem_object(
+                    opened,
+                    current,
+                ):
+                    raise RuntimeError(f"evidence directory changed while locking: {name}")
+            finally:
+                os.close(child_descriptor)
+            continue
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError(f"non-regular evidence appeared while locking: {name}")
+        file_descriptor = os.open(name, _file_flags(), dir_fd=evidence_descriptor)
+        try:
+            opened = os.fstat(file_descriptor)
+            if (
+                not _same_filesystem_object(before, opened)
+                or opened.st_nlink != 1
+            ):
+                raise RuntimeError(f"evidence file changed while locking: {name}")
+            os.fchmod(file_descriptor, 0o444)
+        finally:
+            os.close(file_descriptor)
+    os.fchmod(evidence_descriptor, 0o555)
 
 
 def create_evidence_snapshot(
@@ -682,8 +886,6 @@ def create_evidence_snapshot(
     if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
         raise ValueError("max_bytes must be a non-negative integer")
     work_dir = os.path.abspath(os.fspath(work_dir))
-    if os.path.realpath(work_dir) != work_dir:
-        raise ValueError(f"artifact workspace path contains a symlink: {work_dir}")
 
     selected: list[tuple[dict, tuple[str, ...]]] = []
     seen: set[str] = set()
@@ -698,14 +900,13 @@ def create_evidence_snapshot(
         selected.append((row, parts))
     selected.sort(key=lambda item: "/".join(item[1]))
 
-    prepared_root, evidence, scratch = _prepare_judge_dirs(judge_root)
-    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    work_descriptor = -1
-    evidence_descriptor = -1
+    work_descriptor = _open_absolute_directory(work_dir)
+    prepared: _JudgeDirs | None = None
     validated_sources: list[tuple[dict, tuple[str, ...], int, os.stat_result]] = []
     try:
-        work_descriptor = os.open(work_dir, directory_flags)
-        evidence_descriptor = os.open(evidence, directory_flags)
+        prepared = _prepare_judge_dirs(judge_root)
+        evidence = prepared.evidence_path
+        scratch = prepared.scratch_path
         total_bytes = 0
         for row, parts in selected:
             rel = "/".join(parts)
@@ -723,7 +924,10 @@ def create_evidence_snapshot(
 
         for row, parts, source_descriptor, info in validated_sources:
             rel = "/".join(parts)
-            destination_descriptor = _open_destination_file(evidence_descriptor, parts)
+            destination_descriptor = _open_destination_file(
+                prepared.evidence_descriptor,
+                parts,
+            )
             try:
                 _copy_validated_file(
                     source_descriptor,
@@ -736,16 +940,21 @@ def create_evidence_snapshot(
             finally:
                 os.close(destination_descriptor)
 
-        evidence_rows, evidence_directories = _scan_manifest(
-            evidence,
+        evidence_rows, evidence_directories = _scan_manifest_descriptor(
+            prepared.evidence_descriptor,
             skip_runtime=False,
             require_single_link=True,
         )
         entries = tuple(evidence_rows.values())
         if evidence_directories != _manifest_directories(entries):
             raise RuntimeError("unexpected directory in copied evidence")
-        manifest_path = os.path.join(scratch, "artifact-manifest.json")
-        with open(manifest_path, "w", encoding="utf-8") as handle:
+        manifest_descriptor = os.open(
+            "artifact-manifest.json",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=prepared.scratch_descriptor,
+        )
+        with os.fdopen(manifest_descriptor, "w", encoding="utf-8") as handle:
             json.dump(
                 [asdict(entry) for entry in entries],
                 handle,
@@ -754,25 +963,41 @@ def create_evidence_snapshot(
                 indent=2,
             )
             handle.write("\n")
-        _lock_evidence_directories(evidence)
+        _lock_evidence_directories(prepared.evidence_descriptor)
+        final_rows, final_directories = _scan_manifest_descriptor(
+            prepared.evidence_descriptor,
+            skip_runtime=False,
+            require_single_link=True,
+            required_file_mode=0o444,
+            required_directory_mode=0o555,
+        )
+        final_entries = tuple(final_rows.values())
+        if (
+            final_entries != entries
+            or final_directories != evidence_directories
+            or final_directories != _manifest_directories(final_entries)
+        ):
+            raise RuntimeError("evidence changed while snapshot was finalized")
         return EvidenceSnapshot(
             evidence_dir=evidence,
             scratch_dir=scratch,
-            tree_hash=_tree_hash(entries),
-            files=entries,
+            tree_hash=_tree_hash(final_entries),
+            files=final_entries,
         )
     except Exception:
-        if os.path.isdir(prepared_root):
-            _make_tree_removable(prepared_root)
-            shutil.rmtree(prepared_root)
+        if prepared is not None:
+            try:
+                _remove_directory_at(prepared.parent_descriptor, prepared.root_name)
+            except (FileNotFoundError, ValueError, OSError):
+                pass
         raise
     finally:
         for _row, _parts, source_descriptor, _info in validated_sources:
             os.close(source_descriptor)
-        if evidence_descriptor >= 0:
-            os.close(evidence_descriptor)
         if work_descriptor >= 0:
             os.close(work_descriptor)
+        if prepared is not None:
+            prepared.close()
 
 
 def verify_evidence_snapshot(snapshot: EvidenceSnapshot) -> None:
@@ -782,6 +1007,8 @@ def verify_evidence_snapshot(snapshot: EvidenceSnapshot) -> None:
             snapshot.evidence_dir,
             skip_runtime=False,
             require_single_link=True,
+            required_file_mode=0o444,
+            required_directory_mode=0o555,
         )
         current = tuple(current_rows.values())
     except Exception as exc:

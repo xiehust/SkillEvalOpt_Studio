@@ -1,7 +1,6 @@
 """Artifact manifest and immutable evidence tests for SkillEval."""
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import stat
@@ -140,7 +139,7 @@ class TestManifest:
 
         assert build_manifest(str(root)) == {}
 
-    def test_parent_symlink_swap_cannot_change_manifest_snapshot(
+    def test_parent_symlink_swap_is_rejected(
         self, tmp_path, monkeypatch
     ) -> None:
         root = tmp_path / "work"
@@ -164,11 +163,46 @@ class TestManifest:
             return real_open(path, flags, *args, **kwargs)
 
         monkeypatch.setattr(artifacts_mod.os, "open", racing_open)
-        manifest = build_manifest(str(root))
 
+        with pytest.raises(ValueError, match="changed|symlink"):
+            build_manifest(str(root))
         assert swapped is True
-        assert manifest["nested/report.pdf"].sha256 == hashlib.sha256(original).hexdigest()
-        assert manifest["nested/report.pdf"].kind == "pdf"
+
+    def test_directory_symlink_inserted_after_traversal_is_rejected(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        root = tmp_path / "work"
+        nested = root / "nested"
+        nested.mkdir(parents=True)
+        (nested / "report.pdf").write_bytes(b"%PDF-1.4\n")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        moved = tmp_path / "original-nested"
+        real_manifest_entry = artifacts_mod._manifest_entry_from_descriptor
+        swapped = False
+
+        def racing_manifest_entry(descriptor, rel, *, require_single_link):
+            nonlocal swapped
+            entry = real_manifest_entry(
+                descriptor,
+                rel,
+                require_single_link=require_single_link,
+            )
+            if rel == "nested/report.pdf" and not swapped:
+                os.rename(nested, moved)
+                os.symlink(outside, nested, target_is_directory=True)
+                swapped = True
+            return entry
+
+        monkeypatch.setattr(
+            artifacts_mod,
+            "_manifest_entry_from_descriptor",
+            racing_manifest_entry,
+        )
+
+        with pytest.raises(ValueError, match="changed|symlink"):
+            build_manifest(str(root))
+        assert swapped is True
 
 
 class TestArtifactKind:
@@ -384,6 +418,51 @@ class TestEvidenceSnapshot:
                 str(work), outputs, str(tmp_path / "judge"), max_bytes=1024
             )
 
+    def test_workspace_ancestor_swap_cannot_copy_outside_file(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        workspace_parent = tmp_path / "workspace-parent"
+        work = workspace_parent / "work"
+        work.mkdir(parents=True)
+        (work / "report.pdf").write_bytes(b"%PDF-1.4\noriginal")
+        outside_parent = tmp_path / "outside-parent"
+        outside_work = outside_parent / "work"
+        outside_work.mkdir(parents=True)
+        (outside_work / "report.pdf").write_bytes(b"%PDF-1.4\noutside")
+        outside_entry = build_manifest(str(outside_work))["report.pdf"]
+        outputs = [
+            {
+                "path": outside_entry.path,
+                "size": outside_entry.size,
+                "sha256": outside_entry.sha256,
+                "mime": outside_entry.mime,
+                "kind": outside_entry.kind,
+                "change": "created",
+            }
+        ]
+        moved_parent = tmp_path / "original-workspace-parent"
+        real_prepare = artifacts_mod._prepare_judge_dirs
+        swapped = False
+
+        def racing_prepare(judge_root):
+            nonlocal swapped
+            os.rename(workspace_parent, moved_parent)
+            os.symlink(outside_parent, workspace_parent, target_is_directory=True)
+            swapped = True
+            return real_prepare(judge_root)
+
+        monkeypatch.setattr(
+            artifacts_mod,
+            "_prepare_judge_dirs",
+            racing_prepare,
+        )
+
+        with pytest.raises(ValueError, match="mismatch"):
+            create_evidence_snapshot(
+                str(work), outputs, str(tmp_path / "judge"), max_bytes=1024
+            )
+        assert swapped is True
+
     def test_rejects_path_escape(self, tmp_path) -> None:
         work = tmp_path / "work"
         work.mkdir()
@@ -536,6 +615,49 @@ class TestEvidenceSnapshot:
             )
         assert not (victim / "created-through-link").exists()
 
+    def test_judge_parent_swap_cannot_delete_outside_victim(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        work = tmp_path / "work"
+        work.mkdir()
+        outputs = _outputs_after(
+            work, lambda: (work / "report.pdf").write_bytes(b"%PDF-1.4\n")
+        )
+        anchor = tmp_path / "anchor"
+        parent = anchor / "parent"
+        stale_judge = parent / "judge"
+        stale_judge.mkdir(parents=True)
+        (stale_judge / "stale.txt").write_text("stale", encoding="utf-8")
+        moved_parent = anchor / "original-parent"
+        victim_parent = tmp_path / "victim-parent"
+        victim_judge = victim_parent / "judge"
+        victim_judge.mkdir(parents=True)
+        victim_file = victim_judge / "keep.txt"
+        victim_file.write_text("keep", encoding="utf-8")
+        real_ensure = artifacts_mod._ensure_real_directory
+        swapped = False
+
+        def racing_ensure(path):
+            nonlocal swapped
+            descriptor = real_ensure(path)
+            os.rename(parent, moved_parent)
+            os.symlink(victim_parent, parent, target_is_directory=True)
+            swapped = True
+            return descriptor
+
+        monkeypatch.setattr(
+            artifacts_mod,
+            "_ensure_real_directory",
+            racing_ensure,
+        )
+
+        with pytest.raises(ValueError, match="changed|symlink|directory"):
+            create_evidence_snapshot(
+                str(work), outputs, str(parent / "judge"), max_bytes=1024
+            )
+        assert swapped is True
+        assert victim_file.read_text(encoding="utf-8") == "keep"
+
     def test_detects_evidence_content_and_path_mutation(self, tmp_path) -> None:
         work = tmp_path / "work"
         work.mkdir()
@@ -609,3 +731,63 @@ class TestEvidenceSnapshot:
 
         with pytest.raises(RuntimeError, match="evidence changed"):
             verify_evidence_snapshot(snapshot)
+
+    def test_detects_evidence_file_mode_mutation(self, tmp_path) -> None:
+        work = tmp_path / "work"
+        work.mkdir()
+        outputs = _outputs_after(
+            work, lambda: (work / "report.pdf").write_bytes(b"%PDF-1.4\n")
+        )
+        snapshot = create_evidence_snapshot(
+            str(work), outputs, str(tmp_path / "judge"), max_bytes=1024
+        )
+        os.chmod(tmp_path / "judge" / "evidence" / "report.pdf", 0o644)
+
+        with pytest.raises(RuntimeError, match="evidence changed"):
+            verify_evidence_snapshot(snapshot)
+
+    def test_detects_evidence_directory_mode_mutation(self, tmp_path) -> None:
+        work = tmp_path / "work"
+        work.mkdir()
+        outputs = _outputs_after(
+            work, lambda: (work / "report.pdf").write_bytes(b"%PDF-1.4\n")
+        )
+        snapshot = create_evidence_snapshot(
+            str(work), outputs, str(tmp_path / "judge"), max_bytes=1024
+        )
+        os.chmod(tmp_path / "judge" / "evidence", 0o755)
+
+        with pytest.raises(RuntimeError, match="evidence changed"):
+            verify_evidence_snapshot(snapshot)
+
+    def test_rejects_destination_hard_link_added_during_directory_lock(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        work = tmp_path / "work"
+        work.mkdir()
+        outputs = _outputs_after(
+            work, lambda: (work / "report.pdf").write_bytes(b"%PDF-1.4\n")
+        )
+        judge_root = tmp_path / "judge"
+        late_link = tmp_path / "late-evidence-link.pdf"
+        real_fchmod = artifacts_mod.os.fchmod
+        linked = False
+
+        def racing_fchmod(descriptor, mode):
+            nonlocal linked
+            if mode == 0o555 and stat.S_ISDIR(os.fstat(descriptor).st_mode) and not linked:
+                os.link(judge_root / "evidence" / "report.pdf", late_link)
+                linked = True
+            return real_fchmod(descriptor, mode)
+
+        monkeypatch.setattr(
+            artifacts_mod.os,
+            "fchmod",
+            racing_fchmod,
+        )
+
+        with pytest.raises((ValueError, RuntimeError), match="single-link|changed"):
+            create_evidence_snapshot(
+                str(work), outputs, str(judge_root), max_bytes=1024
+            )
+        assert linked is True
