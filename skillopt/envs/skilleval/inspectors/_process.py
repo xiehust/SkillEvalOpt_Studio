@@ -1,12 +1,16 @@
 """Bounded subprocess execution for trusted inspector adapters."""
 from __future__ import annotations
 
+import json
 import math
 import os
+from pathlib import Path
 import signal
 import subprocess
+import sys
 import threading
 
+from ._scratch import current_scratch_transaction
 from .base import (
     MAX_COMMAND_OUTPUT_CHARS,
     MAX_COMMAND_TIMEOUT_SECONDS,
@@ -47,14 +51,117 @@ def _decode_output(chunks: list[bytes], total: int) -> str:
     return captured
 
 
+def _validate_directory(path: str, label: str) -> str:
+    absolute = _absolute_path(path, label)
+    transaction = current_scratch_transaction()
+    if transaction is not None and absolute == transaction.proc_path:
+        if not os.path.isdir(absolute):
+            raise InspectionError(f"{label} transaction is unavailable")
+        return absolute
+    descriptor = _open_real_directory(absolute, label)
+    os.close(descriptor)
+    return absolute
+
+
+def _supervisor_config(
+    command: list[str],
+    *,
+    timeout: int | float,
+    cwd: str,
+    home: str,
+    pass_fds: tuple[int, ...],
+) -> tuple[dict, tuple[int, ...]]:
+    transaction = current_scratch_transaction()
+    inherited = set(pass_fds)
+    config = {
+        "command": command,
+        "timeout": timeout,
+        "cwd": cwd,
+        "home": home,
+        "path_env": os.environ.get("PATH", "/usr/bin:/bin"),
+        "transaction_fd": None,
+        "pass_fds": [],
+    }
+    if transaction is not None:
+        inherited.add(transaction.descriptor)
+        config.update(
+            {
+                "transaction_fd": transaction.descriptor,
+                "max_file_bytes": transaction.remaining_bytes(),
+                "max_scratch_bytes": transaction.limits.max_bytes,
+                "max_scratch_entries": transaction.limits.max_entries,
+                "max_scratch_depth": transaction.limits.max_depth,
+            }
+        )
+    config["pass_fds"] = sorted(inherited)
+    return config, tuple(sorted(inherited))
+
+
+def _start_supervisor(
+    config: dict,
+    inherited_fds: tuple[int, ...],
+) -> tuple[subprocess.Popen[bytes], int]:
+    config_read, config_write = os.pipe()
+    status_read, status_write = os.pipe()
+    supervisor_script = Path(__file__).with_name("_supervisor.py")
+    repo_root = str(Path(__file__).resolve().parents[4])
+    supervisor_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": config["home"],
+        "LANG": "C.UTF-8",
+        "PYTHONPATH": repo_root,
+    }
+    try:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(supervisor_script),
+                str(config_read),
+                str(status_write),
+            ],
+            cwd=os.path.abspath(os.sep),
+            env=supervisor_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            close_fds=True,
+            pass_fds=(
+                config_read,
+                status_write,
+                *inherited_fds,
+            ),
+            start_new_session=True,
+        )
+    except Exception:
+        os.close(config_read)
+        os.close(config_write)
+        os.close(status_read)
+        os.close(status_write)
+        raise
+    os.close(config_read)
+    os.close(status_write)
+    try:
+        payload = json.dumps(config, separators=(",", ":")).encode("utf-8")
+        with os.fdopen(config_write, "wb", closefd=True) as destination:
+            destination.write(payload)
+    except Exception:
+        process.terminate()
+        process.wait()
+        os.close(status_read)
+        raise
+    return process, status_read
+
+
 def safe_run(
     command: list[str],
     *,
     timeout: int | float = 120,
     cwd: str,
     home: str,
+    pass_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
-    """Run a fixed argv with a minimal environment and bounded diagnostics."""
+    """Run argv under a subreaper supervisor and bounded environment."""
     if (
         not isinstance(command, list)
         or not command
@@ -72,28 +179,27 @@ def safe_run(
         or timeout > MAX_COMMAND_TIMEOUT_SECONDS
     ):
         raise InspectionError("command timeout must be positive and bounded")
-    cwd = _absolute_path(cwd, "command cwd")
-    home = _absolute_path(home, "command home")
-    cwd_fd = _open_real_directory(cwd, "command cwd")
-    home_fd = _open_real_directory(home, "command home")
-    os.close(home_fd)
-    os.close(cwd_fd)
-    env = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "HOME": home,
-        "LANG": "C.UTF-8",
-    }
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            start_new_session=True,
+    if (
+        not isinstance(pass_fds, tuple)
+        or any(
+            isinstance(descriptor, bool)
+            or not isinstance(descriptor, int)
+            or descriptor < 0
+            for descriptor in pass_fds
         )
+    ):
+        raise InspectionError("pass_fds must contain valid descriptors")
+    cwd = _validate_directory(cwd, "command cwd")
+    home = _validate_directory(home, "command home")
+    config, inherited_fds = _supervisor_config(
+        command,
+        timeout=timeout,
+        cwd=cwd,
+        home=home,
+        pass_fds=pass_fds,
+    )
+    try:
+        process, status_fd = _start_supervisor(config, inherited_fds)
     except OSError as exc:
         raise InspectionError(
             "inspector command could not start: "
@@ -132,41 +238,61 @@ def safe_run(
     for reader in readers:
         reader.start()
 
-    timed_out = False
     try:
-        returncode = process.wait(timeout=timeout)
+        process.wait(timeout=timeout + 8)
     except subprocess.TimeoutExpired:
-        timed_out = True
-        returncode = None
-    finally:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
-        if process.poll() is None:
+        try:
+            process.wait(timeout=4)
+        except subprocess.TimeoutExpired:
             try:
-                returncode = process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                returncode = process.wait()
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
     for reader in readers:
         reader.join(timeout=2)
     if any(reader.is_alive() for reader in readers):
+        os.close(status_fd)
         raise InspectionError(
             "inspector command output reader did not finish"
         )
     if reader_errors:
+        os.close(status_fd)
         raise InspectionError(
             "inspector command output could not be read: "
             f"{bounded_diagnostic(reader_errors[0])}"
         )
     stdout = _decode_output(stdout_chunks, stdout_total[0])
     stderr = _decode_output(stderr_chunks, stderr_total[0])
+    with os.fdopen(status_fd, "rb", closefd=True) as source:
+        status_data = source.read()
+    try:
+        status = json.loads(status_data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InspectionError(
+            "inspector supervisor returned an invalid status"
+        ) from exc
 
-    if timed_out:
+    reason = status.get("reason")
+    if reason == "timeout":
         raise InspectionError(
             f"inspector command timed out after {timeout} seconds"
         )
+    if reason == "start":
+        raise InspectionError(
+            "inspector command could not start: "
+            f"{bounded_diagnostic(status.get('detail', ''))}"
+        )
+    if reason is not None:
+        raise InspectionError(
+            f"inspector command {reason} failure: "
+            f"{bounded_diagnostic(status.get('detail', ''))}"
+        )
+    returncode = status.get("returncode")
     completed = subprocess.CompletedProcess(
         command,
         int(returncode),

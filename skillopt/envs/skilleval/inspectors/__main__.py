@@ -15,11 +15,15 @@ from .base import (
     DEFAULT_EXTRACT_CHARS,
     DEFAULT_RESPONSE_BYTES,
     DEFAULT_SCRATCH_BYTES,
+    DEFAULT_SCRATCH_DEPTH,
+    DEFAULT_SCRATCH_ENTRIES,
     InspectionError,
     MAX_EXTRACT_CHARS,
     MAX_RENDER_PIXELS,
     MAX_RESPONSE_BYTES,
     MAX_SCRATCH_BYTES,
+    MAX_SCRATCH_DEPTH,
+    MAX_SCRATCH_ENTRIES,
     MIN_RESPONSE_BYTES,
     bounded_diagnostic,
     normalize_selectors,
@@ -86,6 +90,16 @@ def _add_roots(parser: argparse.ArgumentParser) -> None:
         "--max-scratch-bytes",
         type=_bounded_int("max scratch bytes", MAX_SCRATCH_BYTES),
         default=DEFAULT_SCRATCH_BYTES,
+    )
+    parser.add_argument(
+        "--max-scratch-entries",
+        type=_bounded_int("max scratch entries", MAX_SCRATCH_ENTRIES),
+        default=DEFAULT_SCRATCH_ENTRIES,
+    )
+    parser.add_argument(
+        "--max-scratch-depth",
+        type=_bounded_int("max scratch depth", MAX_SCRATCH_DEPTH),
+        default=DEFAULT_SCRATCH_DEPTH,
     )
 
 
@@ -234,6 +248,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.scratch,
                 max_response_bytes=args.max_response_bytes,
                 max_scratch_bytes=args.max_scratch_bytes,
+                max_scratch_entries=args.max_scratch_entries,
+                max_scratch_depth=args.max_scratch_depth,
             )
         elif args.command == "inspect":
             normalize_selectors(args.selector)
@@ -243,6 +259,8 @@ def main(argv: list[str] | None = None) -> int:
                 scratch_dir=args.scratch,
                 max_response_bytes=args.max_response_bytes,
                 max_scratch_bytes=args.max_scratch_bytes,
+                max_scratch_entries=args.max_scratch_entries,
+                max_scratch_depth=args.max_scratch_depth,
             )
         elif args.command == "render":
             result = render_artifact(
@@ -253,6 +271,8 @@ def main(argv: list[str] | None = None) -> int:
                 max_pixels=args.max_pixels,
                 max_response_bytes=args.max_response_bytes,
                 max_scratch_bytes=args.max_scratch_bytes,
+                max_scratch_entries=args.max_scratch_entries,
+                max_scratch_depth=args.max_scratch_depth,
             )
         else:
             result = extract_artifact(
@@ -263,6 +283,8 @@ def main(argv: list[str] | None = None) -> int:
                 max_extract_chars=args.max_extract_chars,
                 max_response_bytes=args.max_response_bytes,
                 max_scratch_bytes=args.max_scratch_bytes,
+                max_scratch_entries=args.max_scratch_entries,
+                max_scratch_depth=args.max_scratch_depth,
             )
         output = _serialize(
             {"status": "ok", "result": result},

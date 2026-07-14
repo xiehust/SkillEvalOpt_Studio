@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import os
-import secrets
 import stat
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Iterator
 
-from ._scratch import ScratchGuard
+from ._scratch import ScratchTransaction
 from .base import (
     InspectionError,
     _absolute_path,
@@ -23,8 +23,15 @@ _CREATE_FLAGS = (
     | os.O_EXCL
     | getattr(os, "O_NOFOLLOW", 0)
 )
-_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+_FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
 _COPY_CHUNK_BYTES = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class StagedEvidence:
+    detection_path: str
+    inspector_path: str
+    descriptor: int
 
 
 def _same_object(left: os.stat_result, right: os.stat_result) -> bool:
@@ -133,26 +140,6 @@ def _open_evidence_file(evidence_dir: str, logical_path: str) -> int:
         os.close(descriptor)
 
 
-def _create_stage_directory(scratch_descriptor: int) -> tuple[str, int]:
-    for _attempt in range(16):
-        name = f".skillopt-input-{secrets.token_hex(12)}"
-        try:
-            os.mkdir(name, 0o700, dir_fd=scratch_descriptor)
-        except FileExistsError:
-            continue
-        try:
-            descriptor = os.open(
-                name,
-                _DIRECTORY_FLAGS,
-                dir_fd=scratch_descriptor,
-            )
-        except Exception:
-            os.rmdir(name, dir_fd=scratch_descriptor)
-            raise
-        return name, descriptor
-    raise InspectionError("could not allocate a scratch staging directory")
-
-
 def _write_all(descriptor: int, data: bytes) -> None:
     view = memoryview(data)
     while view:
@@ -212,29 +199,21 @@ def _copy_stable(
 def staged_evidence_path(
     evidence_dir: str,
     logical_path: str,
-    scratch_dir: str,
-    scratch_guard: ScratchGuard,
-) -> Iterator[str]:
-    """Yield a controlled read-only copy made from a stable evidence fd."""
+    transaction: ScratchTransaction,
+) -> Iterator[StagedEvidence]:
+    """Yield a procfd path whose evidence descriptor stays open."""
     parts = validate_logical_path(logical_path)
     source = _open_evidence_file(evidence_dir, logical_path)
-    stage_name = ""
-    stage_descriptor = -1
     destination = -1
+    stable = -1
     basename = parts[-1]
-    stage_info: os.stat_result | None = None
     try:
-        remaining = scratch_guard.remaining_bytes()
-        stage_name, stage_descriptor = _create_stage_directory(
-            scratch_guard.descriptor
-        )
-        stage_info = os.fstat(stage_descriptor)
         try:
             destination = os.open(
                 basename,
                 _CREATE_FLAGS,
                 0o600,
-                dir_fd=stage_descriptor,
+                dir_fd=transaction.descriptor,
             )
         except OSError as exc:
             raise InspectionError(
@@ -244,54 +223,28 @@ def staged_evidence_path(
         _copy_stable(
             source,
             destination,
-            remaining_bytes=remaining,
+            remaining_bytes=transaction.remaining_bytes(),
             logical_path=logical_path,
         )
         os.fchmod(destination, 0o400)
+        written = os.fstat(destination)
         os.close(destination)
         destination = -1
-        yield os.path.join(
-            _absolute_path(scratch_dir, "scratch root"),
-            stage_name,
+        stable = os.open(
             basename,
+            _FILE_FLAGS,
+            dir_fd=transaction.descriptor,
+        )
+        if not _same_object(written, os.fstat(stable)):
+            raise InspectionError("staged evidence changed before inspection")
+        yield StagedEvidence(
+            detection_path=f"{transaction.proc_path}/{basename}",
+            inspector_path=f"/proc/self/fd/{stable}",
+            descriptor=stable,
         )
     finally:
+        if stable >= 0:
+            os.close(stable)
         if destination >= 0:
             os.close(destination)
         os.close(source)
-        cleanup_error: Exception | None = None
-        if stage_descriptor >= 0:
-            try:
-                try:
-                    os.unlink(basename, dir_fd=stage_descriptor)
-                except FileNotFoundError:
-                    pass
-            except OSError as exc:
-                cleanup_error = exc
-            os.close(stage_descriptor)
-        if stage_name and stage_info is not None:
-            try:
-                current = os.stat(
-                    stage_name,
-                    dir_fd=scratch_guard.descriptor,
-                    follow_symlinks=False,
-                )
-                if not stat.S_ISDIR(current.st_mode) or not _same_object(
-                    stage_info,
-                    current,
-                ):
-                    raise InspectionError(
-                        "scratch staging directory changed during inspection"
-                    )
-                os.rmdir(stage_name, dir_fd=scratch_guard.descriptor)
-            except FileNotFoundError:
-                cleanup_error = cleanup_error or InspectionError(
-                    "scratch staging directory disappeared during inspection"
-                )
-            except (OSError, InspectionError) as exc:
-                cleanup_error = cleanup_error or exc
-        if cleanup_error is not None:
-            raise InspectionError(
-                "scratch staging cleanup failed: "
-                f"{bounded_diagnostic(cleanup_error)}"
-            ) from cleanup_error

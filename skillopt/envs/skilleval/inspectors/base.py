@@ -18,8 +18,12 @@ MIN_RESPONSE_BYTES = 512
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 DEFAULT_EXTRACT_CHARS = 500_000
 MAX_EXTRACT_CHARS = 4_000_000
-DEFAULT_SCRATCH_BYTES = 512 * 1024 * 1024
+DEFAULT_SCRATCH_BYTES = 1024 * 1024 * 1024
 MAX_SCRATCH_BYTES = 4 * 1024 * 1024 * 1024
+DEFAULT_SCRATCH_ENTRIES = 4_096
+MAX_SCRATCH_ENTRIES = 100_000
+DEFAULT_SCRATCH_DEPTH = 32
+MAX_SCRATCH_DEPTH = 64
 MAX_COMMAND_OUTPUT_CHARS = 64_000
 MAX_SELECTORS = 256
 MAX_SELECTOR_CHARS = 256
@@ -58,6 +62,8 @@ class RenderBudget:
 
     max_pixels: int = MAX_RENDER_PIXELS
     max_scratch_bytes: int = DEFAULT_SCRATCH_BYTES
+    max_scratch_entries: int = DEFAULT_SCRATCH_ENTRIES
+    max_scratch_depth: int = DEFAULT_SCRATCH_DEPTH
 
     def __post_init__(self) -> None:
         _positive_int(self.max_pixels, "render pixel", MAX_RENDER_PIXELS)
@@ -65,6 +71,16 @@ class RenderBudget:
             self.max_scratch_bytes,
             "scratch byte",
             MAX_SCRATCH_BYTES,
+        )
+        _positive_int(
+            self.max_scratch_entries,
+            "scratch entry",
+            MAX_SCRATCH_ENTRIES,
+        )
+        _positive_int(
+            self.max_scratch_depth,
+            "scratch depth",
+            MAX_SCRATCH_DEPTH,
         )
 
 
@@ -75,6 +91,8 @@ class ResponseBudget:
     max_bytes: int = DEFAULT_RESPONSE_BYTES
     max_extract_chars: int = DEFAULT_EXTRACT_CHARS
     max_scratch_bytes: int = DEFAULT_SCRATCH_BYTES
+    max_scratch_entries: int = DEFAULT_SCRATCH_ENTRIES
+    max_scratch_depth: int = DEFAULT_SCRATCH_DEPTH
 
     def __post_init__(self) -> None:
         _positive_int(self.max_bytes, "response byte", MAX_RESPONSE_BYTES)
@@ -91,6 +109,16 @@ class ResponseBudget:
             self.max_scratch_bytes,
             "scratch byte",
             MAX_SCRATCH_BYTES,
+        )
+        _positive_int(
+            self.max_scratch_entries,
+            "scratch entry",
+            MAX_SCRATCH_ENTRIES,
+        )
+        _positive_int(
+            self.max_scratch_depth,
+            "scratch depth",
+            MAX_SCRATCH_DEPTH,
         )
 
 
@@ -447,17 +475,26 @@ def safe_run(
     timeout: int | float = 120,
     cwd: str,
     home: str,
+    pass_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     """Run a command through the focused process-isolation implementation."""
     from ._process import safe_run as _safe_run
 
-    return _safe_run(command, timeout=timeout, cwd=cwd, home=home)
+    return _safe_run(
+        command,
+        timeout=timeout,
+        cwd=cwd,
+        home=home,
+        pass_fds=pass_fds,
+    )
 
 
 __all__ = [
     "DEFAULT_EXTRACT_CHARS",
     "DEFAULT_RESPONSE_BYTES",
     "DEFAULT_SCRATCH_BYTES",
+    "DEFAULT_SCRATCH_DEPTH",
+    "DEFAULT_SCRATCH_ENTRIES",
     "InspectionError",
     "Inspector",
     "JSONValue",
@@ -470,6 +507,8 @@ __all__ = [
     "MAX_RENDER_PIXELS",
     "MAX_RESPONSE_BYTES",
     "MAX_SCRATCH_BYTES",
+    "MAX_SCRATCH_DEPTH",
+    "MAX_SCRATCH_ENTRIES",
     "MIN_RESPONSE_BYTES",
     "RenderBudget",
     "ResponseBudget",

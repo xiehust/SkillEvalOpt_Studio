@@ -1,6 +1,7 @@
 """Trusted inspector registry, CLI, and Artifact MCP tests."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -28,6 +29,7 @@ from skillopt.envs.skilleval.inspectors import (
     render_artifact,
 )
 from skillopt.envs.skilleval.inspectors.__main__ import main as artifactctl_main
+from skillopt.envs.skilleval.inspectors._scratch import scratch_transaction
 from skillopt.envs.skilleval.inspectors.base import (
     MAX_COMMAND_OUTPUT_CHARS,
     MAX_LOGICAL_COMPONENTS,
@@ -81,6 +83,7 @@ class _FakePdfInspector:
     render_escape: str | None = None
     fail_message: str | None = None
     unreturned_scratch_bytes = 0
+    render_bytes: bytes | None = None
 
     def _write_unreturned(self, scratch_dir):
         if self.unreturned_scratch_bytes:
@@ -106,7 +109,10 @@ class _FakePdfInspector:
         if self.render_escape is not None:
             return [self.render_escape]
         output = Path(scratch_dir) / "render-UNTRUSTED_META.png"
-        PillowImage.new("RGB", (2, 3), color=(25, 50, 75)).save(output)
+        if self.render_bytes is None:
+            PillowImage.new("RGB", (2, 3), color=(25, 50, 75)).save(output)
+        else:
+            output.write_bytes(self.render_bytes)
         return [str(output)]
 
     def extract(self, path, scratch_dir, selectors, *, response_budget):
@@ -129,6 +135,7 @@ def fake_pdf_inspector(monkeypatch):
     _FakePdfInspector.render_escape = None
     _FakePdfInspector.fail_message = None
     _FakePdfInspector.unreturned_scratch_bytes = 0
+    _FakePdfInspector.render_bytes = None
     module = types.ModuleType("skillopt.envs.skilleval.inspectors.pdf_image")
     module.PdfInspector = _FakePdfInspector
     module.ImageInspector = _FakePdfInspector
@@ -161,13 +168,23 @@ class TestBudgetsAndSelectors:
         default = inspector_base.DEFAULT_SCRATCH_BYTES
         maximum = inspector_base.MAX_SCRATCH_BYTES
 
-        assert 0 < default <= maximum
+        assert default == 1024 * 1024 * 1024
+        assert default <= maximum
         assert RenderBudget(max_scratch_bytes=default).max_scratch_bytes == default
-        assert ResponseBudget(
-            max_scratch_bytes=default
-        ).max_scratch_bytes == default
+        response = ResponseBudget(
+            max_scratch_bytes=default,
+            max_scratch_entries=10,
+            max_scratch_depth=3,
+        )
+        assert response.max_scratch_bytes == default
+        assert response.max_scratch_entries == 10
+        assert response.max_scratch_depth == 3
         with pytest.raises(InspectionError, match="scratch"):
             RenderBudget(max_scratch_bytes=maximum + 1)
+        with pytest.raises(InspectionError, match="entr"):
+            ResponseBudget(max_scratch_entries=0)
+        with pytest.raises(InspectionError, match="depth"):
+            ResponseBudget(max_scratch_depth=0)
 
     @pytest.mark.parametrize(
         "selectors",
@@ -329,6 +346,54 @@ class TestSafeRun:
             else:
                 pytest.fail("lingering child process remained alive")
             assert time.monotonic() - started < 3
+        finally:
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_setsid_descendant_is_reaped_after_parent_exits(
+        self, tmp_path
+    ) -> None:
+        pid_file = tmp_path / "setsid-child.pid"
+        child_code = (
+            "import os, pathlib, sys, time; "
+            "os.setsid(); "
+            "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+            "time.sleep(60)"
+        )
+        parent_code = (
+            "import pathlib, subprocess, sys, time; "
+            "subprocess.Popen("
+            "[sys.executable, '-c', sys.argv[1], sys.argv[2]], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+            "stderr=subprocess.DEVNULL); "
+            "pid_file = pathlib.Path(sys.argv[2]); "
+            "[(time.sleep(0.01)) for _ in range(200) "
+            "if not pid_file.exists()]"
+        )
+        child_pid = None
+        try:
+            safe_run(
+                [
+                    sys.executable,
+                    "-c",
+                    parent_code,
+                    child_code,
+                    str(pid_file),
+                ],
+                timeout=5,
+                cwd=str(tmp_path),
+                home=str(tmp_path),
+            )
+            child_pid = int(pid_file.read_text(encoding="utf-8"))
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and Path(
+                f"/proc/{child_pid}"
+            ).exists():
+                time.sleep(0.02)
+            assert not Path(f"/proc/{child_pid}").exists()
         finally:
             if child_pid is not None:
                 try:
@@ -677,6 +742,111 @@ class TestRegistry:
         assert "ORIGINAL" in result["payload"]
         assert "ESCAPED" not in result["payload"]
 
+    def test_staged_file_replacement_cannot_change_inspector_input(
+        self, tmp_path, fake_pdf_inspector, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf", b"ORIGINAL")
+        outside = tmp_path / "outside.pdf"
+        _write_pdf(outside, b"ESCAPED")
+        real_detect = inspectors_mod.detect_artifact_kind
+        observed = {}
+
+        def replace_after_detection(path):
+            kind = real_detect(path)
+            if path.startswith("/proc/self/fd/"):
+                proc_dir, basename = os.path.split(path)
+                staged = Path(os.readlink(proc_dir)) / basename
+            else:
+                staged = Path(path)
+            staged.unlink()
+            staged.symlink_to(outside)
+            return kind
+
+        def reading_inspect(self, path, scratch_dir, *, response_budget):
+            payload = Path(path).read_bytes().decode(
+                "ascii",
+                errors="replace",
+            )
+            observed["payload"] = payload
+            return {"payload": payload}
+
+        monkeypatch.setattr(
+            inspectors_mod,
+            "detect_artifact_kind",
+            replace_after_detection,
+        )
+        monkeypatch.setattr(_FakePdfInspector, "inspect", reading_inspect)
+
+        with pytest.raises(InspectionError, match="scratch"):
+            inspect_artifact(
+                "report.pdf",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+
+        assert "ORIGINAL" in observed["payload"]
+        assert "ESCAPED" not in observed["payload"]
+
+    def test_legacy_detection_fallback_never_reopens_staged_name(
+        self, tmp_path, fake_pdf_inspector, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        ole = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+        (evidence / "report.doc").write_bytes(ole + b"ORIGINAL")
+        outside = tmp_path / "outside.doc"
+        outside.write_bytes(ole + b"ESCAPED")
+        office = types.ModuleType(
+            "skillopt.envs.skilleval.inspectors.office"
+        )
+        office.OfficeInspector = _FakePdfInspector
+        monkeypatch.setitem(sys.modules, office.__name__, office)
+        real_open = os.open
+        reopened = False
+        observed = {}
+
+        def tracking_open(path, flags, *args, **kwargs):
+            nonlocal reopened
+            if (
+                isinstance(path, str)
+                and path.startswith("/proc/self/fd/")
+                and path.endswith("/report.doc")
+            ):
+                reopened = True
+            return real_open(path, flags, *args, **kwargs)
+
+        def replacing_detect(path, mime=None):
+            if mime is not None:
+                return "doc"
+            proc_dir, basename = os.path.split(path)
+            staged = Path(os.readlink(proc_dir)) / basename
+            staged.unlink()
+            staged.symlink_to(outside)
+            return None
+
+        def reading_inspect(self, path, scratch_dir, *, response_budget):
+            observed["payload"] = Path(path).read_bytes()
+            return {"ok": True}
+
+        monkeypatch.setattr(inspectors_mod.os, "open", tracking_open)
+        monkeypatch.setattr(
+            inspectors_mod,
+            "detect_artifact_kind",
+            replacing_detect,
+        )
+        monkeypatch.setattr(_FakePdfInspector, "inspect", reading_inspect)
+
+        with pytest.raises(InspectionError, match="scratch"):
+            inspect_artifact(
+                "report.doc",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+
+        assert reopened is False
+        assert b"ORIGINAL" in observed["payload"]
+        assert b"ESCAPED" not in observed["payload"]
+
     def test_inventory_response_limit_fails_closed(self, tmp_path) -> None:
         evidence, scratch = _roots(tmp_path)
         for index in range(10):
@@ -788,7 +958,7 @@ class TestRegistry:
                 scratch_dir=str(scratch),
                 max_scratch_bytes=100,
         )
-        assert (scratch / "unreturned.bin").stat().st_size == 128
+        assert not (scratch / "unreturned.bin").exists()
 
     def test_scratch_budget_counts_staged_input_and_outputs_at_peak(
         self, tmp_path, fake_pdf_inspector
@@ -805,7 +975,225 @@ class TestRegistry:
                 max_scratch_bytes=100,
             )
 
-        assert (scratch / "unreturned.bin").stat().st_size == 50
+        assert not (scratch / "unreturned.bin").exists()
+
+    def test_scratch_transaction_limits_external_write_and_rolls_back(
+        self, tmp_path, fake_pdf_inspector, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        escaped_marker = tmp_path / "writer-completed"
+        script = (
+            "from pathlib import Path; "
+            "Path('oversized.bin').write_bytes(b'x' * (5 * 1024 * 1024)); "
+            f"Path({str(escaped_marker)!r}).write_text('completed')"
+        )
+
+        def process_inspect(self, path, scratch_dir, *, response_budget):
+            safe_run(
+                [sys.executable, "-c", script],
+                timeout=5,
+                cwd=scratch_dir,
+                home=scratch_dir,
+            )
+            return {"ok": True}
+
+        monkeypatch.setattr(_FakePdfInspector, "inspect", process_inspect)
+
+        with pytest.raises(InspectionError, match="scratch|exited"):
+            inspect_artifact(
+                "report.pdf",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+                max_scratch_bytes=1024,
+            )
+
+        assert not escaped_marker.exists()
+        assert list(scratch.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        ("limit_name", "limit_value", "script"),
+        [
+            (
+                "max_scratch_entries",
+                3,
+                (
+                    "from pathlib import Path; import time; "
+                    "[(Path(f'entry-{i}').touch(), time.sleep(0.005)) "
+                    "for i in range(100)]; "
+                ),
+            ),
+            (
+                "max_scratch_depth",
+                2,
+                (
+                    "from pathlib import Path; import time; "
+                    "Path('a/b/c').mkdir(parents=True); time.sleep(1); "
+                ),
+            ),
+        ],
+    )
+    def test_external_watchdog_limits_entries_and_depth(
+        self,
+        tmp_path,
+        fake_pdf_inspector,
+        monkeypatch,
+        limit_name,
+        limit_value,
+        script,
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        completed = tmp_path / f"{limit_name}-completed"
+        command = script + f"Path({str(completed)!r}).write_text('completed')"
+
+        def process_inspect(self, path, scratch_dir, *, response_budget):
+            safe_run(
+                [sys.executable, "-c", command],
+                timeout=5,
+                cwd=scratch_dir,
+                home=scratch_dir,
+            )
+            return {"ok": True}
+
+        monkeypatch.setattr(_FakePdfInspector, "inspect", process_inspect)
+
+        with pytest.raises(InspectionError, match="scratch"):
+            inspect_artifact(
+                "report.pdf",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+                **{limit_name: limit_value},
+            )
+
+        assert not completed.exists()
+        assert list(scratch.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        ("limit_name", "limit_value", "writer"),
+        [
+            (
+                "max_scratch_entries",
+                3,
+                lambda root: [
+                    (root / f"entry-{index}").write_bytes(b"")
+                    for index in range(4)
+                ],
+            ),
+            (
+                "max_scratch_depth",
+                2,
+                lambda root: (root / "a" / "b" / "c").mkdir(parents=True),
+            ),
+        ],
+    )
+    def test_scratch_transaction_limits_entries_and_depth(
+        self,
+        tmp_path,
+        fake_pdf_inspector,
+        monkeypatch,
+        limit_name,
+        limit_value,
+        writer,
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+
+        def writing_inspect(self, path, scratch_dir, *, response_budget):
+            writer(Path(scratch_dir))
+            return {"ok": True}
+
+        monkeypatch.setattr(_FakePdfInspector, "inspect", writing_inspect)
+
+        with pytest.raises(InspectionError, match="scratch"):
+            inspect_artifact(
+                "report.pdf",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+                **{limit_name: limit_value},
+            )
+
+        assert list(scratch.iterdir()) == []
+
+    def test_success_commits_only_returned_render_outputs(
+        self, tmp_path, fake_pdf_inspector
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        fake_pdf_inspector.unreturned_scratch_bytes = 10
+
+        outputs = render_artifact(
+            "report.pdf",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        files = sorted(path for path in scratch.rglob("*") if path.is_file())
+        assert files == [Path(outputs[0])]
+        assert files[0].exists()
+
+    def test_render_commit_respects_root_depth_budget(
+        self, tmp_path, fake_pdf_inspector
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+
+        with pytest.raises(InspectionError, match="scratch depth"):
+            render_artifact(
+                "report.pdf",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+                max_scratch_depth=1,
+            )
+
+        assert list(scratch.iterdir()) == []
+
+    def test_failed_response_budget_rolls_back_committed_outputs(
+        self, tmp_path, fake_pdf_inspector, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+
+        def render_many(self, path, scratch_dir, selectors, budget):
+            outputs = []
+            for index in range(16):
+                output = Path(scratch_dir) / (
+                    f"{index:02d}-" + "x" * 80 + ".png"
+                )
+                PillowImage.new("RGB", (1, 1)).save(output)
+                outputs.append(str(output))
+            return outputs
+
+        monkeypatch.setattr(_FakePdfInspector, "render", render_many)
+
+        with pytest.raises(InspectionError, match="response"):
+            render_artifact(
+                "report.pdf",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+                max_response_bytes=MIN_RESPONSE_BYTES,
+            )
+
+        assert list(scratch.iterdir()) == []
+
+    def test_failed_transaction_entry_does_not_leak_root_descriptor(
+        self, tmp_path
+    ) -> None:
+        _evidence, scratch = _roots(tmp_path)
+        (scratch / "existing.bin").write_bytes(b"x")
+        before = set(os.listdir("/proc/self/fd"))
+
+        for _ in range(3):
+            with pytest.raises(InspectionError, match="scratch"):
+                with scratch_transaction(
+                    str(scratch),
+                    max_bytes=0,
+                    max_entries=10,
+                    max_depth=2,
+                ):
+                    pytest.fail("over-budget transaction entered")
+
+        assert set(os.listdir("/proc/self/fd")) == before
 
 
 class TestArtifactCtl:
@@ -1148,12 +1536,18 @@ class TestArtifactCtl:
                 str(scratch),
                 "--max-scratch-bytes",
                 "1234",
+                "--max-scratch-entries",
+                "12",
+                "--max-scratch-depth",
+                "4",
             ],
         )
 
         assert code == 0
         assert payload["status"] == "ok"
         assert observed["max_scratch_bytes"] == 1234
+        assert observed["max_scratch_entries"] == 12
+        assert observed["max_scratch_depth"] == 4
 
 
 def _assert_untrusted_location(value, needles, path=()):
@@ -1343,6 +1737,8 @@ server.run(transport="stdio")
         ):
             tool = next(tool for tool in tools.tools if tool.name == tool_name)
             assert tool.inputSchema["required"] == ["path"]
+        for tool in tools.tools:
+            assert tool.inputSchema["additionalProperties"] is False
 
     @pytest.mark.anyio
     async def test_calls_representative_tools_and_envelopes_artifact_strings(
@@ -1630,6 +2026,8 @@ server.run(transport="stdio")
             str(evidence),
             str(scratch),
             max_scratch_bytes=100,
+            max_scratch_entries=10,
+            max_scratch_depth=4,
         )
 
         async with create_connected_server_and_client_session(
@@ -1642,19 +2040,25 @@ server.run(transport="stdio")
                 if tool.name == "artifact_inspect"
             )
             assert "max_scratch_bytes" in inspect_tool.inputSchema["properties"]
+            assert "max_scratch_entries" in inspect_tool.inputSchema["properties"]
+            assert "max_scratch_depth" in inspect_tool.inputSchema["properties"]
             result = await client.call_tool(
                 "artifact_inspect",
                 {
                     "path": "report.pdf",
-                    "max_response_bytes": MIN_RESPONSE_BYTES,
+                    "max_response_bytes": 4_096,
                     "max_scratch_bytes": 100,
+                    "max_scratch_entries": 10,
+                    "max_scratch_depth": 4,
                 },
             )
             inventory_result = await client.call_tool(
                 "artifact_inventory",
                 {
-                    "max_response_bytes": MIN_RESPONSE_BYTES,
+                    "max_response_bytes": 4_096,
                     "max_scratch_bytes": 100,
+                    "max_scratch_entries": 10,
+                    "max_scratch_depth": 4,
                 },
             )
 
@@ -1662,15 +2066,16 @@ server.run(transport="stdio")
         assert envelope["status"] == "error"
         assert "scratch" in envelope["error"]
         assert result.isError is True
-        assert _serialized_mcp_result_bytes(result) <= MIN_RESPONSE_BYTES
+        assert _serialized_mcp_result_bytes(result) <= 4_096
+        assert list(scratch.iterdir()) == []
         inventory_envelope = _structured_payload(inventory_result)[
             "untrusted_evidence"
         ]
-        assert inventory_envelope["status"] == "error"
-        assert inventory_result.isError is True
+        assert inventory_envelope["status"] == "ok"
+        assert inventory_result.isError is not True
         assert (
             _serialized_mcp_result_bytes(inventory_result)
-            <= MIN_RESPONSE_BYTES
+            <= 4_096
         )
 
     @pytest.mark.anyio
@@ -1745,15 +2150,6 @@ server.run(transport="stdio")
         payload = _structured_payload(result)
         envelope = payload["untrusted_evidence"]
         assert envelope["status"] == "ok"
-        assert envelope["result"]["images"] == [
-            {
-                "index": 0,
-                "mime": "image/png",
-                "width": 2,
-                "height": 3,
-                "bytes": (scratch / "render-UNTRUSTED_META.png").stat().st_size,
-            }
-        ]
         serialized = json.dumps(payload)
         assert str(scratch) not in serialized
         images = [
@@ -1761,6 +2157,62 @@ server.run(transport="stdio")
         ]
         assert len(images) == 1
         assert images[0].mimeType == "image/png"
+        image_metadata = envelope["result"]["images"][0]
+        assert image_metadata == {
+            "index": 0,
+            "mime": "image/png",
+            "width": 2,
+            "height": 3,
+            "bytes": len(base64.b64decode(images[0].data)),
+        }
+        assert list(scratch.iterdir()) == []
+
+    @pytest.mark.anyio
+    async def test_render_does_not_reopen_replaced_scratch_root(
+        self, tmp_path, fake_pdf_inspector, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        held = tmp_path / "held-scratch"
+        real_read_png = artifact_mcp._read_png
+        replacement_performed = False
+
+        def replace_root_then_read(source, scratch_dir, **kwargs):
+            nonlocal replacement_performed
+            scratch.rename(held)
+            scratch.mkdir()
+            PillowImage.new("RGB", (9, 9), color=(200, 1, 1)).save(
+                scratch / "render-UNTRUSTED_META.png"
+            )
+            replacement_performed = True
+            return real_read_png(source, scratch_dir, **kwargs)
+
+        monkeypatch.setattr(
+            artifact_mcp,
+            "_read_png",
+            replace_root_then_read,
+        )
+        server = artifact_mcp.create_server(str(evidence), str(scratch))
+
+        async with create_connected_server_and_client_session(
+            server,
+            raise_exceptions=True,
+        ) as client:
+            result = await client.call_tool(
+                "artifact_render",
+                {"path": "report.pdf", "max_pixels": 100},
+            )
+
+        assert replacement_performed is True
+        envelope = _structured_payload(result)["untrusted_evidence"]
+        if envelope["status"] == "ok":
+            assert envelope["result"]["images"][0]["width"] == 2
+            assert envelope["result"]["images"][0]["height"] == 3
+        else:
+            assert result.isError is True
+            assert not any(
+                isinstance(content, ImageContent) for content in result.content
+            )
 
     @pytest.mark.anyio
     async def test_render_full_result_budget_rejects_oversized_image_payload(
@@ -1774,7 +2226,7 @@ server.run(transport="stdio")
             large,
             compress_level=0,
         )
-        fake_pdf_inspector.render_escape = str(large)
+        fake_pdf_inspector.render_bytes = large.read_bytes()
         server = artifact_mcp.create_server(str(evidence), str(scratch))
 
         async with create_connected_server_and_client_session(
@@ -1792,6 +2244,7 @@ server.run(transport="stdio")
 
         envelope = _structured_payload(result)["untrusted_evidence"]
         assert envelope["status"] == "error"
+        assert "response" in envelope["error"].lower()
         assert result.isError is True
         assert _serialized_mcp_result_bytes(result) <= MIN_RESPONSE_BYTES
         assert not any(
@@ -1806,7 +2259,7 @@ server.run(transport="stdio")
         _write_pdf(evidence / "report.pdf")
         bad = scratch / "bad.png"
         bad.write_text("not an image", encoding="utf-8")
-        fake_pdf_inspector.render_escape = str(bad)
+        fake_pdf_inspector.render_bytes = bad.read_bytes()
         server = artifact_mcp.create_server(
             str(evidence),
             str(scratch),

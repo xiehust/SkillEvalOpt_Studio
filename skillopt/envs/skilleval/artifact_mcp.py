@@ -2,28 +2,37 @@
 from __future__ import annotations
 
 import argparse
-import io
-import json
 import os
-import stat
-from typing import Annotated, Callable, cast
+from typing import Annotated, cast
 
 from mcp.server.fastmcp import FastMCP, Image
-from mcp.types import CallToolResult, ImageContent, TextContent, Tool as MCPTool
-from PIL import Image as PillowImage
-from PIL import UnidentifiedImageError
+from mcp.types import CallToolResult, Tool as MCPTool
 from pydantic import Field, WithJsonSchema
 
+from ._artifact_mcp_media import (
+    DEFAULT_MAX_MEDIA_BYTES,
+    MAX_MEDIA_BYTES,
+    read_png as _read_png,
+)
+from ._artifact_mcp_results import (
+    envelope as _envelope,
+    guarded_tool as _guarded_tool,
+    positive_maximum as _positive_maximum,
+    request_budget as _request_budget,
+    tool_result as _tool_result,
+)
 from .inspectors import (
+    _render_artifact_files,
     extract_artifact,
     inspect_artifact,
     inventory_artifacts,
-    render_artifact,
 )
 from .inspectors.base import (
     DEFAULT_EXTRACT_CHARS,
     DEFAULT_RESPONSE_BYTES,
     DEFAULT_SCRATCH_BYTES,
+    DEFAULT_SCRATCH_DEPTH,
+    DEFAULT_SCRATCH_ENTRIES,
     InspectionError,
     MAX_EXTRACT_CHARS,
     MAX_LOGICAL_COMPONENTS,
@@ -33,18 +42,14 @@ from .inspectors.base import (
     MAX_RENDER_PIXELS,
     MAX_RESPONSE_BYTES,
     MAX_SCRATCH_BYTES,
+    MAX_SCRATCH_DEPTH,
+    MAX_SCRATCH_ENTRIES,
     MIN_RESPONSE_BYTES,
-    ResponseBudget,
-    bounded_diagnostic,
     normalize_selectors,
-    validate_json_result,
     validate_logical_path,
     validate_roots,
 )
-from .inspectors._secure_files import open_scratch_file
 
-DEFAULT_MAX_MEDIA_BYTES = 25 * 1024 * 1024
-MAX_MEDIA_BYTES = 100 * 1024 * 1024
 _PATH_ARGUMENT_DESCRIPTION = (
     "Normalized POSIX-relative evidence path; at most "
     f"{MAX_LOGICAL_PATH_CHARS} characters, {MAX_LOGICAL_PATH_BYTES} UTF-8 "
@@ -92,15 +97,50 @@ ScratchBudget = Annotated[
         }
     ),
 ]
+ScratchEntriesBudget = Annotated[
+    object,
+    WithJsonSchema(
+        {
+            "anyOf": [
+                {"type": "integer"},
+                {"type": "null"},
+            ],
+            "description": "Maximum entries in one scratch transaction.",
+        }
+    ),
+]
+ScratchDepthBudget = Annotated[
+    object,
+    WithJsonSchema(
+        {
+            "anyOf": [
+                {"type": "integer"},
+                {"type": "null"},
+            ],
+            "description": "Maximum depth in one scratch transaction.",
+        }
+    ),
+]
 _PATH_REQUIRED_TOOLS = frozenset(
     {"artifact_inspect", "artifact_render", "artifact_extract"}
 )
 _TOOL_ARGUMENTS = {
     "artifact_inventory": frozenset(
-        {"max_response_bytes", "max_scratch_bytes"}
+        {
+            "max_response_bytes",
+            "max_scratch_bytes",
+            "max_scratch_entries",
+            "max_scratch_depth",
+        }
     ),
     "artifact_inspect": frozenset(
-        {"path", "max_response_bytes", "max_scratch_bytes"}
+        {
+            "path",
+            "max_response_bytes",
+            "max_scratch_bytes",
+            "max_scratch_entries",
+            "max_scratch_depth",
+        }
     ),
     "artifact_render": frozenset(
         {
@@ -109,6 +149,8 @@ _TOOL_ARGUMENTS = {
             "max_pixels",
             "max_response_bytes",
             "max_scratch_bytes",
+            "max_scratch_entries",
+            "max_scratch_depth",
         }
     ),
     "artifact_extract": frozenset(
@@ -118,6 +160,8 @@ _TOOL_ARGUMENTS = {
             "max_extract_chars",
             "max_response_bytes",
             "max_scratch_bytes",
+            "max_scratch_entries",
+            "max_scratch_depth",
         }
     ),
 }
@@ -133,14 +177,13 @@ class _ArtifactMCP(FastMCP):
         tools = await super().list_tools()
         advertised: list[MCPTool] = []
         for tool in tools:
-            if tool.name not in _PATH_REQUIRED_TOOLS:
-                advertised.append(tool)
-                continue
             schema = dict(tool.inputSchema)
-            required = list(schema.get("required", []))
-            if "path" not in required:
-                required.append("path")
-            schema["required"] = required
+            schema["additionalProperties"] = False
+            if tool.name in _PATH_REQUIRED_TOOLS:
+                required = list(schema.get("required", []))
+                if "path" not in required:
+                    required.append("path")
+                schema["required"] = required
             advertised.append(
                 tool.model_copy(update={"inputSchema": schema})
             )
@@ -163,198 +206,6 @@ class _ArtifactMCP(FastMCP):
         return await super().call_tool(name, arguments)
 
 
-def _positive_maximum(value: object, name: str, maximum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise InspectionError(f"{name} must be a positive integer")
-    if value > maximum:
-        raise InspectionError(f"{name} exceeds maximum {maximum}")
-    return value
-
-
-def _request_budget(
-    value: object,
-    *,
-    default: int,
-    maximum: int,
-    name: str,
-) -> int:
-    selected = default if value is None else value
-    return _positive_maximum(selected, name, maximum)
-
-
-def _select_response_budget(
-    requested: object,
-    server_maximum: int,
-) -> int:
-    if requested is None:
-        return server_maximum
-    if (
-        isinstance(requested, bool)
-        or not isinstance(requested, int)
-        or requested < MIN_RESPONSE_BYTES
-    ):
-        raise InspectionError(
-            f"response byte budget must be at least {MIN_RESPONSE_BYTES}"
-        )
-    return min(requested, server_maximum)
-
-
-def _envelope(operation: str, *, result=None, error: str | None = None) -> dict:
-    body = {
-        "trust": "untrusted_evidence",
-        "operation": operation,
-        "status": "error" if error is not None else "ok",
-    }
-    if error is None:
-        body["result"] = result
-    else:
-        body["error"] = error
-    return {"untrusted_evidence": body}
-
-
-def _tool_result(
-    payload: dict,
-    *,
-    response_limit: int,
-    images: list[ImageContent] | None = None,
-    is_error: bool = False,
-) -> CallToolResult:
-    budget = ResponseBudget(
-        max_bytes=response_limit,
-        max_extract_chars=MAX_EXTRACT_CHARS,
-    )
-    validate_json_result(payload, budget)
-    text = json.dumps(
-        payload,
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":"),
-    )
-    content = [TextContent(type="text", text=text)]
-    content.extend(images or [])
-    result = CallToolResult(
-        content=content,
-        structuredContent=payload,
-        isError=is_error,
-    )
-    serialized = result.model_dump_json(
-        by_alias=True,
-        exclude_none=True,
-    ).encode("utf-8")
-    if len(serialized) > response_limit:
-        raise InspectionError(
-            "MCP response byte budget exceeded: "
-            f"{len(serialized)} > {response_limit}"
-        )
-    return result
-
-
-def _error_result(
-    operation: str,
-    exc: Exception,
-    *,
-    response_limit: int,
-) -> CallToolResult:
-    diagnostic_limit = max(80, min(512, response_limit // 2))
-    error = (
-        f"{type(exc).__name__}: "
-        f"{bounded_diagnostic(exc, diagnostic_limit)}"
-    )
-    payload = _envelope(operation, error=error)
-    try:
-        return _tool_result(
-            payload,
-            response_limit=response_limit,
-            is_error=True,
-        )
-    except Exception:
-        fallback = _envelope(
-            operation,
-            error="InspectionError: bounded artifact operation failure",
-        )
-        return _tool_result(
-            fallback,
-            response_limit=response_limit,
-            is_error=True,
-        )
-
-
-def _guarded_tool(
-    operation: str,
-    requested_response_limit: object,
-    server_response_maximum: int,
-    function: Callable[[int], CallToolResult],
-) -> CallToolResult:
-    try:
-        response_limit = _select_response_budget(
-            requested_response_limit,
-            server_response_maximum,
-        )
-    except Exception as exc:
-        return _error_result(
-            operation,
-            exc,
-            response_limit=server_response_maximum,
-        )
-    try:
-        return function(response_limit)
-    except Exception as exc:
-        return _error_result(
-            operation,
-            exc,
-            response_limit=response_limit,
-        )
-
-
-def _read_png(
-    path: str,
-    scratch_dir: str,
-    *,
-    remaining_pixels: int,
-    remaining_bytes: int,
-) -> tuple[bytes, dict]:
-    try:
-        descriptor = open_scratch_file(scratch_dir, path)
-    except (OSError, InspectionError) as exc:
-        raise InspectionError(
-            f"rendered media could not be opened: {bounded_diagnostic(exc)}"
-        ) from exc
-    try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode):
-            raise InspectionError("rendered media must be a regular file")
-        if info.st_size <= 0 or info.st_size > remaining_bytes:
-            raise InspectionError("rendered media byte budget exceeded")
-        with os.fdopen(os.dup(descriptor), "rb") as source:
-            data = source.read(remaining_bytes + 1)
-    finally:
-        os.close(descriptor)
-    if len(data) != info.st_size or len(data) > remaining_bytes:
-        raise InspectionError("rendered media byte budget exceeded")
-    try:
-        with PillowImage.open(io.BytesIO(data)) as image:
-            if image.format != "PNG":
-                raise InspectionError("rendered media must be PNG")
-            width, height = image.size
-            image.verify()
-    except InspectionError:
-        raise
-    except (OSError, ValueError, UnidentifiedImageError) as exc:
-        raise InspectionError(
-            f"rendered media is not a valid PNG: {bounded_diagnostic(exc)}"
-        ) from exc
-    pixels = width * height
-    if width <= 0 or height <= 0 or pixels > remaining_pixels:
-        raise InspectionError("rendered media pixel budget exceeded")
-    return data, {
-        "mime": "image/png",
-        "width": width,
-        "height": height,
-        "bytes": len(data),
-        "pixels": pixels,
-    }
-
-
 def create_server(
     evidence_dir: str,
     scratch_dir: str,
@@ -364,6 +215,8 @@ def create_server(
     max_extract_chars: int = DEFAULT_EXTRACT_CHARS,
     max_media_bytes: int = DEFAULT_MAX_MEDIA_BYTES,
     max_scratch_bytes: int = DEFAULT_SCRATCH_BYTES,
+    max_scratch_entries: int = DEFAULT_SCRATCH_ENTRIES,
+    max_scratch_depth: int = DEFAULT_SCRATCH_DEPTH,
 ) -> FastMCP:
     """Create an in-memory or stdio Artifact MCP server."""
     evidence, scratch = validate_roots(evidence_dir, scratch_dir)
@@ -397,6 +250,16 @@ def create_server(
         "server scratch byte maximum",
         MAX_SCRATCH_BYTES,
     )
+    server_scratch_entries_max = _positive_maximum(
+        max_scratch_entries,
+        "server scratch entry maximum",
+        MAX_SCRATCH_ENTRIES,
+    )
+    server_scratch_depth_max = _positive_maximum(
+        max_scratch_depth,
+        "server scratch depth maximum",
+        MAX_SCRATCH_DEPTH,
+    )
 
     server = _ArtifactMCP(
         "skillopt-artifact",
@@ -411,6 +274,8 @@ def create_server(
     def artifact_inventory(
         max_response_bytes: IntegerBudget = None,
         max_scratch_bytes: ScratchBudget = None,
+        max_scratch_entries: ScratchEntriesBudget = None,
+        max_scratch_depth: ScratchDepthBudget = None,
     ) -> CallToolResult:
         def run(response_limit: int) -> CallToolResult:
             scratch_limit = _request_budget(
@@ -419,11 +284,25 @@ def create_server(
                 maximum=server_scratch_max,
                 name="scratch byte budget",
             )
+            scratch_entries_limit = _request_budget(
+                max_scratch_entries,
+                default=server_scratch_entries_max,
+                maximum=server_scratch_entries_max,
+                name="scratch entry budget",
+            )
+            scratch_depth_limit = _request_budget(
+                max_scratch_depth,
+                default=server_scratch_depth_max,
+                maximum=server_scratch_depth_max,
+                name="scratch depth budget",
+            )
             result = inventory_artifacts(
                 evidence,
                 scratch,
                 max_response_bytes=response_limit,
                 max_scratch_bytes=scratch_limit,
+                max_scratch_entries=scratch_entries_limit,
+                max_scratch_depth=scratch_depth_limit,
             )
             return _tool_result(
                 _envelope("artifact_inventory", result=result),
@@ -448,6 +327,8 @@ def create_server(
         path: LogicalPath = None,
         max_response_bytes: IntegerBudget = None,
         max_scratch_bytes: ScratchBudget = None,
+        max_scratch_entries: ScratchEntriesBudget = None,
+        max_scratch_depth: ScratchDepthBudget = None,
     ) -> CallToolResult:
         def run(response_limit: int) -> CallToolResult:
             validate_logical_path(path)
@@ -457,12 +338,26 @@ def create_server(
                 maximum=server_scratch_max,
                 name="scratch byte budget",
             )
+            scratch_entries_limit = _request_budget(
+                max_scratch_entries,
+                default=server_scratch_entries_max,
+                maximum=server_scratch_entries_max,
+                name="scratch entry budget",
+            )
+            scratch_depth_limit = _request_budget(
+                max_scratch_depth,
+                default=server_scratch_depth_max,
+                maximum=server_scratch_depth_max,
+                name="scratch depth budget",
+            )
             result = inspect_artifact(
                 cast(str, path),
                 evidence_dir=evidence,
                 scratch_dir=scratch,
                 max_response_bytes=response_limit,
                 max_scratch_bytes=scratch_limit,
+                max_scratch_entries=scratch_entries_limit,
+                max_scratch_depth=scratch_depth_limit,
             )
             return _tool_result(
                 _envelope("artifact_inspect", result=result),
@@ -489,6 +384,8 @@ def create_server(
         max_pixels: IntegerBudget = None,
         max_response_bytes: IntegerBudget = None,
         max_scratch_bytes: ScratchBudget = None,
+        max_scratch_entries: ScratchEntriesBudget = None,
+        max_scratch_depth: ScratchDepthBudget = None,
     ) -> CallToolResult:
         def run(response_limit: int) -> CallToolResult:
             validate_logical_path(path)
@@ -505,7 +402,19 @@ def create_server(
                 maximum=server_scratch_max,
                 name="scratch byte budget",
             )
-            paths = render_artifact(
+            scratch_entries_limit = _request_budget(
+                max_scratch_entries,
+                default=server_scratch_entries_max,
+                maximum=server_scratch_entries_max,
+                name="scratch entry budget",
+            )
+            scratch_depth_limit = _request_budget(
+                max_scratch_depth,
+                default=server_scratch_depth_max,
+                maximum=server_scratch_depth_max,
+                name="scratch depth budget",
+            )
+            with _render_artifact_files(
                 cast(str, path),
                 evidence_dir=evidence,
                 scratch_dir=scratch,
@@ -513,28 +422,32 @@ def create_server(
                 max_pixels=pixel_limit,
                 max_response_bytes=response_limit,
                 max_scratch_bytes=scratch_limit,
-            )
-            metadata = []
-            images = []
-            used_pixels = 0
-            used_bytes = 0
-            for index, rendered_path in enumerate(paths):
-                data, details = _read_png(
-                    rendered_path,
-                    scratch,
-                    remaining_pixels=pixel_limit - used_pixels,
-                    remaining_bytes=server_media_max - used_bytes,
+                max_scratch_entries=scratch_entries_limit,
+                max_scratch_depth=scratch_depth_limit,
+            ) as outputs:
+                metadata = []
+                images = []
+                used_pixels = 0
+                used_bytes = 0
+                for index, output in enumerate(outputs):
+                    data, details = _read_png(
+                        output.descriptor,
+                        scratch,
+                        remaining_pixels=pixel_limit - used_pixels,
+                        remaining_bytes=server_media_max - used_bytes,
+                    )
+                    used_pixels += details.pop("pixels")
+                    used_bytes += details["bytes"]
+                    metadata.append({"index": index, **details})
+                    images.append(
+                        Image(data=data, format="png").to_image_content()
+                    )
+                result = {"images": metadata}
+                return _tool_result(
+                    _envelope("artifact_render", result=result),
+                    response_limit=response_limit,
+                    images=images,
                 )
-                used_pixels += details.pop("pixels")
-                used_bytes += details["bytes"]
-                metadata.append({"index": index, **details})
-                images.append(Image(data=data, format="png").to_image_content())
-            result = {"images": metadata}
-            return _tool_result(
-                _envelope("artifact_render", result=result),
-                response_limit=response_limit,
-                images=images,
-            )
 
         return _guarded_tool(
             "artifact_render",
@@ -556,6 +469,8 @@ def create_server(
         max_extract_chars: IntegerBudget = None,
         max_response_bytes: IntegerBudget = None,
         max_scratch_bytes: ScratchBudget = None,
+        max_scratch_entries: ScratchEntriesBudget = None,
+        max_scratch_depth: ScratchDepthBudget = None,
     ) -> CallToolResult:
         def run(response_limit: int) -> CallToolResult:
             validate_logical_path(path)
@@ -572,6 +487,18 @@ def create_server(
                 maximum=server_scratch_max,
                 name="scratch byte budget",
             )
+            scratch_entries_limit = _request_budget(
+                max_scratch_entries,
+                default=server_scratch_entries_max,
+                maximum=server_scratch_entries_max,
+                name="scratch entry budget",
+            )
+            scratch_depth_limit = _request_budget(
+                max_scratch_depth,
+                default=server_scratch_depth_max,
+                maximum=server_scratch_depth_max,
+                name="scratch depth budget",
+            )
             result = extract_artifact(
                 cast(str, path),
                 evidence_dir=evidence,
@@ -580,6 +507,8 @@ def create_server(
                 max_extract_chars=extract_limit,
                 max_response_bytes=response_limit,
                 max_scratch_bytes=scratch_limit,
+                max_scratch_entries=scratch_entries_limit,
+                max_scratch_depth=scratch_depth_limit,
             )
             return _tool_result(
                 _envelope("artifact_extract", result=result),
@@ -657,6 +586,22 @@ def main(argv: list[str] | None = None) -> None:
             DEFAULT_SCRATCH_BYTES,
         ),
     )
+    parser.add_argument(
+        "--max-scratch-entries",
+        type=int,
+        default=_env_int(
+            "SKILLOPT_ARTIFACT_MAX_SCRATCH_ENTRIES",
+            DEFAULT_SCRATCH_ENTRIES,
+        ),
+    )
+    parser.add_argument(
+        "--max-scratch-depth",
+        type=int,
+        default=_env_int(
+            "SKILLOPT_ARTIFACT_MAX_SCRATCH_DEPTH",
+            DEFAULT_SCRATCH_DEPTH,
+        ),
+    )
     args = parser.parse_args(argv)
     server = create_server(
         args.evidence,
@@ -666,6 +611,8 @@ def main(argv: list[str] | None = None) -> None:
         max_extract_chars=args.max_extract_chars,
         max_media_bytes=args.max_media_bytes,
         max_scratch_bytes=args.max_scratch_bytes,
+        max_scratch_entries=args.max_scratch_entries,
+        max_scratch_depth=args.max_scratch_depth,
     )
     server.run(transport="stdio")
 
