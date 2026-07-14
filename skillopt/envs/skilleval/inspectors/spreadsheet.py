@@ -1307,15 +1307,11 @@ class _XmlStructureValidator:
     def _validate_shared_string_element(
         self,
         tag: str,
-        local_name: str,
         parent: str | None,
     ) -> None:
-        if local_name != "si":
+        if tag != self._SHARED_STRING_ITEM_TAG:
             return
-        if (
-            tag != self._SHARED_STRING_ITEM_TAG
-            or parent != self._SHARED_STRING_ROOT_TAG
-        ):
+        if parent != self._SHARED_STRING_ROOT_TAG:
             raise InspectionError(
                 "OOXML shared string item has invalid namespace or nesting"
             )
@@ -1464,7 +1460,7 @@ class _XmlStructureValidator:
         if self._worksheet:
             self._validate_worksheet_element(tag, local_name, parent)
         if self._shared_strings:
-            self._validate_shared_string_element(tag, local_name, parent)
+            self._validate_shared_string_element(tag, parent)
         if self._styles:
             self._validate_style_element(tag, local_name, parent)
         if self._drawing:

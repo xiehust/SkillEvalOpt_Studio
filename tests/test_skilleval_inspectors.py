@@ -3003,6 +3003,37 @@ class TestSpreadsheetInspector:
             "shared string",
         )
 
+    def test_xlsx_accepts_x14_shared_string_in_extlst_without_counting_it(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        path = tmp_path / "extlst-x14-shared-string.xlsx"
+        self._save_xlsx(path)
+        self._add_shared_strings_part(path)
+        extension = (
+            b'<extLst><ext uri="{00000000-0000-0000-0000-000000000000}">'
+            b'<x14:si xmlns:x14="http://schemas.microsoft.com/office/'
+            b'spreadsheetml/2009/9/main"><x14:t>ignored</x14:t>'
+            b"</x14:si></ext></extLst>"
+        )
+        self._rewrite_xlsx_member(
+            path,
+            "xl/sharedStrings.xml",
+            lambda payload: payload.replace(
+                b"</sst>",
+                extension + b"</sst>",
+                1,
+            ),
+        )
+        monkeypatch.setattr(
+            spreadsheet,
+            "_MAX_SHARED_STRING_ITEMS",
+            1,
+        )
+
+        spreadsheet.preflight_xlsx(str(path))
+
     def test_xlsx_structure_limits_follow_content_type_not_part_path(
         self, tmp_path, monkeypatch
     ) -> None:
