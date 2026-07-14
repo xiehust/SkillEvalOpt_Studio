@@ -329,6 +329,45 @@ class TestArtifactKind:
 
         assert detect_artifact_kind(str(path), "application/zip") == "xlsx"
 
+    def test_prefixed_always_zip64_is_detected_and_manifested(
+        self, tmp_path
+    ) -> None:
+        path = tmp_path / "artifact.xlsx"
+        _write_ooxml(path, "xlsx")
+        _rewrite_always_zip64_eocd(path)
+        prefix = b"MZ" + b"\x00" * 62
+        path.write_bytes(prefix + path.read_bytes())
+
+        with zipfile.ZipFile(path) as archive:
+            assert archive.testzip() is None
+        assert detect_artifact_kind(str(path), "application/zip") == "xlsx"
+        assert build_manifest(str(tmp_path))["artifact.xlsx"].kind == "xlsx"
+
+    def test_prefixed_always_zip64_rejects_corrupt_logical_offset(
+        self, tmp_path
+    ) -> None:
+        path = tmp_path / "artifact.xlsx"
+        _write_ooxml(path, "xlsx")
+        _rewrite_always_zip64_eocd(path)
+        prefix = b"MZ" + b"\x00" * 62
+        payload = bytearray(prefix + path.read_bytes())
+        locator_offset = payload.rfind(b"PK\x06\x07")
+        assert locator_offset >= 0
+        logical_offset = struct.unpack_from(
+            "<Q",
+            payload,
+            locator_offset + 8,
+        )[0]
+        struct.pack_into(
+            "<Q",
+            payload,
+            locator_offset + 8,
+            logical_offset + 1,
+        )
+        path.write_bytes(payload)
+
+        assert detect_artifact_kind(str(path), "application/zip") is None
+
     @pytest.mark.parametrize(
         ("field", "value"),
         [

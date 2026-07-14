@@ -1749,6 +1749,21 @@ class TestSpreadsheetInspector:
         os.replace(rewritten, path)
 
     @staticmethod
+    def _rewrite_xlsx_package(path: Path, transform) -> None:
+        rewritten = path.with_name(f"{path.stem}-package-rewritten.xlsx")
+        with (
+            zipfile.ZipFile(path) as source,
+            zipfile.ZipFile(rewritten, "w") as destination,
+        ):
+            for info in source.infolist():
+                name, payload = transform(
+                    info.filename,
+                    source.read(info),
+                )
+                destination.writestr(name, payload)
+        os.replace(rewritten, path)
+
+    @staticmethod
     def _mutate_local_header(
         path: Path,
         member_name: str,
@@ -2408,6 +2423,271 @@ class TestSpreadsheetInspector:
             )
         assert load_calls == []
 
+    def test_xlsx_merge_area_rejects_before_openpyxl_load(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "huge-merge.xlsx"
+        self._save_xlsx(path)
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        self._rewrite_xlsx_member(
+            path,
+            "xl/worksheets/sheet1.xml",
+            lambda payload: payload.replace(
+                b'ref="A5:B5"',
+                b'ref="A1:XFD1048576"',
+                1,
+            ),
+        )
+        load_calls = []
+
+        def forbidden_load(*args, **kwargs):
+            load_calls.append((args, kwargs))
+            raise AssertionError("load_workbook must not be called")
+
+        monkeypatch.setattr(
+            spreadsheet.openpyxl,
+            "load_workbook",
+            forbidden_load,
+        )
+
+        with pytest.raises(InspectionError, match="merged range area"):
+            inspect_artifact(
+                "huge-merge.xlsx",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+        assert load_calls == []
+
+    @pytest.mark.parametrize(
+        "merge_ref",
+        ["A0:B1", "A1:XFE1", "A1:A1048577", "not-a-range"],
+    )
+    def test_xlsx_preflight_rejects_invalid_merge_coordinates(
+        self, tmp_path, merge_ref
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        path = tmp_path / "invalid-merge.xlsx"
+        self._save_xlsx(path)
+        self._rewrite_xlsx_member(
+            path,
+            "xl/worksheets/sheet1.xml",
+            lambda payload: payload.replace(
+                b'ref="A5:B5"',
+                f'ref="{merge_ref}"'.encode(),
+                1,
+            ),
+        )
+
+        with pytest.raises(InspectionError, match="merge reference"):
+            preflight_xlsx(str(path))
+
+    def test_xlsx_preflight_limits_cumulative_merged_cell_area(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        path = tmp_path / "merged-area.xlsx"
+        self._save_xlsx(path)
+
+        def add_merge(payload: bytes) -> bytes:
+            marker = b'<mergeCells count="1"><mergeCell ref="A5:B5"/></mergeCells>'
+            replacement = (
+                b'<mergeCells count="2"><mergeCell ref="A5:B5"/>'
+                b'<mergeCell ref="C5:D5"/></mergeCells>'
+            )
+            assert marker in payload
+            return payload.replace(marker, replacement, 1)
+
+        self._rewrite_xlsx_member(
+            path,
+            "xl/worksheets/sheet1.xml",
+            add_merge,
+        )
+        monkeypatch.setattr(
+            spreadsheet,
+            "_MAX_MERGED_CELLS",
+            3,
+            raising=False,
+        )
+
+        with pytest.raises(InspectionError, match="merged cell area"):
+            spreadsheet.preflight_xlsx(str(path))
+
+    def test_xlsx_preflight_accepts_100001_plain_rows(self, tmp_path) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        path = tmp_path / "many-plain-rows.xlsx"
+        self._save_xlsx(path)
+        rows = b"".join(
+            (
+                f'<row r="{row}"><c r="A{row}" t="n">'
+                "<v>1</v></c></row>"
+            ).encode()
+            for row in range(1, 100_002)
+        )
+        worksheet = (
+            b'<worksheet xmlns="http://schemas.openxmlformats.org/'
+            b'spreadsheetml/2006/main"><sheetData>'
+            + rows
+            + b"</sheetData></worksheet>"
+        )
+        self._rewrite_xlsx_member(
+            path,
+            "xl/worksheets/sheet1.xml",
+            lambda _payload: worksheet,
+        )
+
+        preflight_xlsx(str(path))
+
+    def test_xlsx_preflight_limits_materialized_row_dimensions(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        path = tmp_path / "row-dimension.xlsx"
+        self._save_xlsx(path)
+        self._rewrite_xlsx_member(
+            path,
+            "xl/worksheets/sheet1.xml",
+            lambda payload: payload.replace(
+                b'<row r="1">',
+                b'<row r="1" ht="15" customHeight="1">',
+                1,
+            ),
+        )
+        monkeypatch.setattr(
+            spreadsheet,
+            "_MAX_ROW_DIMENSIONS",
+            0,
+            raising=False,
+        )
+
+        with pytest.raises(InspectionError, match="row dimension"):
+            spreadsheet.preflight_xlsx(str(path))
+
+    @pytest.mark.parametrize(
+        ("member_name", "limit_name", "valid_tags", "closing_tag"),
+        [
+            (
+                "xl/worksheets/sheet1.xml",
+                "_MAX_WORKSHEET_CELLS",
+                {"c"},
+                b"</sheetData>",
+            ),
+            (
+                "xl/styles.xml",
+                "_MAX_STYLE_RECORDS",
+                {
+                    "numFmt",
+                    "font",
+                    "fill",
+                    "border",
+                    "xf",
+                    "cellStyle",
+                    "dxf",
+                    "tableStyle",
+                },
+                b"</styleSheet>",
+            ),
+        ],
+    )
+    def test_xlsx_extension_namespace_nodes_do_not_count_as_structures(
+        self,
+        tmp_path,
+        monkeypatch,
+        member_name,
+        limit_name,
+        valid_tags,
+        closing_tag,
+    ) -> None:
+        from xml.etree import ElementTree
+
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        path = tmp_path / "extension-node.xlsx"
+        self._save_xlsx(path)
+        with zipfile.ZipFile(path) as archive:
+            payload = archive.read(member_name)
+        namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        valid_qnames = {f"{{{namespace}}}{name}" for name in valid_tags}
+        valid_count = sum(
+            element.tag in valid_qnames
+            for element in ElementTree.fromstring(payload).iter()
+        )
+        extension_name = next(iter(valid_tags))
+        extension = (
+            f'<x:{extension_name} xmlns:x="urn:extension"/>'.encode()
+        )
+        self._rewrite_xlsx_member(
+            path,
+            member_name,
+            lambda content: content.replace(
+                closing_tag,
+                extension + closing_tag,
+                1,
+            ),
+        )
+        monkeypatch.setattr(spreadsheet, limit_name, valid_count)
+
+        spreadsheet.preflight_xlsx(str(path))
+
+    def test_xlsx_extension_drawing_node_does_not_count_as_object(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from openpyxl import Workbook
+        from openpyxl.chart import BarChart, Reference
+        from xml.etree import ElementTree
+
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        path = tmp_path / "extension-drawing.xlsx"
+        book = Workbook()
+        sheet = book.active
+        sheet["A1"] = 1
+        chart = BarChart()
+        chart.add_data(Reference(sheet, min_col=1, min_row=1))
+        sheet.add_chart(chart, "C1")
+        book.save(path)
+        book.close()
+        member_name = "xl/drawings/drawing1.xml"
+        with zipfile.ZipFile(path) as archive:
+            payload = archive.read(member_name)
+        namespace = (
+            "http://schemas.openxmlformats.org/drawingml/2006/"
+            "spreadsheetDrawing"
+        )
+        valid_qnames = {
+            f"{{{namespace}}}{name}"
+            for name in {"sp", "pic", "graphicFrame", "cxnSp", "grpSp"}
+        }
+        valid_count = sum(
+            element.tag in valid_qnames
+            for element in ElementTree.fromstring(payload).iter()
+        )
+        self._rewrite_xlsx_member(
+            path,
+            member_name,
+            lambda content: content.replace(
+                b"</wsDr>",
+                b'<x:graphicFrame xmlns:x="urn:extension"/></wsDr>',
+                1,
+            ),
+        )
+        monkeypatch.setattr(
+            spreadsheet,
+            "_MAX_DRAWING_OBJECTS",
+            valid_count,
+        )
+
+        spreadsheet.preflight_xlsx(str(path))
+
     def test_xlsx_structure_limits_follow_content_type_not_part_path(
         self, tmp_path, monkeypatch
     ) -> None:
@@ -2418,19 +2698,25 @@ class TestSpreadsheetInspector:
         renamed = tmp_path / "renamed-package.xlsx"
         old_name = "xl/worksheets/sheet1.xml"
         new_name = "xl/custom/sheet-data.xml"
-        with (
-            zipfile.ZipFile(path) as source,
-            zipfile.ZipFile(renamed, "w") as destination,
-        ):
-            for member in source.infolist():
-                payload = source.read(member)
-                if member.filename == "[Content_Types].xml":
+        with zipfile.ZipFile(path) as source:
+            members = [
+                (member.filename, source.read(member))
+                for member in source.infolist()
+            ]
+        with zipfile.ZipFile(renamed, "w") as destination:
+            for name, payload in members:
+                if name == "[Content_Types].xml":
+                    payload = payload.replace(
+                        f"/{old_name}".encode(),
+                        f"/{new_name}".encode(),
+                    )
+                elif name == "xl/_rels/workbook.xml.rels":
                     payload = payload.replace(
                         f"/{old_name}".encode(),
                         f"/{new_name}".encode(),
                     )
                 destination.writestr(
-                    new_name if member.filename == old_name else member.filename,
+                    new_name if name == old_name else name,
                     payload,
                 )
         os.replace(renamed, path)
@@ -2439,10 +2725,258 @@ class TestSpreadsheetInspector:
         with pytest.raises(InspectionError, match="worksheet cell"):
             spreadsheet.preflight_xlsx(str(path))
 
+    def test_xlsx_relationship_graph_accepts_renamed_worksheet(
+        self, tmp_path
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        path = tmp_path / "renamed-worksheet.xlsx"
+        self._save_xlsx(path)
+        old_name = "xl/worksheets/sheet1.xml"
+        new_name = "xl/custom/sheet-data.bin"
+
+        def rename(name: str, payload: bytes) -> tuple[str, bytes]:
+            if name == "[Content_Types].xml":
+                payload = payload.replace(
+                    f"/{old_name}".encode(),
+                    f"/{new_name}".encode(),
+                )
+            elif name == "xl/_rels/workbook.xml.rels":
+                payload = payload.replace(
+                    f"/{old_name}".encode(),
+                    f"/{new_name}".encode(),
+                )
+            return (new_name if name == old_name else name), payload
+
+        self._rewrite_xlsx_package(path, rename)
+
+        preflight_xlsx(str(path))
+
+    def test_xlsx_relationship_graph_rejects_sheet_content_type_mismatch(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "sheet-type-mismatch.xlsx"
+        self._save_xlsx(path)
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        old_name = "xl/worksheets/sheet1.xml"
+        new_name = "xl/custom/sheet-data.bin"
+        worksheet_type = (
+            b"application/vnd.openxmlformats-officedocument."
+            b"spreadsheetml.worksheet+xml"
+        )
+
+        def mismatch(name: str, payload: bytes) -> tuple[str, bytes]:
+            if name == "[Content_Types].xml":
+                payload = payload.replace(
+                    f"/{old_name}".encode(),
+                    f"/{new_name}".encode(),
+                ).replace(
+                    worksheet_type,
+                    b"application/octet-stream",
+                    1,
+                )
+            elif name == "xl/_rels/workbook.xml.rels":
+                payload = payload.replace(
+                    f"/{old_name}".encode(),
+                    f"/{new_name}".encode(),
+                )
+            return (new_name if name == old_name else name), payload
+
+        self._rewrite_xlsx_package(path, mismatch)
+        load_calls = []
+
+        def forbidden_load(*args, **kwargs):
+            load_calls.append((args, kwargs))
+            raise AssertionError("load_workbook must not be called")
+
+        monkeypatch.setattr(
+            spreadsheet.openpyxl,
+            "load_workbook",
+            forbidden_load,
+        )
+
+        with pytest.raises(
+            InspectionError,
+            match="worksheet relationship content type",
+        ):
+            inspect_artifact(
+                "sheet-type-mismatch.xlsx",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+        assert load_calls == []
+
+    def test_xlsx_relationship_graph_rejects_sheet_type_mismatch(
+        self, tmp_path
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        path = tmp_path / "sheet-relationship-type.xlsx"
+        self._save_xlsx(path)
+        worksheet_rel = (
+            b"http://schemas.openxmlformats.org/officeDocument/"
+            b"2006/relationships/worksheet"
+        )
+        chart_rel = (
+            b"http://schemas.openxmlformats.org/officeDocument/"
+            b"2006/relationships/chart"
+        )
+        self._rewrite_xlsx_member(
+            path,
+            "xl/_rels/workbook.xml.rels",
+            lambda payload: payload.replace(
+                worksheet_rel,
+                chart_rel,
+                1,
+            ),
+        )
+
+        with pytest.raises(
+            InspectionError,
+            match="sheet relationship type",
+        ):
+            preflight_xlsx(str(path))
+
+    def test_xlsx_relationship_graph_rejects_duplicate_sheet_relationship_id(
+        self, tmp_path
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        path = tmp_path / "duplicate-sheet-id.xlsx"
+        self._save_xlsx(path)
+        duplicate = (
+            b'<sheet xmlns:r="http://schemas.openxmlformats.org/'
+            b'officeDocument/2006/relationships" name="Other" '
+            b'sheetId="2" state="visible" r:id="rId1"/>'
+        )
+        self._rewrite_xlsx_member(
+            path,
+            "xl/workbook.xml",
+            lambda payload: payload.replace(
+                b"</sheets>",
+                duplicate + b"</sheets>",
+                1,
+            ),
+        )
+
+        with pytest.raises(
+            InspectionError,
+            match="sheet relationship id",
+        ):
+            preflight_xlsx(str(path))
+
+    @pytest.mark.parametrize(
+        "target",
+        ["../../xl/worksheets/sheet1.xml", "%2e%2e/%2e%2e/escape.xml"],
+    )
+    def test_xlsx_relationship_graph_rejects_traversal_target(
+        self, tmp_path, target
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        path = tmp_path / "relationship-traversal.xlsx"
+        self._save_xlsx(path)
+        self._rewrite_xlsx_member(
+            path,
+            "xl/_rels/workbook.xml.rels",
+            lambda payload: payload.replace(
+                b"/xl/worksheets/sheet1.xml",
+                target.encode(),
+                1,
+            ),
+        )
+
+        with pytest.raises(
+            InspectionError,
+            match="relationship target",
+        ):
+            preflight_xlsx(str(path))
+
+    @pytest.mark.parametrize(
+        ("part_name", "content_type", "relationship_role"),
+        [
+            (
+                "xl/drawings/drawing1.xml",
+                (
+                    b"application/vnd.openxmlformats-officedocument."
+                    b"drawing+xml"
+                ),
+                "drawing",
+            ),
+            (
+                "xl/charts/chart1.xml",
+                (
+                    b"application/vnd.openxmlformats-officedocument."
+                    b"drawingml.chart+xml"
+                ),
+                "chart",
+            ),
+        ],
+    )
+    def test_xlsx_relationship_graph_validates_drawing_and_chart_types(
+        self,
+        tmp_path,
+        part_name,
+        content_type,
+        relationship_role,
+    ) -> None:
+        from openpyxl import Workbook
+        from openpyxl.chart import BarChart, Reference
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        path = tmp_path / f"{relationship_role}-type-mismatch.xlsx"
+        book = Workbook()
+        sheet = book.active
+        sheet["A1"] = 1
+        chart = BarChart()
+        chart.add_data(Reference(sheet, min_col=1, min_row=1))
+        sheet.add_chart(chart, "C1")
+        book.save(path)
+        book.close()
+
+        def mismatch(name: str, payload: bytes) -> tuple[str, bytes]:
+            if name == "[Content_Types].xml":
+                marker = (
+                    f'<Override PartName="/{part_name}" '.encode()
+                    + b'ContentType="'
+                    + content_type
+                    + b'"/>'
+                )
+                assert marker in payload
+                payload = payload.replace(
+                    marker,
+                    (
+                        f'<Override PartName="/{part_name}" '
+                        'ContentType="application/octet-stream"/>'
+                    ).encode(),
+                    1,
+                )
+            return name, payload
+
+        self._rewrite_xlsx_package(path, mismatch)
+
+        with pytest.raises(
+            InspectionError,
+            match=f"{relationship_role} relationship content type",
+        ):
+            preflight_xlsx(str(path))
+
     @pytest.mark.parametrize(
         ("limit_name", "reason", "fixture_kind"),
         [
-            ("_MAX_WORKSHEET_ROWS", "worksheet row", "basic"),
+            ("_MAX_ROW_DIMENSIONS", "row dimension", "row-dimension"),
             ("_MAX_WORKSHEET_CELLS", "worksheet cell", "basic"),
             ("_MAX_WORKSHEET_MERGES", "worksheet merge", "basic"),
             ("_MAX_SHARED_STRING_ITEMS", "shared string item", "shared"),
@@ -2467,7 +3001,17 @@ class TestSpreadsheetInspector:
 
         path = tmp_path / f"{fixture_kind}.xlsx"
         self._save_xlsx(path)
-        if fixture_kind == "shared":
+        if fixture_kind == "row-dimension":
+            self._rewrite_xlsx_member(
+                path,
+                "xl/worksheets/sheet1.xml",
+                lambda payload: payload.replace(
+                    b'<row r="1">',
+                    b'<row r="1" hidden="1">',
+                    1,
+                ),
+            )
+        elif fixture_kind == "shared":
             shared_strings = (
                 b'<?xml version="1.0" encoding="UTF-8"?>'
                 b'<sst xmlns="http://schemas.openxmlformats.org/'
@@ -2492,6 +3036,20 @@ class TestSpreadsheetInspector:
                 path,
                 "[Content_Types].xml",
                 add_shared_override,
+            )
+            shared_relationship = (
+                b'<Relationship Type="http://schemas.openxmlformats.org/'
+                b'officeDocument/2006/relationships/sharedStrings" '
+                b'Target="/xl/sharedStrings.xml" Id="rIdShared"/>'
+            )
+            self._rewrite_xlsx_member(
+                path,
+                "xl/_rels/workbook.xml.rels",
+                lambda payload: payload.replace(
+                    b"</Relationships>",
+                    shared_relationship + b"</Relationships>",
+                    1,
+                ),
             )
         elif fixture_kind == "chart":
             book = Workbook()
@@ -3251,6 +3809,70 @@ class TestSpreadsheetInspector:
 
         with pytest.raises(InspectionError, match="expected output"):
             evaluate_xlsx_check(str(path), check)
+
+    @pytest.mark.parametrize("transient_error_kind", ["entry", "profile-dir"])
+    def test_libreoffice_conversion_retries_transient_scratch_disappearance(
+        self, tmp_path, monkeypatch, transient_error_kind
+    ) -> None:
+        from openpyxl import Workbook
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            evaluate_xlsx_check,
+        )
+
+        path = tmp_path / "legacy.xls"
+        path.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1legacy")
+        attempts = []
+
+        def fake_run(command, **kwargs):
+            attempts.append((command, kwargs))
+            if len(attempts) == 1:
+                if transient_error_kind == "entry":
+                    detail = (
+                        "[Errno 2] No such file or directory: "
+                        "'backenddb.xml'"
+                    )
+                else:
+                    profile_arg = next(
+                        part
+                        for part in command
+                        if part.startswith("-env:UserInstallation=")
+                    )
+                    profile_name = Path(
+                        profile_arg.split("file://", 1)[1]
+                    ).name
+                    detail = (
+                        "scratch directory could not be scanned: "
+                        f"work/{profile_name}/user/uno_packages/cache/"
+                        "registry/PackageRegistryBackend"
+                    )
+                raise InspectionError(
+                    f"inspector command scratch failure: {detail}"
+                )
+            out_dir = Path(command[command.index("--outdir") + 1])
+            book = Workbook()
+            book.active.title = "Summary"
+            book.active["A1"] = 7
+            book.save(out_dir / f"{Path(command[-1]).stem}.xlsx")
+            book.close()
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        monkeypatch.setattr(
+            spreadsheet,
+            "_find_libreoffice",
+            lambda: "/mock/libreoffice",
+        )
+        monkeypatch.setattr(spreadsheet, "safe_run", fake_run)
+        check = {
+            "id": "legacy-retry",
+            "type": "xlsx_cell",
+            "path": "legacy.xls",
+            "spec": {"sheet": "Summary", "cell": "A1", "value": 7},
+        }
+
+        assert evaluate_xlsx_check(str(path), check)["passed"] is True
+        assert len(attempts) == 2
+        assert attempts[1][1]["timeout"] < attempts[0][1]["timeout"]
 
     def test_libreoffice_lookup_failure_does_not_leak_input_fd(
         self, tmp_path, monkeypatch

@@ -86,6 +86,7 @@ _ZIP_MAX_COMMENT_BYTES = 65535
 _ZIP64_EOCD_LOCATOR_SIZE = 20
 _ZIP64_EOCD_FIXED_SIZE = 56
 _MAX_ZIP64_EOCD_BYTES = 1024 * 1024
+_ZIP_LOCAL_FILE_HEADER = struct.Struct("<4s5H3L2H")
 _MAX_OOXML_ENTRIES = 10_000
 _MAX_OOXML_CENTRAL_DIRECTORY_BYTES = 16 * 1024 * 1024
 _HAS_REQUIRED_DIR_FD = all(
@@ -236,7 +237,118 @@ def _safe_zip_member(name: str) -> bool:
     return not path.is_absolute() and ".." not in path.parts
 
 
-def _preflight_zip_descriptor(descriptor: int) -> bool:
+def _find_zip64_eocd_record(
+    descriptor: int,
+    locator_offset: int,
+) -> tuple[int, bytes, int] | None:
+    window_start = max(0, locator_offset - _MAX_ZIP64_EOCD_BYTES)
+    window = _read_descriptor(
+        descriptor,
+        locator_offset - window_start,
+        window_start,
+    )
+    if len(window) != locator_offset - window_start:
+        return None
+
+    candidates: list[tuple[int, bytes, int]] = []
+    search_from = 0
+    while True:
+        index = window.find(b"PK\x06\x06", search_from)
+        if index < 0:
+            break
+        search_from = index + 1
+        if len(window) - index < _ZIP64_EOCD_FIXED_SIZE:
+            continue
+        record_size = struct.unpack_from("<Q", window, index + 4)[0]
+        total_size = 12 + record_size
+        physical_offset = window_start + index
+        if (
+            record_size >= 44
+            and total_size <= _MAX_ZIP64_EOCD_BYTES
+            and physical_offset + total_size == locator_offset
+        ):
+            candidates.append(
+                (
+                    physical_offset,
+                    window[index:index + _ZIP64_EOCD_FIXED_SIZE],
+                    total_size,
+                )
+            )
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _validate_zipfile_bounds(
+    descriptor: int,
+    central_start: int,
+    total_entries: int,
+    archive_prefix: int,
+) -> bool:
+    try:
+        with os.fdopen(os.dup(descriptor), "rb") as source:
+            with zipfile.ZipFile(source) as archive:
+                members = archive.infolist()
+                if (
+                    len(members) != total_entries
+                    or archive.start_dir != central_start
+                ):
+                    return False
+                ordered = sorted(
+                    members,
+                    key=lambda member: member.header_offset,
+                )
+                for index, member in enumerate(ordered):
+                    header_offset = member.header_offset
+                    boundary = (
+                        ordered[index + 1].header_offset
+                        if index + 1 < len(ordered)
+                        else central_start
+                    )
+                    if (
+                        header_offset < archive_prefix
+                        or header_offset + _ZIP_LOCAL_FILE_HEADER.size
+                        > boundary
+                        or boundary > central_start
+                    ):
+                        return False
+                    fixed = _read_descriptor(
+                        descriptor,
+                        _ZIP_LOCAL_FILE_HEADER.size,
+                        header_offset,
+                    )
+                    if len(fixed) != _ZIP_LOCAL_FILE_HEADER.size:
+                        return False
+                    fields = _ZIP_LOCAL_FILE_HEADER.unpack(fixed)
+                    if fields[0] != b"PK\x03\x04":
+                        return False
+                    filename_size, extra_size = fields[-2:]
+                    data_start = (
+                        header_offset
+                        + _ZIP_LOCAL_FILE_HEADER.size
+                        + filename_size
+                        + extra_size
+                    )
+                    if (
+                        data_start > boundary
+                        or data_start + member.compress_size > boundary
+                    ):
+                        return False
+    except (
+        OSError,
+        RuntimeError,
+        NotImplementedError,
+        ValueError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ):
+        return False
+    return True
+
+
+def _preflight_zip_descriptor(
+    descriptor: int,
+    *,
+    validate_local_bounds: bool = True,
+) -> bool:
     file_size = os.fstat(descriptor).st_size
     tail_size = min(file_size, _ZIP_EOCD_SIZE + _ZIP_MAX_COMMENT_BYTES)
     if tail_size < _ZIP_EOCD_SIZE:
@@ -298,13 +410,13 @@ def _preflight_zip_descriptor(descriptor: int) -> bool:
             return False
         if locator_disk != 0 or total_disks != 1:
             return False
-        fixed = _read_descriptor(
+        located_record = _find_zip64_eocd_record(
             descriptor,
-            _ZIP64_EOCD_FIXED_SIZE,
-            zip64_offset,
+            locator_offset,
         )
-        if len(fixed) != _ZIP64_EOCD_FIXED_SIZE:
+        if located_record is None:
             return False
+        physical_zip64_offset, fixed, zip64_total_size = located_record
         try:
             (
                 zip64_signature,
@@ -320,16 +432,19 @@ def _preflight_zip_descriptor(descriptor: int) -> bool:
             ) = struct.unpack("<4sQ2H2L4Q", fixed)
         except struct.error:
             return False
-        zip64_total_size = 12 + zip64_record_size
+        archive_prefix = physical_zip64_offset - zip64_offset
         if (
             zip64_signature != b"PK\x06\x06"
             or zip64_record_size < 44
             or zip64_total_size > _MAX_ZIP64_EOCD_BYTES
-            or zip64_offset + zip64_total_size != locator_offset
+            or 12 + zip64_record_size != zip64_total_size
+            or archive_prefix < 0
             or version_needed < 45
             or zip64_disk != 0
             or zip64_central_disk != 0
             or zip64_entries_on_disk != zip64_total_entries
+            or zip64_central_offset + zip64_central_size
+            != zip64_offset
         ):
             return False
         classic_pairs = (
@@ -360,7 +475,8 @@ def _preflight_zip_descriptor(descriptor: int) -> bool:
         total_entries = zip64_total_entries
         central_directory_size = zip64_central_size
         central_directory_offset = zip64_central_offset
-        central_boundary = zip64_offset
+        central_start = central_directory_offset + archive_prefix
+        central_boundary = physical_zip64_offset
     else:
         if (
             disk_number != 0
@@ -368,6 +484,14 @@ def _preflight_zip_descriptor(descriptor: int) -> bool:
             or entries_on_disk != total_entries
         ):
             return False
+        archive_prefix = (
+            eocd_offset
+            - central_directory_size
+            - central_directory_offset
+        )
+        if archive_prefix < 0:
+            return False
+        central_start = central_directory_offset + archive_prefix
         central_boundary = eocd_offset
 
     if (
@@ -376,10 +500,18 @@ def _preflight_zip_descriptor(descriptor: int) -> bool:
     ):
         return False
     return (
-        central_directory_offset >= 0
+        central_start >= archive_prefix
         and central_directory_size >= 0
-        and central_directory_offset + central_directory_size
-        <= central_boundary
+        and central_start + central_directory_size == central_boundary
+        and (
+            not validate_local_bounds
+            or _validate_zipfile_bounds(
+                descriptor,
+                central_start,
+                total_entries,
+                archive_prefix,
+            )
+        )
     )
 
 

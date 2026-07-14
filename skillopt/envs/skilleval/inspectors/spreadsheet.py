@@ -10,15 +10,22 @@ import shutil
 import stat
 import struct
 import tempfile
+import time
 import unicodedata
 import zipfile
 import zlib
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import unquote_to_bytes, urlsplit
 from xml.etree import ElementTree
 
 import openpyxl
-from openpyxl.utils.cell import coordinate_to_tuple, get_column_letter
+from openpyxl.utils.cell import (
+    coordinate_to_tuple,
+    get_column_letter,
+    range_boundaries,
+)
 from openpyxl.worksheet.worksheet import Worksheet
 
 from skillopt.envs.skilleval import artifacts as artifact_security
@@ -41,12 +48,15 @@ _MAX_OOXML_ENTRIES = 10_000
 _MAX_OOXML_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 _MAX_CONTENT_TYPES_BYTES = 2 * 1024 * 1024
 _MAX_OOXML_LOCAL_METADATA_BYTES = 16 * 1024 * 1024
+_MAX_OOXML_GRAPH_PART_BYTES = 4 * 1024 * 1024
 _MAX_OOXML_XML_PART_BYTES = 32 * 1024 * 1024
 _MAX_OOXML_XML_NODES = 1_000_000
 _MAX_OOXML_XML_DEPTH = 256
-_MAX_WORKSHEET_ROWS = 100_000
+_MAX_ROW_DIMENSIONS = 50_000
 _MAX_WORKSHEET_CELLS = 250_000
 _MAX_WORKSHEET_MERGES = 50_000
+_MAX_MERGED_RANGE_CELLS = 100_000
+_MAX_MERGED_CELLS = 250_000
 _MAX_SHARED_STRING_ITEMS = 250_000
 _MAX_SHARED_STRING_CHARS = 16 * 1024 * 1024
 _MAX_STYLE_RECORDS = 100_000
@@ -65,14 +75,75 @@ _ZIP32_MAX = 0xFFFFFFFF
 _SUPPORTED_ZIP_FLAGS = 0x080E
 _CELL_PAGE_SIZE = 128
 _LIBREOFFICE_TIMEOUT_SECONDS = 120
+_LIBREOFFICE_MAX_TRANSIENT_ATTEMPTS = 3
+_TRANSIENT_SCRATCH_ENOENT = (
+    "inspector command scratch failure: [Errno 2] No such file or directory:"
+)
+_TRANSIENT_SCRATCH_PROFILE_SCAN = (
+    "inspector command scratch failure: "
+    "scratch directory could not be scanned: "
+)
 _SUPPORTED_ZIP_COMPRESSION = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
 _XLSX_WORKBOOK_CONTENT_TYPE = (
     "application/vnd.openxmlformats-officedocument."
     "spreadsheetml.sheet.main+xml"
 )
+_WORKSHEET_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument."
+    "spreadsheetml.worksheet+xml"
+)
+_CHARTSHEET_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument."
+    "spreadsheetml.chartsheet+xml"
+)
+_STYLES_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument."
+    "spreadsheetml.styles+xml"
+)
+_SHARED_STRINGS_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument."
+    "spreadsheetml.sharedStrings+xml"
+)
+_DRAWING_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument.drawing+xml"
+)
+_CHART_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument.drawingml.chart+xml"
+)
+_RELATIONSHIPS_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-package.relationships+xml"
+)
 _CONTENT_TYPES_NAMESPACE = (
     "http://schemas.openxmlformats.org/package/2006/content-types"
 )
+_SPREADSHEET_NAMESPACE = (
+    "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+)
+_PACKAGE_RELATIONSHIPS_NAMESPACE = (
+    "http://schemas.openxmlformats.org/package/2006/relationships"
+)
+_SPREADSHEET_DRAWING_NAMESPACE = (
+    "http://schemas.openxmlformats.org/drawingml/2006/"
+    "spreadsheetDrawing"
+)
+_CHART_NAMESPACE = (
+    "http://schemas.openxmlformats.org/drawingml/2006/chart"
+)
+_OFFICE_RELATIONSHIPS_NAMESPACE = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+)
+_WORKSHEET_RELATIONSHIP_TYPE = (
+    f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/worksheet"
+)
+_CHARTSHEET_RELATIONSHIP_TYPE = (
+    f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/chartsheet"
+)
+_STYLES_RELATIONSHIP_TYPE = f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/styles"
+_SHARED_STRINGS_RELATIONSHIP_TYPE = (
+    f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/sharedStrings"
+)
+_DRAWING_RELATIONSHIP_TYPE = f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/drawing"
+_CHART_RELATIONSHIP_TYPE = f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/chart"
 _CELL_SELECTOR_RE = re.compile(
     r"^sheet:([^:]+?)(?::page:([1-9][0-9]*))?$"
 )
@@ -644,6 +715,327 @@ def _is_xml_content_type(content_type: str | None) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class _Relationship:
+    id: str
+    type: str
+    target: str | None
+    external: bool
+
+
+def _parse_graph_xml(
+    archive: zipfile.ZipFile,
+    members: dict[str, zipfile.ZipInfo],
+    name: str,
+    label: str,
+):
+    member = members.get(name)
+    if member is None or member.is_dir():
+        raise InspectionError(f"OOXML {label} part is missing")
+    payload = _read_bounded_member(
+        archive,
+        member,
+        _MAX_OOXML_GRAPH_PART_BYTES,
+        f"OOXML {label} part",
+    )
+    lowered = payload.lower()
+    if b"<!doctype" in lowered or b"<!entity" in lowered:
+        raise InspectionError(
+            f"OOXML {label} part contains forbidden declarations"
+        )
+    try:
+        return ElementTree.fromstring(payload)
+    except ElementTree.ParseError as exc:
+        raise InspectionError(f"OOXML {label} part is malformed") from exc
+
+
+def _relationship_part_name(source_part: str) -> str:
+    parent, _, filename = source_part.rpartition("/")
+    prefix = f"{parent}/" if parent else ""
+    return f"{prefix}_rels/{filename}.rels"
+
+
+def _normalize_relationship_target(source_part: str, target: str) -> str:
+    if not target or "\x00" in target or "\\" in target:
+        raise InspectionError("OOXML relationship target is invalid")
+    split = urlsplit(target)
+    if split.scheme or split.netloc or split.query or split.fragment:
+        raise InspectionError("OOXML relationship target is not an internal part")
+    try:
+        decoded = unquote_to_bytes(split.path).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise InspectionError(
+            "OOXML relationship target encoding is invalid"
+        ) from exc
+    if not decoded or "\x00" in decoded or "\\" in decoded:
+        raise InspectionError("OOXML relationship target is invalid")
+
+    parts = [] if decoded.startswith("/") else source_part.split("/")[:-1]
+    for part in decoded.lstrip("/").split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if not parts:
+                raise InspectionError(
+                    "OOXML relationship target escapes the package"
+                )
+            parts.pop()
+            continue
+        parts.append(part)
+    normalized = "/".join(parts)
+    if not artifact_security._safe_zip_member(normalized):
+        raise InspectionError("OOXML relationship target is invalid")
+    return normalized
+
+
+def _parse_relationships(
+    archive: zipfile.ZipFile,
+    members: dict[str, zipfile.ZipInfo],
+    names: set[str],
+    part_content_types: dict[str, str],
+    source_part: str,
+    *,
+    required: bool = False,
+) -> tuple[str | None, dict[str, _Relationship]]:
+    relationship_part = _relationship_part_name(source_part)
+    if relationship_part not in members:
+        if required:
+            raise InspectionError("OOXML workbook relationships are missing")
+        return None, {}
+    if (
+        part_content_types.get(relationship_part)
+        != _RELATIONSHIPS_CONTENT_TYPE
+    ):
+        raise InspectionError(
+            "OOXML relationship part content type is invalid"
+        )
+    root = _parse_graph_xml(
+        archive,
+        members,
+        relationship_part,
+        "relationship",
+    )
+    relationships_tag = (
+        f"{{{_PACKAGE_RELATIONSHIPS_NAMESPACE}}}Relationships"
+    )
+    relationship_tag = (
+        f"{{{_PACKAGE_RELATIONSHIPS_NAMESPACE}}}Relationship"
+    )
+    if root.tag != relationships_tag:
+        raise InspectionError("OOXML relationship root is invalid")
+
+    relationships: dict[str, _Relationship] = {}
+    for element in root:
+        if element.tag != relationship_tag or len(element):
+            raise InspectionError("OOXML relationship entry is invalid")
+        if not set(element.attrib).issubset(
+            {"Id", "Type", "Target", "TargetMode"}
+        ):
+            raise InspectionError("OOXML relationship entry is invalid")
+        relationship_id = element.attrib.get("Id")
+        relationship_type = element.attrib.get("Type")
+        target = element.attrib.get("Target")
+        target_mode = element.attrib.get("TargetMode")
+        if (
+            not relationship_id
+            or not relationship_type
+            or not target
+            or relationship_id in relationships
+        ):
+            raise InspectionError(
+                "OOXML relationship id, type, or target is invalid"
+            )
+        if len(relationships) >= _MAX_RELATIONSHIPS:
+            raise InspectionError(
+                "OOXML relationship count exceeds configured limit"
+            )
+        if target_mode not in {None, "External"}:
+            raise InspectionError("OOXML relationship target mode is invalid")
+        external = target_mode == "External"
+        normalized_target = (
+            None
+            if external
+            else _normalize_relationship_target(source_part, target)
+        )
+        if normalized_target is not None and normalized_target not in names:
+            raise InspectionError(
+                "OOXML relationship target part is missing"
+            )
+        relationships[relationship_id] = _Relationship(
+            id=relationship_id,
+            type=relationship_type,
+            target=normalized_target,
+            external=external,
+        )
+    return relationship_part, relationships
+
+
+def _require_relationship_role(
+    roles: dict[str, set[str]],
+    part_content_types: dict[str, str],
+    relationship: _Relationship,
+    role: str,
+    expected_content_type: str,
+) -> str:
+    if relationship.external or relationship.target is None:
+        raise InspectionError(
+            f"OOXML {role} relationship must target an internal part"
+        )
+    if part_content_types.get(relationship.target) != expected_content_type:
+        raise InspectionError(
+            f"OOXML {role} relationship content type is invalid"
+        )
+    roles.setdefault(relationship.target, set()).add(role)
+    return relationship.target
+
+
+def _build_part_roles(
+    archive: zipfile.ZipFile,
+    members: dict[str, zipfile.ZipInfo],
+    names: set[str],
+    part_content_types: dict[str, str],
+) -> dict[str, set[str]]:
+    workbook_name = "xl/workbook.xml"
+    workbook = _parse_graph_xml(
+        archive,
+        members,
+        workbook_name,
+        "workbook",
+    )
+    workbook_tag = f"{{{_SPREADSHEET_NAMESPACE}}}workbook"
+    sheets_tag = f"{{{_SPREADSHEET_NAMESPACE}}}sheets"
+    sheet_tag = f"{{{_SPREADSHEET_NAMESPACE}}}sheet"
+    relationship_id_attr = (
+        f"{{{_OFFICE_RELATIONSHIPS_NAMESPACE}}}id"
+    )
+    if workbook.tag != workbook_tag:
+        raise InspectionError("OOXML workbook root is invalid")
+    sheets = workbook.find(sheets_tag)
+    if sheets is None:
+        raise InspectionError("OOXML workbook sheets are missing")
+
+    roles: dict[str, set[str]] = {workbook_name: {"workbook"}}
+    relationship_parts: set[str] = set()
+    relationship_cache: dict[str, dict[str, _Relationship]] = {}
+
+    def relationships_for(
+        source_part: str,
+        *,
+        required: bool = False,
+    ) -> dict[str, _Relationship]:
+        if source_part in relationship_cache:
+            return relationship_cache[source_part]
+        part_name, parsed = _parse_relationships(
+            archive,
+            members,
+            names,
+            part_content_types,
+            source_part,
+            required=required,
+        )
+        relationship_cache[source_part] = parsed
+        if part_name is not None:
+            relationship_parts.add(part_name)
+        return parsed
+
+    workbook_relationships = relationships_for(
+        workbook_name,
+        required=True,
+    )
+    sheet_relationship_ids: set[str] = set()
+    sheet_targets: set[str] = set()
+    sheet_parts: list[str] = []
+    for sheet in sheets:
+        if sheet.tag != sheet_tag:
+            continue
+        relationship_id = sheet.attrib.get(relationship_id_attr)
+        if (
+            not relationship_id
+            or relationship_id in sheet_relationship_ids
+        ):
+            raise InspectionError(
+                "OOXML sheet relationship id is missing or duplicated"
+            )
+        sheet_relationship_ids.add(relationship_id)
+        relationship = workbook_relationships.get(relationship_id)
+        if relationship is None:
+            raise InspectionError("OOXML sheet relationship is missing")
+        if relationship.type == _WORKSHEET_RELATIONSHIP_TYPE:
+            role = "worksheet"
+            content_type = _WORKSHEET_CONTENT_TYPE
+        elif relationship.type == _CHARTSHEET_RELATIONSHIP_TYPE:
+            role = "chartsheet"
+            content_type = _CHARTSHEET_CONTENT_TYPE
+        else:
+            raise InspectionError("OOXML sheet relationship type is invalid")
+        target = _require_relationship_role(
+            roles,
+            part_content_types,
+            relationship,
+            role,
+            content_type,
+        )
+        if target in sheet_targets:
+            raise InspectionError("OOXML sheet relationship target is duplicated")
+        sheet_targets.add(target)
+        sheet_parts.append(target)
+
+    for relationship in workbook_relationships.values():
+        if relationship.type == _STYLES_RELATIONSHIP_TYPE:
+            _require_relationship_role(
+                roles,
+                part_content_types,
+                relationship,
+                "styles",
+                _STYLES_CONTENT_TYPE,
+            )
+        elif relationship.type == _SHARED_STRINGS_RELATIONSHIP_TYPE:
+            _require_relationship_role(
+                roles,
+                part_content_types,
+                relationship,
+                "shared_strings",
+                _SHARED_STRINGS_CONTENT_TYPE,
+            )
+
+    drawing_parts: set[str] = set()
+    for sheet_part in sheet_parts:
+        for relationship in relationships_for(sheet_part).values():
+            if relationship.type == _DRAWING_RELATIONSHIP_TYPE:
+                drawing_parts.add(
+                    _require_relationship_role(
+                        roles,
+                        part_content_types,
+                        relationship,
+                        "drawing",
+                        _DRAWING_CONTENT_TYPE,
+                    )
+                )
+            elif relationship.type == _CHART_RELATIONSHIP_TYPE:
+                _require_relationship_role(
+                    roles,
+                    part_content_types,
+                    relationship,
+                    "chart",
+                    _CHART_CONTENT_TYPE,
+                )
+
+    for drawing_part in drawing_parts:
+        for relationship in relationships_for(drawing_part).values():
+            if relationship.type == _CHART_RELATIONSHIP_TYPE:
+                _require_relationship_role(
+                    roles,
+                    part_content_types,
+                    relationship,
+                    "chart",
+                    _CHART_CONTENT_TYPE,
+                )
+
+    for part_name in relationship_parts:
+        roles.setdefault(part_name, set()).add("relationships")
+    return roles
+
+
 def _xml_local_name(tag: object) -> str:
     if not isinstance(tag, str):
         return ""
@@ -652,21 +1044,37 @@ def _xml_local_name(tag: object) -> str:
 
 class _XmlStructureValidator:
     _STYLE_TAGS = {
-        "numFmt",
-        "font",
-        "fill",
-        "border",
-        "xf",
-        "cellStyle",
-        "dxf",
-        "tableStyle",
+        f"{{{_SPREADSHEET_NAMESPACE}}}{name}"
+        for name in {
+            "numFmt",
+            "font",
+            "fill",
+            "border",
+            "xf",
+            "cellStyle",
+            "dxf",
+            "tableStyle",
+        }
     }
-    _DRAWING_TAGS = {"sp", "pic", "graphicFrame", "cxnSp", "grpSp"}
+    _DRAWING_TAGS = {
+        f"{{{_SPREADSHEET_DRAWING_NAMESPACE}}}{name}"
+        for name in {"sp", "pic", "graphicFrame", "cxnSp", "grpSp"}
+    }
+    _ROW_TAG = f"{{{_SPREADSHEET_NAMESPACE}}}row"
+    _CELL_TAG = f"{{{_SPREADSHEET_NAMESPACE}}}c"
+    _MERGE_TAG = f"{{{_SPREADSHEET_NAMESPACE}}}mergeCell"
+    _SHARED_STRING_ITEM_TAG = f"{{{_SPREADSHEET_NAMESPACE}}}si"
+    _TEXT_TAG = f"{{{_SPREADSHEET_NAMESPACE}}}t"
+    _RELATIONSHIP_TAG = (
+        f"{{{_PACKAGE_RELATIONSHIPS_NAMESPACE}}}Relationship"
+    )
+    _CHART_TAG = f"{{{_CHART_NAMESPACE}}}chart"
+    _CHART_SERIES_TAG = f"{{{_CHART_NAMESPACE}}}ser"
 
     def __init__(
         self,
         name: str,
-        content_type: str | None,
+        roles: set[str],
         totals: dict[str, int],
     ) -> None:
         self._name = name
@@ -675,49 +1083,45 @@ class _XmlStructureValidator:
         self._bytes = 0
         self._depth = 0
         self._declaration_tail = b""
-        media_type = (
-            content_type.split(";", 1)[0].strip().casefold()
-            if content_type is not None
-            else ""
-        )
-        self._worksheet = (
-            media_type.endswith(".worksheet+xml")
-            or (
-                name.startswith("xl/worksheets/")
-                and name.endswith(".xml")
-            )
-        )
-        self._shared_strings = (
-            media_type.endswith(".sharedstrings+xml")
-            or name == "xl/sharedStrings.xml"
-        )
-        self._styles = (
-            media_type.endswith(".styles+xml")
-            or name == "xl/styles.xml"
-        )
-        self._relationships = (
-            media_type.endswith(".relationships+xml")
-            or name.endswith(".rels")
-        )
-        self._drawing = (
-            media_type.endswith(".drawing+xml")
-            or (
-                name.startswith("xl/drawings/")
-                and name.endswith(".xml")
-            )
-        )
-        self._chart = (
-            media_type.endswith(".chart+xml")
-            or (
-                name.startswith("xl/charts/")
-                and name.endswith(".xml")
-            )
-        )
+        self._worksheet = "worksheet" in roles
+        self._shared_strings = "shared_strings" in roles
+        self._styles = "styles" in roles
+        self._relationships = "relationships" in roles
+        self._drawing = "drawing" in roles
+        self._chart = "chart" in roles
 
     def _increment(self, key: str, limit: int, label: str) -> None:
         self._totals[key] = self._totals.get(key, 0) + 1
         if self._totals[key] > limit:
             raise InspectionError(f"OOXML {label} count exceeds configured limit")
+
+    def _count_merge_area(self, element) -> None:
+        merge_ref = element.attrib.get("ref")
+        try:
+            min_col, min_row, max_col, max_row = range_boundaries(merge_ref)
+        except (TypeError, ValueError) as exc:
+            raise InspectionError("OOXML merge reference is invalid") from exc
+        if (
+            min_col is None
+            or min_row is None
+            or max_col is None
+            or max_row is None
+            or not 1 <= min_col <= max_col <= 16_384
+            or not 1 <= min_row <= max_row <= 1_048_576
+        ):
+            raise InspectionError("OOXML merge reference is invalid or out of range")
+        area = (max_col - min_col + 1) * (max_row - min_row + 1)
+        if area > _MAX_MERGED_RANGE_CELLS:
+            raise InspectionError(
+                "OOXML merged range area exceeds configured limit"
+            )
+        self._totals["merged_cells"] = (
+            self._totals.get("merged_cells", 0) + area
+        )
+        if self._totals["merged_cells"] > _MAX_MERGED_CELLS:
+            raise InspectionError(
+                "OOXML cumulative merged cell area exceeds configured limit"
+            )
 
     def _drain_events(self) -> None:
         for event, element in self._parser.read_events():
@@ -734,52 +1138,67 @@ class _XmlStructureValidator:
                     "XML node",
                 )
                 if self._worksheet:
-                    if local_name == "row":
-                        self._increment(
-                            "worksheet_rows",
-                            _MAX_WORKSHEET_ROWS,
-                            "worksheet row",
-                        )
-                    elif local_name == "c":
+                    if element.tag == self._ROW_TAG:
+                        dimension_attributes = {
+                            key
+                            for key in element.attrib
+                            if not key.startswith("{") and key not in {"r", "spans"}
+                        }
+                        if dimension_attributes:
+                            self._increment(
+                                "row_dimensions",
+                                _MAX_ROW_DIMENSIONS,
+                                "row dimension",
+                            )
+                    elif element.tag == self._CELL_TAG:
                         self._increment(
                             "worksheet_cells",
                             _MAX_WORKSHEET_CELLS,
                             "worksheet cell",
                         )
-                    elif local_name == "mergeCell":
+                    elif element.tag == self._MERGE_TAG:
                         self._increment(
                             "worksheet_merges",
                             _MAX_WORKSHEET_MERGES,
                             "worksheet merge",
                         )
-                if self._shared_strings and local_name == "si":
+                        self._count_merge_area(element)
+                if (
+                    self._shared_strings
+                    and element.tag == self._SHARED_STRING_ITEM_TAG
+                ):
                     self._increment(
                         "shared_string_items",
                         _MAX_SHARED_STRING_ITEMS,
                         "shared string item",
                     )
-                if self._styles and local_name in self._STYLE_TAGS:
+                if self._styles and element.tag in self._STYLE_TAGS:
                     self._increment(
                         "style_records",
                         _MAX_STYLE_RECORDS,
                         "style record",
                     )
-                if self._relationships and local_name == "Relationship":
+                if (
+                    self._relationships
+                    and element.tag == self._RELATIONSHIP_TAG
+                ):
                     self._increment(
                         "relationships",
                         _MAX_RELATIONSHIPS,
                         "relationship",
                     )
-                if self._drawing and local_name in self._DRAWING_TAGS:
+                if self._drawing and element.tag in self._DRAWING_TAGS:
                     self._increment(
                         "drawing_objects",
                         _MAX_DRAWING_OBJECTS,
                         "drawing object",
                     )
                 if self._chart and (
-                    local_name == "chart"
-                    or local_name == "ser"
-                    or local_name.endswith("Chart")
+                    element.tag in {self._CHART_TAG, self._CHART_SERIES_TAG}
+                    or (
+                        element.tag.startswith(f"{{{_CHART_NAMESPACE}}}")
+                        and local_name.endswith("Chart")
+                    )
                 ):
                     self._increment(
                         "chart_objects",
@@ -787,7 +1206,7 @@ class _XmlStructureValidator:
                         "chart object",
                     )
             else:
-                if self._shared_strings and local_name == "t":
+                if self._shared_strings and element.tag == self._TEXT_TAG:
                     chars = len(element.text or "")
                     self._totals["shared_string_chars"] = (
                         self._totals.get("shared_string_chars", 0) + chars
@@ -863,7 +1282,10 @@ def preflight_xlsx(path: str) -> None:
     """Validate an XLSX ZIP before a parser opens it."""
     descriptor = _open_stable_descriptor(path, "OOXML workbook")
     try:
-        if not artifact_security._preflight_zip_descriptor(descriptor):
+        if not artifact_security._preflight_zip_descriptor(
+            descriptor,
+            validate_local_bounds=False,
+        ):
             raise InspectionError("OOXML ZIP central directory failed preflight")
 
         with os.fdopen(os.dup(descriptor), "rb") as source:
@@ -877,6 +1299,7 @@ def preflight_xlsx(path: str) -> None:
                         )
 
                     names: set[str] = set()
+                    members_by_name: dict[str, zipfile.ZipInfo] = {}
                     collision_keys: set[str] = set()
                     declared_total = 0
                     content_types_info: zipfile.ZipInfo | None = None
@@ -890,6 +1313,7 @@ def preflight_xlsx(path: str) -> None:
                                 "duplicate or colliding OOXML entry name"
                             )
                         names.add(name)
+                        members_by_name[name] = member
                         collision_keys.add(collision_key)
                         declared_total += member.file_size
                         if declared_total > _MAX_OOXML_UNCOMPRESSED_BYTES:
@@ -919,6 +1343,12 @@ def preflight_xlsx(path: str) -> None:
                         content_types,
                         names,
                     )
+                    part_roles = _build_part_roles(
+                        archive,
+                        members_by_name,
+                        names,
+                        part_content_types,
+                    )
 
                     actual_total = 0
                     xml_totals: dict[str, int] = {}
@@ -935,7 +1365,7 @@ def preflight_xlsx(path: str) -> None:
                         xml_validator = (
                             _XmlStructureValidator(
                                 name,
-                                content_type,
+                                part_roles.get(name, set()),
                                 xml_totals,
                             )
                             if (
@@ -1035,6 +1465,19 @@ def _write_libreoffice_profile(profile: Path) -> None:
     (profile / "fontconfig.xml").write_text(fontconfig, encoding="utf-8")
 
 
+def _is_transient_libreoffice_scratch_error(
+    exc: InspectionError,
+    profile: Path,
+) -> bool:
+    message = str(exc)
+    if message.startswith(_TRANSIENT_SCRATCH_ENOENT):
+        return True
+    profile_scan_prefix = (
+        f"{_TRANSIENT_SCRATCH_PROFILE_SCAN}work/{profile.name}/"
+    )
+    return message.startswith(profile_scan_prefix)
+
+
 def _convert_with_libreoffice(
     path: str,
     scratch_dir: str,
@@ -1077,13 +1520,31 @@ def _convert_with_libreoffice(
         input_path,
     ]
     try:
-        safe_run(
-            command,
-            timeout=_LIBREOFFICE_TIMEOUT_SECONDS,
-            cwd=scratch_dir,
-            home=scratch_dir,
-            pass_fds=(input_descriptor,),
-        )
+        deadline = time.monotonic() + _LIBREOFFICE_TIMEOUT_SECONDS
+        for attempt in range(_LIBREOFFICE_MAX_TRANSIENT_ATTEMPTS):
+            remaining_timeout = deadline - time.monotonic()
+            if remaining_timeout <= 0:
+                raise InspectionError(
+                    "LibreOffice conversion exceeded its total timeout"
+                )
+            try:
+                safe_run(
+                    command,
+                    timeout=remaining_timeout,
+                    cwd=scratch_dir,
+                    home=scratch_dir,
+                    pass_fds=(input_descriptor,),
+                )
+                break
+            except InspectionError as exc:
+                if (
+                    attempt + 1 >= _LIBREOFFICE_MAX_TRANSIENT_ATTEMPTS
+                    or not _is_transient_libreoffice_scratch_error(
+                        exc,
+                        profile,
+                    )
+                ):
+                    raise
 
         expected = output_dir / f"{input_descriptor}.{target_format}"
         try:
