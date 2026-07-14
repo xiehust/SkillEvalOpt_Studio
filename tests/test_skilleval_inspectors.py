@@ -14,8 +14,10 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
+import warnings
 import zipfile
 import zlib
 from pathlib import Path
@@ -5084,6 +5086,42 @@ class TestPdfImageInspectors:
         )
         assert text_command[2:6] == ["-f", "1", "-l", "1"]
 
+    def test_pdf_extract_only_marks_default_page_as_truncated(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        def fake_run(command, **kwargs):
+            stdout = (
+                "Pages: 3\n"
+                if command[0] == "pdfinfo"
+                else "first page\f"
+            )
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        monkeypatch.setattr(pdf_image, "safe_run", fake_run)
+
+        explicit = extract_artifact(
+            "report.pdf",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["page:1"],
+        )
+        default = extract_artifact(
+            "report.pdf",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        assert explicit["units_inspected"] == ["page:1"]
+        assert explicit["truncated"] is False
+        assert explicit["next_cursor"] is None
+        assert default["units_inspected"] == ["page:1"]
+        assert default["truncated"] is True
+        assert default["next_cursor"] == "page:2"
+
     def test_pdf_contains_text_streams_pages_under_total_budgets(
         self, tmp_path, monkeypatch
     ) -> None:
@@ -5262,6 +5300,131 @@ class TestPdfImageInspectors:
                 scratch_dir=str(scratch),
             )
 
+    def test_image_frame_index_never_reads_n_frames_or_seeks_past_limit(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        seek_calls = []
+
+        class ManyFrameImage:
+            format = "GIF"
+            size = (1, 1)
+            width = 1
+            height = 1
+            mode = "RGB"
+            info = {}
+
+            @property
+            def n_frames(self):
+                raise AssertionError("n_frames may scan the full image")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def verify(self):
+                return None
+
+            def seek(self, index):
+                seek_calls.append(index)
+                if index >= 3_000:
+                    raise EOFError
+
+            def load(self):
+                return None
+
+            def getbands(self):
+                return ("R", "G", "B")
+
+        monkeypatch.setattr(
+            pdf_image.PillowImage,
+            "open",
+            lambda path: ManyFrameImage(),
+        )
+
+        with pytest.raises(InspectionError, match="frame count"):
+            pdf_image.ImageInspector().inspect(
+                str(tmp_path / "many.gif"),
+                str(tmp_path),
+                response_budget=ResponseBudget(),
+            )
+
+        assert seek_calls == list(range(pdf_image.MAX_IMAGE_FRAMES + 1))
+
+    def test_pillow_warning_guard_serializes_threads_and_restores_filters(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        baseline_filters = warnings.filters[:]
+        start = threading.Barrier(2)
+        state_lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        class ThreadImage:
+            format = "PNG"
+            size = (1, 1)
+            width = 1
+            height = 1
+            mode = "RGB"
+            info = {}
+
+            def __enter__(self):
+                nonlocal active, max_active
+                with state_lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.05)
+                return self
+
+            def __exit__(self, *args):
+                nonlocal active
+                with state_lock:
+                    active -= 1
+                return False
+
+            def verify(self):
+                return None
+
+            def seek(self, index):
+                if index:
+                    raise EOFError
+
+            def load(self):
+                return None
+
+            def getbands(self):
+                return ("R", "G", "B")
+
+        monkeypatch.setattr(
+            pdf_image.PillowImage,
+            "open",
+            lambda path: ThreadImage(),
+        )
+
+        def inspect():
+            start.wait(timeout=2)
+            return pdf_image._inspect_image_metadata(
+                str(tmp_path / "threaded.png")
+            )
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(inspect) for _ in range(2)]
+                for future in futures:
+                    future.result(timeout=5)
+            filters_after = warnings.filters[:]
+        finally:
+            warnings.filters[:] = baseline_filters
+            warnings._filters_mutated()
+
+        assert max_active == 1
+        assert filters_after == baseline_filters
+
     def test_image_decoded_limit_accounts_for_sample_width(
         self, tmp_path, monkeypatch
     ) -> None:
@@ -5381,6 +5544,59 @@ class TestPdfImageInspectors:
             assert rendered.mode == "RGB"
             assert "icc_profile" not in rendered.info
             assert rendered.getexif().get(274) is None
+
+    def test_image_render_bounds_png_during_save_and_rolls_back(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        pixel_count = 82 * 82 * 3
+        pixels = b"".join(
+            hashlib.sha256(str(index).encode()).digest()
+            for index in range((pixel_count + 31) // 32)
+        )[:pixel_count]
+        source_image = PillowImage.frombytes("RGB", (82, 82), pixels)
+        source = evidence / "noisy.jpg"
+        source_image.save(source, format="JPEG", quality=10, optimize=True)
+        source_image.close()
+
+        expected = tmp_path / "expected.png"
+        with PillowImage.open(source) as decoded:
+            decoded.load()
+            decoded.save(expected, format="PNG")
+        assert expected.stat().st_size > 16_812
+
+        real_save = PillowImage.Image.save
+        observed_sizes = []
+
+        def recording_save(image, target, *args, **kwargs):
+            try:
+                return real_save(image, target, *args, **kwargs)
+            finally:
+                try:
+                    descriptor = target.fileno()
+                except (AttributeError, OSError):
+                    try:
+                        observed_sizes.append(os.stat(target).st_size)
+                    except (FileNotFoundError, TypeError):
+                        pass
+                else:
+                    observed_sizes.append(os.fstat(descriptor).st_size)
+
+        monkeypatch.setattr(PillowImage.Image, "save", recording_save)
+        scratch_limit = 3_328
+
+        with pytest.raises(InspectionError, match="scratch byte budget"):
+            render_artifact(
+                "noisy.jpg",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+                max_pixels=82 * 82,
+                max_scratch_bytes=scratch_limit,
+            )
+
+        assert observed_sizes
+        assert max(observed_sizes) <= scratch_limit - source.stat().st_size
+        assert list(scratch.iterdir()) == []
 
     @pytest.mark.parametrize("kind", ["image", "pdf"])
     def test_render_pixel_overflow_rolls_back_transaction(

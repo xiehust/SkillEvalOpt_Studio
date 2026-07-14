@@ -1,14 +1,17 @@
 """Bounded PDF and raster-image inspection and rendering."""
 from __future__ import annotations
 
+import io
 import json
 import math
 import os
 import re
 import stat
 import subprocess
+import threading
 import time
 import warnings
+from contextlib import contextmanager
 
 from PIL import Image as PillowImage
 from PIL import ImageOps
@@ -55,6 +58,15 @@ _PILLOW_FORMAT_ERRORS = (
     PillowImage.DecompressionBombWarning,
     PillowImage.DecompressionBombError,
 )
+_PILLOW_WARNING_LOCK = threading.RLock()
+
+
+@contextmanager
+def _pillow_warning_guard():
+    with _PILLOW_WARNING_LOCK:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", PillowImage.DecompressionBombWarning)
+            yield
 
 
 def _json_bytes(value: object) -> int:
@@ -411,6 +423,107 @@ def _remove_outputs(outputs: list[str]) -> None:
             pass
 
 
+class _BoundedScratchSink(io.RawIOBase):
+    """Write one output without ever growing past its transaction allowance."""
+
+    def __init__(self, transaction, name: str) -> None:
+        super().__init__()
+        usage = transaction.check()
+        if usage.entries >= transaction.requested_limits.max_entries:
+            raise InspectionError("scratch entry budget exceeded")
+        self._max_size = transaction.requested_limits.max_bytes - usage.bytes
+        self._descriptor = -1
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            self._descriptor = os.open(
+                name,
+                flags,
+                0o600,
+                dir_fd=transaction.descriptor,
+            )
+        except FileExistsError as exc:
+            raise InspectionError("image render output already exists") from exc
+        except OSError as exc:
+            raise InspectionError(
+                f"image render output could not be created: "
+                f"{bounded_diagnostic(exc)}"
+            ) from exc
+        try:
+            transaction.check()
+        except BaseException:
+            os.close(self._descriptor)
+            self._descriptor = -1
+            os.unlink(name, dir_fd=transaction.descriptor)
+            raise
+
+    def writable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
+        if self.closed or self._descriptor < 0:
+            raise ValueError("I/O operation on closed file")
+        return self._descriptor
+
+    def tell(self) -> int:
+        return os.lseek(self.fileno(), 0, os.SEEK_CUR)
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        descriptor = self.fileno()
+        if whence == os.SEEK_SET:
+            target = offset
+        elif whence == os.SEEK_CUR:
+            target = os.lseek(descriptor, 0, os.SEEK_CUR) + offset
+        elif whence == os.SEEK_END:
+            target = os.fstat(descriptor).st_size + offset
+        else:
+            raise ValueError(f"invalid whence ({whence})")
+        if target < 0 or target > self._max_size:
+            raise InspectionError("scratch byte budget exceeded during image render")
+        return os.lseek(descriptor, target, os.SEEK_SET)
+
+    def write(self, data) -> int:
+        descriptor = self.fileno()
+        view = memoryview(data)
+        length = view.nbytes
+        position = os.lseek(descriptor, 0, os.SEEK_CUR)
+        projected_size = max(
+            os.fstat(descriptor).st_size,
+            position + length,
+        )
+        if projected_size > self._max_size:
+            raise InspectionError("scratch byte budget exceeded during image render")
+        written = 0
+        while written < length:
+            count = os.write(descriptor, view[written:])
+            if count <= 0:
+                raise InspectionError("image render output could not be written")
+            written += count
+        return written
+
+    def flush(self) -> None:
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        descriptor = self._descriptor
+        try:
+            super().close()
+        finally:
+            self._descriptor = -1
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
 def _verify_rendered_png(
     path: str,
     *,
@@ -422,8 +535,7 @@ def _verify_rendered_png(
             raise InspectionError(
                 "rendered image must be a regular non-symlink file"
             )
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", PillowImage.DecompressionBombWarning)
+        with _pillow_warning_guard():
             with PillowImage.open(path) as image:
                 if image.format != "PNG":
                     raise InspectionError("rendered image must be PNG")
@@ -459,9 +571,13 @@ def _verify_rendered_png(
 
 
 def _inspect_image_metadata(path: str) -> tuple[dict, list[dict]]:
+    with _pillow_warning_guard():
+        return _inspect_image_metadata_locked(path)
+
+
+def _inspect_image_metadata_locked(path: str) -> tuple[dict, list[dict]]:
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", PillowImage.DecompressionBombWarning)
+        with _pillow_warning_guard():
             with PillowImage.open(path) as image:
                 image.verify()
 
@@ -469,21 +585,23 @@ def _inspect_image_metadata(path: str) -> tuple[dict, list[dict]]:
         total_pixels = 0
         total_decoded_bytes = 0
         has_transparency = False
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", PillowImage.DecompressionBombWarning)
+        with _pillow_warning_guard():
             with PillowImage.open(path) as image:
                 image_format = image.format
-                frame_count = int(getattr(image, "n_frames", 1))
-                if not image_format or frame_count <= 0:
+                if not image_format:
                     raise InspectionError("image metadata is invalid")
-                if frame_count > MAX_IMAGE_FRAMES:
-                    raise InspectionError(
-                        f"image frame count exceeds maximum {MAX_IMAGE_FRAMES}"
-                    )
                 first_size: tuple[int, int] | None = None
                 first_mode = ""
-                for index in range(frame_count):
-                    image.seek(index)
+                for index in range(MAX_IMAGE_FRAMES + 1):
+                    try:
+                        image.seek(index)
+                    except EOFError:
+                        break
+                    if index == MAX_IMAGE_FRAMES:
+                        raise InspectionError(
+                            "image frame count exceeds maximum "
+                            f"{MAX_IMAGE_FRAMES}"
+                        )
                     width, height = image.size
                     if width <= 0 or height <= 0:
                         raise InspectionError("image dimensions must be positive")
@@ -522,7 +640,8 @@ def _inspect_image_metadata(path: str) -> tuple[dict, list[dict]]:
                     if first_size is None:
                         first_size = (width, height)
                         first_mode = image.mode
-        assert first_size is not None
+                if first_size is None:
+                    raise InspectionError("image metadata is invalid")
         result = {
             "kind": "image",
             "opens": True,
@@ -550,11 +669,7 @@ def _image_metadata_fields(path: str, summary: dict) -> dict:
         "has_transparency": summary["has_transparency"],
     }
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter(
-                "error",
-                PillowImage.DecompressionBombWarning,
-            )
+        with _pillow_warning_guard():
             with PillowImage.open(path) as image:
                 orientation = image.getexif().get(274)
                 if orientation is not None:
@@ -789,17 +904,16 @@ class ImageInspector:
             raise InspectionError(
                 "image rendering requires an active scratch transaction"
             )
-        _summary, frame_metadata = _inspect_image_metadata(path)
-        selected = _selected_image_frames(selectors, len(frame_metadata))
         normalized_frames: list[tuple[int, PillowImage.Image]] = []
         outputs: list[str] = []
         try:
-            total_pixels = 0
-            with warnings.catch_warnings():
-                warnings.simplefilter(
-                    "error",
-                    PillowImage.DecompressionBombWarning,
+            with _pillow_warning_guard():
+                _summary, frame_metadata = _inspect_image_metadata(path)
+                selected = _selected_image_frames(
+                    selectors,
+                    len(frame_metadata),
                 )
+                total_pixels = 0
                 with PillowImage.open(path) as image:
                     for frame_number in selected:
                         image.seek(frame_number - 1)
@@ -815,31 +929,35 @@ class ImageInspector:
                             (frame_number, normalized)
                         )
 
-            for frame_number, normalized in normalized_frames:
-                output = os.path.join(
-                    scratch_dir,
-                    f"frame-{frame_number:04d}.png",
-                )
-                if os.path.lexists(output):
-                    raise InspectionError(
-                        "image render output already exists"
+                for frame_number, normalized in normalized_frames:
+                    output_name = f"frame-{frame_number:04d}.png"
+                    output = os.path.join(
+                        scratch_dir,
+                        output_name,
                     )
-                normalized.save(output, format="PNG")
-                outputs.append(output)
+                    sink = _BoundedScratchSink(transaction, output_name)
+                    outputs.append(output)
+                    try:
+                        normalized.save(sink, format="PNG")
+                    finally:
+                        sink.close()
+                    transaction.check()
 
-            rendered_pixels = 0
-            for output in outputs:
-                width, height = _verify_rendered_png(
-                    output,
-                    remaining_pixels=budget.max_pixels - rendered_pixels,
-                )
-                rendered_pixels += width * height
-                if rendered_pixels > budget.max_pixels:
-                    raise InspectionError(
-                        "image render pixel budget exceeded"
+                rendered_pixels = 0
+                for output in outputs:
+                    width, height = _verify_rendered_png(
+                        output,
+                        remaining_pixels=(
+                            budget.max_pixels - rendered_pixels
+                        ),
                     )
-            transaction.check()
-            return outputs
+                    rendered_pixels += width * height
+                    if rendered_pixels > budget.max_pixels:
+                        raise InspectionError(
+                            "image render pixel budget exceeded"
+                        )
+                transaction.check()
+                return outputs
         except InspectionError:
             _remove_outputs(outputs)
             raise
@@ -907,7 +1025,10 @@ class PdfInspector:
                 "pages": pages,
                 "characters": 0,
             },
-            "truncated": pages > len(reply_pages),
+            "truncated": (
+                len(selected) > len(reply_pages)
+                or (not selectors and pages > len(reply_pages))
+            ),
             "next_cursor": (
                 f"page:{selected[len(reply_pages)]}"
                 if len(selected) > len(reply_pages)
