@@ -903,6 +903,64 @@ def _revalidate_source_entry(
     return entry
 
 
+def _revalidate_destination_entry(
+    evidence_descriptor: int,
+    destination_descriptor: int,
+    parts: tuple[str, ...],
+    copied_info: os.stat_result,
+    expected: ManifestEntry,
+) -> ManifestEntry:
+    rel = "/".join(parts)
+    retained_info = os.fstat(destination_descriptor)
+    if (
+        not stat.S_ISREG(retained_info.st_mode)
+        or retained_info.st_nlink != 1
+        or not _same_filesystem_object(copied_info, retained_info)
+        or retained_info.st_size != expected.size
+        or stat.S_IMODE(retained_info.st_mode) != 0o444
+    ):
+        raise ValueError(f"copied evidence destination changed after locking: {rel}")
+    retained_size, retained_hash = _hash_descriptor(destination_descriptor)
+    if retained_size != expected.size or retained_hash != expected.sha256:
+        raise ValueError(f"copied evidence destination content changed: {rel}")
+
+    named_descriptor = _open_relative_file(evidence_descriptor, parts)
+    try:
+        named_info = os.fstat(named_descriptor)
+        if (
+            not stat.S_ISREG(named_info.st_mode)
+            or named_info.st_nlink != 1
+            or not _same_filesystem_object(copied_info, named_info)
+            or named_info.st_size != expected.size
+            or stat.S_IMODE(named_info.st_mode) != 0o444
+        ):
+            raise ValueError(f"copied evidence destination name changed: {rel}")
+        entry = _manifest_entry_from_descriptor(
+            named_descriptor,
+            rel,
+            require_single_link=True,
+        )
+        final_named_info = os.fstat(named_descriptor)
+        if not _same_filesystem_object(copied_info, final_named_info):
+            raise ValueError(f"copied evidence destination changed: {rel}")
+    finally:
+        os.close(named_descriptor)
+
+    confirmation_descriptor = _open_relative_file(evidence_descriptor, parts)
+    try:
+        if not _same_filesystem_object(
+            copied_info,
+            os.fstat(confirmation_descriptor),
+        ):
+            raise ValueError(f"copied evidence destination name changed: {rel}")
+    finally:
+        os.close(confirmation_descriptor)
+
+    if entry != expected:
+        raise ValueError(f"copied evidence destination content changed: {rel}")
+    return entry
+
+
 def _lock_evidence_directories(evidence_descriptor: int) -> None:
     with os.scandir(evidence_descriptor) as entries:
         names = sorted(entry.name for entry in entries)
@@ -974,6 +1032,7 @@ def create_evidence_snapshot(
     work_descriptor = _open_absolute_directory(work_dir)
     prepared: _JudgeDirs | None = None
     validated_sources: list[tuple[dict, tuple[str, ...], int, os.stat_result]] = []
+    copied_destinations: list[tuple[tuple[str, ...], int, os.stat_result]] = []
     try:
         prepared = _prepare_judge_dirs(judge_root)
         evidence = prepared.evidence_path
@@ -1005,7 +1064,7 @@ def create_evidence_snapshot(
                 parts,
             )
             try:
-                copied_total += _copy_validated_file(
+                copied = _copy_validated_file(
                     source_descriptor,
                     destination_descriptor,
                     rel=rel,
@@ -1013,8 +1072,13 @@ def create_evidence_snapshot(
                     expected_sha256=row.get("sha256"),
                     initial_info=info,
                 )
-            finally:
+                copied_total += copied
+                copied_destinations.append(
+                    (parts, destination_descriptor, os.fstat(destination_descriptor))
+                )
+            except Exception:
                 os.close(destination_descriptor)
+                raise
 
         evidence_rows, evidence_directories = _scan_manifest_descriptor(
             prepared.evidence_descriptor,
@@ -1058,10 +1122,25 @@ def create_evidence_snapshot(
             )
             for row, parts, source_descriptor, info in validated_sources
         )
+        if len(copied_destinations) != len(expected_entries):
+            raise RuntimeError("copied evidence destination set is incomplete")
+        destination_entries = tuple(
+            _revalidate_destination_entry(
+                prepared.evidence_descriptor,
+                destination_descriptor,
+                parts,
+                copied_info,
+                expected_entries[index],
+            )
+            for index, (parts, destination_descriptor, copied_info) in enumerate(
+                copied_destinations
+            )
+        )
         expected_directories = _manifest_directories(expected_entries)
         if (
             entries != expected_entries
             or final_entries != expected_entries
+            or destination_entries != expected_entries
             or evidence_directories != expected_directories
             or final_directories != expected_directories
         ):
@@ -1096,6 +1175,8 @@ def create_evidence_snapshot(
                 pass
         raise
     finally:
+        for _parts, destination_descriptor, _info in copied_destinations:
+            os.close(destination_descriptor)
         for _row, _parts, source_descriptor, _info in validated_sources:
             os.close(source_descriptor)
         if work_descriptor >= 0:

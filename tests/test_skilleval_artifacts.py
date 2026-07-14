@@ -936,3 +936,41 @@ class TestEvidenceSnapshot:
                 str(work), outputs, str(judge_root), max_bytes=1024
             )
         assert linked is True
+
+    def test_rejects_same_content_destination_inode_replacement(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        work = tmp_path / "work"
+        work.mkdir()
+        payload = b"%PDF-1.4\n"
+        outputs = _outputs_after(
+            work, lambda: (work / "report.pdf").write_bytes(payload)
+        )
+        judge_root = tmp_path / "judge"
+        replacement = tmp_path / "replacement.pdf"
+        replacement.write_bytes(payload)
+        os.chmod(replacement, 0o444)
+        real_lock = artifacts_mod._lock_evidence_directories
+        replaced = False
+
+        def racing_lock(evidence_descriptor):
+            nonlocal replaced
+            real_lock(evidence_descriptor)
+            evidence_dir = judge_root / "evidence"
+            os.chmod(evidence_dir, 0o755)
+            os.replace(replacement, evidence_dir / "report.pdf")
+            os.chmod(evidence_dir / "report.pdf", 0o444)
+            os.chmod(evidence_dir, 0o555)
+            replaced = True
+
+        monkeypatch.setattr(
+            artifacts_mod,
+            "_lock_evidence_directories",
+            racing_lock,
+        )
+
+        with pytest.raises((ValueError, RuntimeError), match="destination|changed"):
+            create_evidence_snapshot(
+                str(work), outputs, str(judge_root), max_bytes=1024
+            )
+        assert replaced is True
