@@ -1715,6 +1715,896 @@ class TestRegistry:
         assert set(os.listdir("/proc/self/fd")) == before
 
 
+class TestOfficeInspector:
+    @staticmethod
+    def _rewrite_package(path: Path, transform) -> None:
+        rewritten = path.with_name(f"{path.stem}-rewritten{path.suffix}")
+        with (
+            zipfile.ZipFile(path) as source,
+            zipfile.ZipFile(rewritten, "w") as destination,
+        ):
+            for info in source.infolist():
+                name, payload = transform(
+                    info.filename,
+                    source.read(info),
+                )
+                destination.writestr(name, payload)
+        os.replace(rewritten, path)
+
+    @classmethod
+    def _rewrite_member(
+        cls, path: Path, member_name: str, transform
+    ) -> None:
+        cls._rewrite_package(
+            path,
+            lambda name, payload: (
+                name,
+                transform(payload) if name == member_name else payload,
+            ),
+        )
+
+    def test_docx_inspection_reports_paragraph_table_and_header(
+        self, tmp_path
+    ) -> None:
+        from docx import Document
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "report.docx"
+        document = Document()
+        document.add_paragraph("Quarterly report")
+        table = document.add_table(rows=1, cols=2)
+        table.cell(0, 0).text = "Revenue"
+        table.cell(0, 1).text = "42"
+        document.sections[0].header.paragraphs[0].text = "Confidential"
+        document.save(path)
+
+        result = inspect_artifact(
+            "report.docx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        assert result["kind"] == "document"
+        assert result["opens"] is True
+        assert result["paragraphs"]["items"][0]["text"] == "Quarterly report"
+        assert result["tables"]["items"][0]["cells"] == [
+            ["Revenue", "42"],
+        ]
+        assert result["headers"]["items"][0]["paragraphs"] == ["Confidential"]
+
+    def test_pptx_inspection_reports_slide_count_and_text(
+        self, tmp_path
+    ) -> None:
+        from pptx import Presentation
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "briefing.pptx"
+        presentation = Presentation()
+        slide = presentation.slides.add_slide(
+            presentation.slide_layouts[1]
+        )
+        slide.shapes.title.text = "Roadmap"
+        slide.placeholders[1].text = "Ship the inspector"
+        presentation.save(path)
+
+        result = inspect_artifact(
+            "briefing.pptx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        assert result["kind"] == "presentation"
+        assert result["opens"] is True
+        assert result["slide_count"] == 1
+        assert result["slides"]["items"][0]["text"] == [
+            "Roadmap",
+            "Ship the inspector",
+        ]
+
+    def test_docx_extract_paginates_paragraphs_and_validates_selector(
+        self, tmp_path
+    ) -> None:
+        from docx import Document
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "long.docx"
+        document = Document()
+        for index in range(70):
+            document.add_paragraph(f"Paragraph {index + 1}")
+        document.save(path)
+
+        inventory = inspect_artifact(
+            "long.docx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+        detail = extract_artifact(
+            "long.docx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["paragraphs:page:2"],
+        )
+
+        assert inventory["paragraphs"]["total"] == 70
+        assert inventory["paragraphs"]["returned"] == 64
+        assert inventory["paragraphs"]["omitted"] == 6
+        assert detail["paragraphs"]["page"] == 2
+        assert detail["paragraphs"]["items"][0]["paragraph"] == 65
+        with pytest.raises(InspectionError, match="selector"):
+            extract_artifact(
+                "long.docx",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+                selectors=["slide:1"],
+            )
+
+    def test_docx_external_relationship_is_metadata_only(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from docx import Document
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "external.docx"
+        Document().save(path)
+        external = (
+            b'<Relationship Id="rIdExternal" '
+            b'Type="http://schemas.openxmlformats.org/officeDocument/'
+            b'2006/relationships/hyperlink" '
+            b'Target="https://example.invalid/UNTRUSTED" '
+            b'TargetMode="External"/>'
+        )
+        self._rewrite_member(
+            path,
+            "word/_rels/document.xml.rels",
+            lambda payload: payload.replace(
+                b"</Relationships>",
+                external + b"</Relationships>",
+                1,
+            ),
+        )
+
+        def forbidden_network(*args, **kwargs):
+            raise AssertionError("Office inspection must not access the network")
+
+        monkeypatch.setattr("socket.create_connection", forbidden_network)
+        result = inspect_artifact(
+            "external.docx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        relationship = next(
+            item
+            for item in result["relationships"]["items"]
+            if item["id"] == "rIdExternal"
+        )
+        assert relationship["external"] is True
+        assert relationship["target"] == "https://example.invalid/UNTRUSTED"
+
+    def test_docx_reports_hyperlink_and_image_metadata(
+        self, tmp_path
+    ) -> None:
+        from docx import Document
+
+        evidence, scratch = _roots(tmp_path)
+        image_path = tmp_path / "pixel.png"
+        PillowImage.new("RGB", (2, 2), color=(10, 20, 30)).save(image_path)
+        document = Document()
+        document.add_paragraph()
+        document.add_picture(str(image_path))
+        path = evidence / "linked.docx"
+        document.save(path)
+
+        def add_hyperlink(name: str, payload: bytes) -> tuple[str, bytes]:
+            if name == "word/document.xml":
+                payload = payload.replace(
+                    b"</w:p>",
+                    (
+                        b'<w:hyperlink r:id="rIdExternal">'
+                        b"<w:r><w:t>Example</w:t></w:r>"
+                        b"</w:hyperlink></w:p>"
+                    ),
+                    1,
+                )
+            elif name == "word/_rels/document.xml.rels":
+                payload = payload.replace(
+                    b"</Relationships>",
+                    (
+                        b'<Relationship Id="rIdExternal" '
+                        b'Type="http://schemas.openxmlformats.org/'
+                        b'officeDocument/2006/relationships/hyperlink" '
+                        b'Target="https://example.invalid/report" '
+                        b'TargetMode="External"/></Relationships>'
+                    ),
+                    1,
+                )
+            return name, payload
+
+        self._rewrite_package(path, add_hyperlink)
+
+        result = inspect_artifact(
+            "linked.docx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        linked_paragraph = next(
+            item
+            for item in result["paragraphs"]["items"]
+            if item["hyperlinks"]
+        )
+        assert linked_paragraph["hyperlinks"] == [
+            {
+                "text": "Example",
+                "address": "https://example.invalid/report",
+                "fragment": "",
+            }
+        ]
+        assert result["media"]["items"][0]["content_type"] == "image/png"
+        assert result["media"]["items"][0]["bytes"] > 0
+
+    def test_docx_reports_macro_and_embedded_object_metadata(
+        self, tmp_path
+    ) -> None:
+        from docx import Document
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "objects.docx"
+        Document().save(path)
+
+        def add_parts(name: str, payload: bytes) -> tuple[str, bytes]:
+            if name == "[Content_Types].xml":
+                payload = payload.replace(
+                    b"</Types>",
+                    (
+                        b'<Override PartName="/word/vbaProject.bin" '
+                        b'ContentType="application/vnd.ms-office.vbaProject"/>'
+                        b'<Override PartName="/word/embeddings/object.bin" '
+                        b'ContentType="application/vnd.openxmlformats-'
+                        b'officedocument.oleObject"/></Types>'
+                    ),
+                    1,
+                )
+            elif name == "word/_rels/document.xml.rels":
+                payload = payload.replace(
+                    b"</Relationships>",
+                    (
+                        b'<Relationship Id="rIdMacro" '
+                        b'Type="http://schemas.microsoft.com/office/2006/'
+                        b'relationships/vbaProject" Target="vbaProject.bin"/>'
+                        b'<Relationship Id="rIdObject" '
+                        b'Type="http://schemas.openxmlformats.org/'
+                        b'officeDocument/2006/relationships/oleObject" '
+                        b'Target="embeddings/object.bin"/></Relationships>'
+                    ),
+                    1,
+                )
+            return name, payload
+
+        self._rewrite_package(path, add_parts)
+        with zipfile.ZipFile(path, "a") as archive:
+            archive.writestr("word/vbaProject.bin", b"UNTRUSTED_MACRO")
+            archive.writestr("word/embeddings/object.bin", b"UNTRUSTED_OBJECT")
+
+        result = inspect_artifact(
+            "objects.docx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        assert result["macros"]["items"][0]["part"] == "word/vbaProject.bin"
+        assert (
+            result["embedded_objects"]["items"][0]["part"]
+            == "word/embeddings/object.bin"
+        )
+
+    def test_docx_malformed_xml_is_rejected_before_python_docx(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from docx import Document
+        from skillopt.envs.skilleval.inspectors import office
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "malformed.docx"
+        Document().save(path)
+        self._rewrite_member(
+            path,
+            "word/document.xml",
+            lambda _payload: b"<w:document",
+        )
+        parser_calls = []
+
+        def forbidden_parser(*args, **kwargs):
+            parser_calls.append((args, kwargs))
+            raise AssertionError("python-docx must not see malformed OOXML")
+
+        monkeypatch.setattr(office, "Document", forbidden_parser)
+        with pytest.raises(InspectionError, match="malformed"):
+            inspect_artifact(
+                "malformed.docx",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+        assert parser_calls == []
+
+    def test_pptx_extract_reports_notes_shape_type_and_bounds(
+        self, tmp_path
+    ) -> None:
+        from pptx import Presentation
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "details.pptx"
+        presentation = Presentation()
+        slide = presentation.slides.add_slide(
+            presentation.slide_layouts[1]
+        )
+        slide.shapes.title.text = "Status"
+        slide.placeholders[1].text = "On track"
+        slide.notes_slide.notes_text_frame.text = "Presenter note"
+        presentation.save(path)
+
+        result = extract_artifact(
+            "details.pptx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["slide:1"],
+        )
+
+        detail = result["slides"]["items"][0]
+        assert detail["notes_text"] == "Presenter note"
+        assert detail["shapes"][0]["type"]
+        assert set(detail["shapes"][0]["bounds"]) == {
+            "left",
+            "top",
+            "width",
+            "height",
+        }
+
+    def test_docx_relationship_traversal_is_rejected(
+        self, tmp_path
+    ) -> None:
+        from docx import Document
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "traversal.docx"
+        Document().save(path)
+        self._rewrite_member(
+            path,
+            "word/_rels/document.xml.rels",
+            lambda payload: payload.replace(
+                b"</Relationships>",
+                (
+                    b'<Relationship Id="rIdEscape" '
+                    b'Type="urn:untrusted" Target="../../../escape.bin"/>'
+                    b"</Relationships>"
+                ),
+                1,
+            ),
+        )
+
+        with pytest.raises(InspectionError, match="escapes"):
+            inspect_artifact(
+                "traversal.docx",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+
+    def test_docx_resource_limit_rejects_before_python_docx(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from docx import Document
+        from skillopt.envs.skilleval.inspectors import office
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "many-paragraphs.docx"
+        document = Document()
+        document.add_paragraph("one")
+        document.add_paragraph("two")
+        document.save(path)
+        parser_calls = []
+
+        def forbidden_parser(*args, **kwargs):
+            parser_calls.append((args, kwargs))
+            raise AssertionError("python-docx must not see over-limit OOXML")
+
+        monkeypatch.setattr(office, "_MAX_PARAGRAPHS", 1)
+        monkeypatch.setattr(office, "Document", forbidden_parser)
+        with pytest.raises(InspectionError, match="paragraph count"):
+            inspect_artifact(
+                "many-paragraphs.docx",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+        assert parser_calls == []
+
+    def test_libreoffice_conversion_uses_hardened_profile_and_safe_run(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from docx import Document
+        from skillopt.envs.skilleval.inspectors import office
+
+        source = tmp_path / "source.docx"
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        Document().save(source)
+        calls = []
+
+        def fake_run(command, *, timeout, cwd, home, pass_fds):
+            calls.append((command, timeout, cwd, home, pass_fds))
+            assert 0 < timeout <= 180
+            assert cwd == home
+            assert len(pass_fds) == 1
+            os.fstat(pass_fds[0])
+            outdir = Path(command[command.index("--outdir") + 1])
+            output = outdir / f"{pass_fds[0]}.docx"
+            output.write_bytes(source.read_bytes())
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        monkeypatch.setattr(office, "safe_run", fake_run)
+        monkeypatch.setattr(office, "_find_libreoffice", lambda: "/usr/bin/soffice")
+
+        with scratch_transaction(
+            str(scratch),
+            max_bytes=100 * 1024 * 1024,
+            max_entries=1_000,
+            max_depth=16,
+        ) as transaction:
+            converted = office._convert_with_libreoffice(
+                str(source),
+                transaction.proc_path,
+                "docx",
+            )
+            assert Path(converted).is_file()
+            command = calls[0][0]
+            for option in (
+                "--headless",
+                "--nologo",
+                "--nodefault",
+                "--nolockcheck",
+                "--norestore",
+            ):
+                assert option in command
+            installation = next(
+                part for part in command
+                if part.startswith("-env:UserInstallation=")
+            )
+            profile = Path(
+                installation.removeprefix(
+                    "-env:UserInstallation=file://"
+                )
+            )
+            profile_config = (
+                profile / "user" / "registrymodifications.xcu"
+            ).read_text(encoding="utf-8")
+            assert "MacroSecurityLevel" in profile_config
+            assert "DisableMacrosExecution" in profile_config
+            assert "UpdateDocMode" in profile_config
+            assert "<value>0</value>" in profile_config
+
+        assert list(scratch.iterdir()) == []
+
+    def test_missing_libreoffice_does_not_leak_input_descriptor(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from docx import Document
+        from skillopt.envs.skilleval.inspectors import office
+
+        source = tmp_path / "source.docx"
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        Document().save(source)
+
+        def unavailable():
+            raise InspectionError(
+                "LibreOffice is not installed or not on PATH"
+            )
+
+        monkeypatch.setattr(office, "_find_libreoffice", unavailable)
+        with scratch_transaction(
+            str(scratch),
+            max_bytes=100 * 1024 * 1024,
+            max_entries=1_000,
+            max_depth=16,
+        ) as transaction:
+            before = set(os.listdir("/proc/self/fd"))
+            for _ in range(3):
+                with pytest.raises(InspectionError, match="not installed"):
+                    office._convert_with_libreoffice(
+                        str(source),
+                        transaction.proc_path,
+                        "docx",
+                    )
+            assert set(os.listdir("/proc/self/fd")) == before
+
+    def test_libreoffice_retries_transient_scratch_error_within_deadline(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from docx import Document
+        from skillopt.envs.skilleval.inspectors import office
+
+        source = tmp_path / "source.docx"
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        Document().save(source)
+        timeouts = []
+
+        def fake_run(command, *, timeout, cwd, home, pass_fds):
+            timeouts.append(timeout)
+            if len(timeouts) == 1:
+                raise InspectionError(
+                    "inspector command scratch failure: [Errno 2] "
+                    "No such file or directory: transient-cache"
+                )
+            outdir = Path(command[command.index("--outdir") + 1])
+            (outdir / f"{pass_fds[0]}.docx").write_bytes(
+                source.read_bytes()
+            )
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        monkeypatch.setattr(office, "safe_run", fake_run)
+        monkeypatch.setattr(office, "_find_libreoffice", lambda: "/usr/bin/soffice")
+        with scratch_transaction(
+            str(scratch),
+            max_bytes=100 * 1024 * 1024,
+            max_entries=1_000,
+            max_depth=16,
+        ) as transaction:
+            office._convert_with_libreoffice(
+                str(source),
+                transaction.proc_path,
+                "docx",
+            )
+
+        assert len(timeouts) == 2
+        assert 0 < timeouts[1] <= timeouts[0] <= 180
+
+    @pytest.mark.parametrize(
+        ("mode", "match"),
+        [
+            ("extra", "uniquely named"),
+            ("symlink", "regular file"),
+            ("signature", "OOXML ZIP"),
+            ("content_type", "main part"),
+        ],
+    )
+    def test_libreoffice_conversion_rejects_untrusted_output(
+        self, tmp_path, monkeypatch, mode, match
+    ) -> None:
+        from docx import Document
+        from pptx import Presentation
+        from skillopt.envs.skilleval.inspectors import office
+
+        source = tmp_path / "source.docx"
+        wrong_type = tmp_path / "wrong.pptx"
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        Document().save(source)
+        Presentation().save(wrong_type)
+
+        def fake_run(command, *, timeout, cwd, home, pass_fds):
+            outdir = Path(command[command.index("--outdir") + 1])
+            output = outdir / f"{pass_fds[0]}.docx"
+            if mode == "symlink":
+                output.symlink_to(source)
+            elif mode == "signature":
+                output.write_bytes(b"not-an-ooxml-package")
+            elif mode == "content_type":
+                output.write_bytes(wrong_type.read_bytes())
+            else:
+                output.write_bytes(source.read_bytes())
+                (outdir / "unexpected.docx").write_bytes(
+                    source.read_bytes()
+                )
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        monkeypatch.setattr(office, "safe_run", fake_run)
+        monkeypatch.setattr(office, "_find_libreoffice", lambda: "/usr/bin/soffice")
+        with pytest.raises(InspectionError, match=match):
+            with scratch_transaction(
+                str(scratch),
+                max_bytes=100 * 1024 * 1024,
+                max_entries=1_000,
+                max_depth=16,
+            ) as transaction:
+                office._convert_with_libreoffice(
+                    str(source),
+                    transaction.proc_path,
+                    "docx",
+                )
+
+        assert list(scratch.iterdir()) == []
+
+    def test_legacy_doc_inspection_uses_converted_parser_and_marks_source(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from docx import Document
+        from skillopt.envs.skilleval.inspectors import office
+
+        evidence, scratch = _roots(tmp_path)
+        (evidence / "legacy.doc").write_bytes(
+            b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\0" * 512
+        )
+        converted_template = tmp_path / "converted.docx"
+        document = Document()
+        document.add_paragraph("Converted legacy document")
+        document.save(converted_template)
+
+        monkeypatch.setattr(office, "_legacy_kind", lambda _path: "doc")
+
+        def fake_convert(path, scratch_dir, target_format):
+            assert target_format == "docx"
+            output = Path(scratch_dir) / "converted.docx"
+            output.write_bytes(converted_template.read_bytes())
+            return str(output)
+
+        monkeypatch.setattr(
+            office,
+            "_convert_with_libreoffice",
+            fake_convert,
+        )
+        result = inspect_artifact(
+            "legacy.doc",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        assert result["converted_from"] == "doc"
+        assert result["paragraphs"]["items"][0]["text"] == (
+            "Converted legacy document"
+        )
+        assert list(scratch.iterdir()) == []
+
+    def test_office_render_delegates_pdf_page_and_pixel_budget(
+        self, tmp_path, monkeypatch, fake_pdf_inspector
+    ) -> None:
+        from docx import Document
+        from skillopt.envs.skilleval.inspectors import office
+
+        evidence, scratch = _roots(tmp_path)
+        Document().save(evidence / "report.docx")
+
+        def fake_convert(path, scratch_dir, target_format):
+            assert target_format == "pdf"
+            output = Path(scratch_dir) / "converted.pdf"
+            output.write_bytes(b"%PDF-1.4\n")
+            return str(output)
+
+        monkeypatch.setattr(
+            office,
+            "_convert_with_libreoffice",
+            fake_convert,
+        )
+        outputs = render_artifact(
+            "report.docx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["page:1"],
+            max_pixels=1234,
+        )
+
+        render_call = next(
+            call for call in fake_pdf_inspector.calls
+            if call[0] == "render"
+        )
+        assert render_call[3] == ["page:1"]
+        assert render_call[4].max_pixels == 1234
+        assert "converted.pdf" not in outputs[0]
+        assert Path(outputs[0]).is_file()
+
+    def test_real_docx_render_smoke(self, tmp_path) -> None:
+        from docx import Document
+
+        if shutil.which("libreoffice") is None and shutil.which("soffice") is None:
+            pytest.skip("LibreOffice is unavailable")
+        if shutil.which("pdfinfo") is None or shutil.which("pdftoppm") is None:
+            pytest.skip("Poppler is unavailable")
+
+        evidence, scratch = _roots(tmp_path)
+        document = Document()
+        document.add_paragraph("Rendered Office smoke")
+        document.save(evidence / "smoke.docx")
+
+        outputs = render_artifact(
+            "smoke.docx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["page:1"],
+            max_pixels=5_000_000,
+        )
+
+        assert len(outputs) == 1
+        with PillowImage.open(outputs[0]) as image:
+            assert image.format == "PNG"
+            assert image.width * image.height <= 5_000_000
+
+    def test_office_extract_character_budget_omits_oversized_detail(
+        self, tmp_path
+    ) -> None:
+        from docx import Document
+
+        evidence, scratch = _roots(tmp_path)
+        document = Document()
+        document.add_paragraph("x" * 2_000)
+        document.save(evidence / "large.docx")
+
+        result = extract_artifact(
+            "large.docx",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+            selectors=["paragraph:1"],
+            max_extract_chars=128,
+        )
+
+        assert result["details"] == []
+        assert result["omitted"] == 1
+
+    def test_pptx_external_slide_relationship_is_rejected_before_parser(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from pptx import Presentation
+        from skillopt.envs.skilleval.inspectors import office
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "external-slide.pptx"
+        presentation = Presentation()
+        presentation.slides.add_slide(presentation.slide_layouts[1])
+        presentation.save(path)
+        self._rewrite_member(
+            path,
+            "ppt/_rels/presentation.xml.rels",
+            lambda payload: payload.replace(
+                b'Target="slides/slide1.xml"',
+                (
+                    b'Target="https://example.invalid/slide.xml" '
+                    b'TargetMode="External"'
+                ),
+                1,
+            ),
+        )
+        parser_calls = []
+
+        def forbidden_parser(*args, **kwargs):
+            parser_calls.append((args, kwargs))
+            raise AssertionError("python-pptx must not see an external slide")
+
+        monkeypatch.setattr(office, "Presentation", forbidden_parser)
+        with pytest.raises(InspectionError, match="slide relationship"):
+            inspect_artifact(
+                "external-slide.pptx",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+        assert parser_calls == []
+
+    def test_legacy_ppt_inspection_uses_converted_parser_and_marks_source(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from pptx import Presentation
+        from skillopt.envs.skilleval.inspectors import office
+
+        evidence, scratch = _roots(tmp_path)
+        (evidence / "legacy.ppt").write_bytes(
+            b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\0" * 512
+        )
+        converted_template = tmp_path / "converted.pptx"
+        presentation = Presentation()
+        slide = presentation.slides.add_slide(
+            presentation.slide_layouts[1]
+        )
+        slide.shapes.title.text = "Converted legacy deck"
+        presentation.save(converted_template)
+
+        monkeypatch.setattr(office, "_legacy_kind", lambda _path: "ppt")
+
+        def fake_convert(path, scratch_dir, target_format):
+            assert target_format == "pptx"
+            output = Path(scratch_dir) / "converted.pptx"
+            output.write_bytes(converted_template.read_bytes())
+            return str(output)
+
+        monkeypatch.setattr(
+            office,
+            "_convert_with_libreoffice",
+            fake_convert,
+        )
+        result = inspect_artifact(
+            "legacy.ppt",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        assert result["converted_from"] == "ppt"
+        assert result["slide_count"] == 1
+        assert result["slides"]["items"][0]["text"] == [
+            "Converted legacy deck",
+        ]
+        assert list(scratch.iterdir()) == []
+
+    def test_real_legacy_doc_conversion_smoke(self, tmp_path) -> None:
+        from docx import Document
+        from skillopt.envs.skilleval.inspectors import office
+
+        libreoffice = shutil.which("libreoffice") or shutil.which("soffice")
+        env_executable = shutil.which("env")
+        if libreoffice is None:
+            pytest.skip("LibreOffice is unavailable")
+        if env_executable is None:
+            pytest.skip("env is unavailable")
+
+        source = tmp_path / "source.docx"
+        document = Document()
+        document.add_paragraph("Legacy conversion smoke")
+        document.save(source)
+        staging = tmp_path / "staging"
+        staging.mkdir()
+
+        with scratch_transaction(
+            str(staging),
+            max_bytes=100 * 1024 * 1024,
+            max_entries=2_000,
+            max_depth=16,
+        ) as transaction:
+            profile = Path(
+                tempfile.mkdtemp(
+                    prefix="fixture-profile-",
+                    dir=transaction.proc_path,
+                )
+            )
+            output_dir = Path(
+                tempfile.mkdtemp(
+                    prefix="fixture-output-",
+                    dir=transaction.proc_path,
+                )
+            )
+            office._write_libreoffice_profile(profile)
+            descriptor = os.open(source, os.O_RDONLY)
+            try:
+                safe_run(
+                    [
+                        env_executable,
+                        f"FONTCONFIG_FILE={profile / 'fontconfig.xml'}",
+                        libreoffice,
+                        "--headless",
+                        "--invisible",
+                        "--nologo",
+                        "--nodefault",
+                        "--nolockcheck",
+                        "--norestore",
+                        f"-env:UserInstallation={profile.as_uri()}",
+                        "--convert-to",
+                        "doc",
+                        "--outdir",
+                        str(output_dir),
+                        f"/proc/self/fd/{descriptor}",
+                    ],
+                    timeout=180,
+                    cwd=transaction.proc_path,
+                    home=transaction.proc_path,
+                    pass_fds=(descriptor,),
+                )
+            finally:
+                os.close(descriptor)
+            outputs = list(output_dir.iterdir())
+            assert len(outputs) == 1
+            legacy_payload = outputs[0].read_bytes()
+
+        inspection_root = tmp_path / "inspection"
+        inspection_root.mkdir()
+        evidence, scratch = _roots(inspection_root)
+        (evidence / "legacy.doc").write_bytes(legacy_payload)
+        result = inspect_artifact(
+            "legacy.doc",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        assert result["converted_from"] == "doc"
+        assert result["paragraphs"]["items"][0]["text"] == (
+            "Legacy conversion smoke"
+        )
+        assert list(scratch.iterdir()) == []
+
+
 class TestSpreadsheetInspector:
     @staticmethod
     def _save_xlsx(path: Path, *, formula: bool = True) -> None:

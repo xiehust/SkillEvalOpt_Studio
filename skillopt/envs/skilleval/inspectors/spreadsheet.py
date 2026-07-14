@@ -586,6 +586,9 @@ def _validate_local_headers(
 def _validate_content_types(
     payload: bytes,
     names: set[str],
+    *,
+    required_main_part: str = "xl/workbook.xml",
+    required_main_content_type: str = _XLSX_WORKBOOK_CONTENT_TYPE,
 ) -> dict[str, str]:
     if len(payload) > _MAX_CONTENT_TYPES_BYTES:
         raise InspectionError("OOXML content types exceed size limit")
@@ -677,11 +680,20 @@ def _validate_content_types(
         mapped[name] = content_type
 
     if (
-        mapped.get("xl/workbook.xml") != _XLSX_WORKBOOK_CONTENT_TYPE
-        or overrides.get("/xl/workbook.xml")
-        != _XLSX_WORKBOOK_CONTENT_TYPE
+        mapped.get(required_main_part) != required_main_content_type
+        or overrides.get(f"/{required_main_part}")
+        != required_main_content_type
     ):
-        raise InspectionError("OOXML content types do not describe an XLSX workbook")
+        detail = (
+            "an XLSX workbook"
+            if (
+                required_main_part == "xl/workbook.xml"
+                and required_main_content_type
+                == _XLSX_WORKBOOK_CONTENT_TYPE
+            )
+            else "the required main part"
+        )
+        raise InspectionError(f"OOXML content types do not describe {detail}")
     return mapped
 
 
