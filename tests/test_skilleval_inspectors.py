@@ -5474,6 +5474,63 @@ class TestPdfImageInspectors:
         assert load_calls == []
         assert list(scratch.iterdir()) == []
 
+    def test_pdf_render_rejects_crc_valid_corrupt_idat(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "corrupt.pdf")
+
+        def fake_run(command, **kwargs):
+            if command[0] == "pdfinfo":
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    "Pages: 1\n",
+                    "",
+                )
+
+            output = Path(f"{command[-1]}.png")
+            image = PillowImage.new("RGB", (20, 20), (1, 2, 3))
+            image.save(output)
+            image.close()
+            payload = bytearray(output.read_bytes())
+            offset = 8
+            while offset < len(payload):
+                length = struct.unpack(
+                    ">I",
+                    payload[offset:offset + 4],
+                )[0]
+                kind_at = offset + 4
+                data_at = kind_at + 4
+                crc_at = data_at + length
+                kind = bytes(payload[kind_at:data_at])
+                if kind == b"IDAT":
+                    payload[data_at] ^= 0xFF
+                    crc = zlib.crc32(kind)
+                    crc = zlib.crc32(payload[data_at:crc_at], crc)
+                    payload[crc_at:crc_at + 4] = struct.pack(
+                        ">I",
+                        crc & 0xFFFFFFFF,
+                    )
+                    break
+                offset = crc_at + 4
+            output.write_bytes(payload)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        monkeypatch.setattr(pdf_image, "safe_run", fake_run)
+
+        with pytest.raises(InspectionError, match="rendered PNG is invalid"):
+            render_artifact(
+                "corrupt.pdf",
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+                max_pixels=400,
+            )
+
+        assert list(scratch.iterdir()) == []
+
     def test_pdf_tool_receives_live_stable_evidence_descriptor(
         self, tmp_path, monkeypatch
     ) -> None:

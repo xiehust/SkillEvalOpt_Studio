@@ -437,6 +437,18 @@ def _verify_rendered_png(
                         "rendered image pixel budget exceeded"
                     )
                 image.verify()
+            with PillowImage.open(path) as decoded:
+                if decoded.format != "PNG":
+                    raise InspectionError("rendered image must be PNG")
+                if decoded.size != (width, height):
+                    raise InspectionError(
+                        "rendered image dimensions changed during validation"
+                    )
+                decoded.load()
+                if decoded.size != (width, height):
+                    raise InspectionError(
+                        "rendered image dimensions changed during decoding"
+                    )
         return width, height
     except InspectionError:
         raise
