@@ -1142,6 +1142,50 @@ class TestArtifactMcp:
         assert json.loads(text) == result.structuredContent
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "tool_name",
+        ["artifact_render", "artifact_extract"],
+    )
+    async def test_argument_validation_errors_are_bounded_and_enveloped(
+        self, tmp_path, fake_pdf_inspector, tool_name
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        server = artifact_mcp.create_server(str(evidence), str(scratch))
+        invalid_selectors = [
+            {"UNTRUSTED_SELECTOR": index}
+            for index in range(256)
+        ]
+
+        async with create_connected_server_and_client_session(
+            server,
+            raise_exceptions=True,
+        ) as client:
+            assert client.get_server_capabilities().tools is not None
+            tools = await client.list_tools()
+            assert tool_name in {tool.name for tool in tools.tools}
+            result = await client.call_tool(
+                tool_name,
+                {
+                    "path": "report.pdf",
+                    "selectors": invalid_selectors,
+                    "max_response_bytes": MIN_RESPONSE_BYTES,
+                },
+            )
+
+        envelope = _structured_payload(result)["untrusted_evidence"]
+        assert envelope["status"] == "error"
+        assert "selector" in envelope["error"]
+        text = next(
+            content.text
+            for content in result.content
+            if isinstance(content, TextContent)
+        )
+        assert len(text.encode("utf-8")) <= MIN_RESPONSE_BYTES
+        assert json.loads(text) == result.structuredContent
+        assert fake_pdf_inspector.calls == []
+
+    @pytest.mark.anyio
     async def test_mcp_response_budget_below_minimum_skips_inspector(
         self, tmp_path, fake_pdf_inspector
     ) -> None:

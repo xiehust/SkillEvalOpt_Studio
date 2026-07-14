@@ -6,13 +6,13 @@ import io
 import json
 import os
 import stat
-from typing import Annotated, Callable
+from typing import Annotated, Callable, cast
 
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.types import CallToolResult, ImageContent, TextContent
 from PIL import Image as PillowImage
 from PIL import UnidentifiedImageError
-from pydantic import Field
+from pydantic import Field, WithJsonSchema
 
 from .inspectors import (
     extract_artifact,
@@ -34,6 +34,7 @@ from .inspectors.base import (
     MIN_RESPONSE_BYTES,
     ResponseBudget,
     bounded_diagnostic,
+    normalize_selectors,
     resolve_scratch_path,
     validate_json_result,
     validate_logical_path,
@@ -48,7 +49,33 @@ _PATH_ARGUMENT_DESCRIPTION = (
     f"bytes, {MAX_LOGICAL_COMPONENTS} components, and "
     f"{MAX_LOGICAL_COMPONENT_BYTES} UTF-8 bytes per component."
 )
-LogicalPath = Annotated[str, Field(description=_PATH_ARGUMENT_DESCRIPTION)]
+LogicalPath = Annotated[
+    object,
+    WithJsonSchema({"type": "string"}),
+    Field(description=_PATH_ARGUMENT_DESCRIPTION),
+]
+SelectorList = Annotated[
+    object,
+    WithJsonSchema(
+        {
+            "anyOf": [
+                {"type": "array", "items": {"type": "string"}},
+                {"type": "null"},
+            ]
+        }
+    ),
+]
+IntegerBudget = Annotated[
+    object,
+    WithJsonSchema(
+        {
+            "anyOf": [
+                {"type": "integer"},
+                {"type": "null"},
+            ]
+        }
+    ),
+]
 
 
 def _positive_maximum(value: object, name: str, maximum: int) -> int:
@@ -60,7 +87,7 @@ def _positive_maximum(value: object, name: str, maximum: int) -> int:
 
 
 def _request_budget(
-    value: int | None,
+    value: object,
     *,
     default: int,
     maximum: int,
@@ -71,7 +98,7 @@ def _request_budget(
 
 
 def _select_response_budget(
-    requested: int | None,
+    requested: object,
     server_maximum: int,
 ) -> int:
     if requested is None:
@@ -152,7 +179,7 @@ def _error_result(
 
 def _guarded_tool(
     operation: str,
-    requested_response_limit: int | None,
+    requested_response_limit: object,
     server_response_maximum: int,
     function: Callable[[int], CallToolResult],
 ) -> CallToolResult:
@@ -275,7 +302,7 @@ def create_server(
         description="List immutable evidence artifacts with bounded metadata.",
     )
     def artifact_inventory(
-        max_response_bytes: int | None = None,
+        max_response_bytes: IntegerBudget = None,
     ) -> CallToolResult:
         def run(response_limit: int) -> CallToolResult:
             result = inventory_artifacts(
@@ -303,13 +330,13 @@ def create_server(
         ),
     )
     def artifact_inspect(
-        path: LogicalPath,
-        max_response_bytes: int | None = None,
+        path: LogicalPath = None,
+        max_response_bytes: IntegerBudget = None,
     ) -> CallToolResult:
         def run(response_limit: int) -> CallToolResult:
             validate_logical_path(path)
             result = inspect_artifact(
-                path,
+                cast(str, path),
                 evidence_dir=evidence,
                 scratch_dir=scratch,
                 max_response_bytes=response_limit,
@@ -334,13 +361,14 @@ def create_server(
         ),
     )
     def artifact_render(
-        path: LogicalPath,
-        selectors: list[str] | None = None,
-        max_pixels: int | None = None,
-        max_response_bytes: int | None = None,
+        path: LogicalPath = None,
+        selectors: SelectorList = None,
+        max_pixels: IntegerBudget = None,
+        max_response_bytes: IntegerBudget = None,
     ) -> CallToolResult:
         def run(response_limit: int) -> CallToolResult:
             validate_logical_path(path)
+            normalized_selectors = normalize_selectors(selectors)
             pixel_limit = _request_budget(
                 max_pixels,
                 default=server_render_max,
@@ -348,10 +376,10 @@ def create_server(
                 name="render pixel budget",
             )
             paths = render_artifact(
-                path,
+                cast(str, path),
                 evidence_dir=evidence,
                 scratch_dir=scratch,
-                selectors=selectors,
+                selectors=normalized_selectors,
                 max_pixels=pixel_limit,
                 max_response_bytes=response_limit,
             )
@@ -392,13 +420,14 @@ def create_server(
         ),
     )
     def artifact_extract(
-        path: LogicalPath,
-        selectors: list[str] | None = None,
-        max_extract_chars: int | None = None,
-        max_response_bytes: int | None = None,
+        path: LogicalPath = None,
+        selectors: SelectorList = None,
+        max_extract_chars: IntegerBudget = None,
+        max_response_bytes: IntegerBudget = None,
     ) -> CallToolResult:
         def run(response_limit: int) -> CallToolResult:
             validate_logical_path(path)
+            normalized_selectors = normalize_selectors(selectors)
             extract_limit = _request_budget(
                 max_extract_chars,
                 default=server_extract_max,
@@ -406,10 +435,10 @@ def create_server(
                 name="extraction character budget",
             )
             result = extract_artifact(
-                path,
+                cast(str, path),
                 evidence_dir=evidence,
                 scratch_dir=scratch,
-                selectors=selectors,
+                selectors=normalized_selectors,
                 max_extract_chars=extract_limit,
                 max_response_bytes=response_limit,
             )
