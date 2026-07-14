@@ -5425,6 +5425,69 @@ class TestPdfImageInspectors:
         assert max_active == 1
         assert filters_after == baseline_filters
 
+    @pytest.mark.skipif(
+        not hasattr(os, "fork"),
+        reason="requires POSIX fork",
+    )
+    def test_pillow_warning_guard_reinitializes_after_threaded_fork(
+        self, tmp_path
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors import pdf_image
+
+        image_path = tmp_path / "forked.png"
+        PillowImage.new("RGB", (3, 2), (1, 2, 3)).save(image_path)
+        baseline_filters = warnings.filters[:]
+        guard_entered = threading.Event()
+        release_guard = threading.Event()
+
+        def hold_guard():
+            with pdf_image._pillow_warning_guard():
+                guard_entered.set()
+                release_guard.wait(timeout=5)
+
+        holder = threading.Thread(target=hold_guard)
+        holder.start()
+        assert guard_entered.wait(timeout=2)
+
+        context = multiprocessing.get_context("fork")
+        results = context.Queue()
+
+        def inspect_in_child():
+            before = warnings.filters[:] == baseline_filters
+            inspected = pdf_image.ImageInspector().inspect(
+                str(image_path),
+                str(tmp_path),
+                response_budget=ResponseBudget(),
+            )
+            after = warnings.filters[:] == baseline_filters
+            results.put((before, after, inspected))
+
+        process = context.Process(target=inspect_in_child)
+        release_timer = threading.Timer(0.1, release_guard.set)
+        release_timer.start()
+        try:
+            process.start()
+            process.join(timeout=3)
+            assert not process.is_alive()
+            assert process.exitcode == 0
+            before, after, inspected = results.get(timeout=1)
+        finally:
+            release_guard.set()
+            release_timer.cancel()
+            release_timer.join(timeout=1)
+            holder.join(timeout=2)
+            if process.is_alive():
+                process.kill()
+                process.join()
+
+        assert not holder.is_alive()
+        assert before is True
+        assert after is True
+        assert inspected["format"] == "PNG"
+        assert inspected["width"] == 3
+        assert inspected["height"] == 2
+        assert warnings.filters[:] == baseline_filters
+
     def test_image_decoded_limit_accounts_for_sample_width(
         self, tmp_path, monkeypatch
     ) -> None:

@@ -61,6 +61,28 @@ _PILLOW_FORMAT_ERRORS = (
 _PILLOW_WARNING_LOCK = threading.RLock()
 
 
+def _acquire_pillow_warning_lock_before_fork() -> None:
+    _PILLOW_WARNING_LOCK.acquire()
+
+
+def _release_pillow_warning_lock_after_fork_parent() -> None:
+    _PILLOW_WARNING_LOCK.release()
+
+
+def _reinitialize_pillow_warning_lock_after_fork_child() -> None:
+    global _PILLOW_WARNING_LOCK
+
+    _PILLOW_WARNING_LOCK = threading.RLock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        before=_acquire_pillow_warning_lock_before_fork,
+        after_in_parent=_release_pillow_warning_lock_after_fork_parent,
+        after_in_child=_reinitialize_pillow_warning_lock_after_fork_child,
+    )
+
+
 @contextmanager
 def _pillow_warning_guard():
     with _PILLOW_WARNING_LOCK:
