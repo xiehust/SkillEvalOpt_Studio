@@ -9,7 +9,7 @@ import stat
 from typing import Annotated, Callable, cast
 
 from mcp.server.fastmcp import FastMCP, Image
-from mcp.types import CallToolResult, ImageContent, TextContent
+from mcp.types import CallToolResult, ImageContent, TextContent, Tool as MCPTool
 from PIL import Image as PillowImage
 from PIL import UnidentifiedImageError
 from pydantic import Field, WithJsonSchema
@@ -76,6 +76,29 @@ IntegerBudget = Annotated[
         }
     ),
 ]
+_PATH_REQUIRED_TOOLS = frozenset(
+    {"artifact_inspect", "artifact_render", "artifact_extract"}
+)
+
+
+class _ArtifactMCP(FastMCP):
+    async def list_tools(self) -> list[MCPTool]:
+        """Advertise required paths while runtime validation stays guarded."""
+        tools = await super().list_tools()
+        advertised: list[MCPTool] = []
+        for tool in tools:
+            if tool.name not in _PATH_REQUIRED_TOOLS:
+                advertised.append(tool)
+                continue
+            schema = dict(tool.inputSchema)
+            required = list(schema.get("required", []))
+            if "path" not in required:
+                required.append("path")
+            schema["required"] = required
+            advertised.append(
+                tool.model_copy(update={"inputSchema": schema})
+            )
+        return advertised
 
 
 def _positive_maximum(value: object, name: str, maximum: int) -> int:
@@ -292,7 +315,7 @@ def create_server(
         MAX_MEDIA_BYTES,
     )
 
-    server = FastMCP(
+    server = _ArtifactMCP(
         "skillopt-artifact",
         instructions=None,
     )

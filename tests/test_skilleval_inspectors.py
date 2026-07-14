@@ -978,6 +978,13 @@ class TestArtifactMcp:
         assert path_schema["description"].startswith(
             "Normalized POSIX-relative"
         )
+        for tool_name in (
+            "artifact_inspect",
+            "artifact_render",
+            "artifact_extract",
+        ):
+            tool = next(tool for tool in tools.tools if tool.name == tool_name)
+            assert tool.inputSchema["required"] == ["path"]
 
     @pytest.mark.anyio
     async def test_calls_representative_tools_and_envelopes_artifact_strings(
@@ -1176,6 +1183,41 @@ class TestArtifactMcp:
         envelope = _structured_payload(result)["untrusted_evidence"]
         assert envelope["status"] == "error"
         assert "selector" in envelope["error"]
+        text = next(
+            content.text
+            for content in result.content
+            if isinstance(content, TextContent)
+        )
+        assert len(text.encode("utf-8")) <= MIN_RESPONSE_BYTES
+        assert json.loads(text) == result.structuredContent
+        assert fake_pdf_inspector.calls == []
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "tool_name",
+        ["artifact_inspect", "artifact_render", "artifact_extract"],
+    )
+    async def test_missing_path_errors_are_bounded_and_enveloped(
+        self, tmp_path, fake_pdf_inspector, tool_name
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        server = artifact_mcp.create_server(str(evidence), str(scratch))
+
+        async with create_connected_server_and_client_session(
+            server,
+            raise_exceptions=True,
+        ) as client:
+            tools = await client.list_tools()
+            tool = next(tool for tool in tools.tools if tool.name == tool_name)
+            assert tool.inputSchema["required"] == ["path"]
+            result = await client.call_tool(
+                tool_name,
+                {"max_response_bytes": MIN_RESPONSE_BYTES},
+            )
+
+        envelope = _structured_payload(result)["untrusted_evidence"]
+        assert envelope["status"] == "error"
+        assert "path" in envelope["error"]
         text = next(
             content.text
             for content in result.content
