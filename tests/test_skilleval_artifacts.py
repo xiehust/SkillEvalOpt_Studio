@@ -53,7 +53,11 @@ def _write_ooxml(path, kind: str, *, unsafe_name: str | None = None) -> None:
             archive.writestr(unsafe_name, "unsafe")
 
 
-def _rewrite_always_zip64_eocd(path) -> None:
+def _rewrite_always_zip64_eocd(
+    path,
+    *,
+    extensible_data: bytes = b"",
+) -> None:
     payload = path.read_bytes()
     eocd_offset = payload.rfind(b"PK\x05\x06")
     assert eocd_offset >= 0
@@ -76,7 +80,7 @@ def _rewrite_always_zip64_eocd(path) -> None:
     zip64_record = struct.pack(
         "<4sQ2H2L4Q",
         b"PK\x06\x06",
-        44,
+        44 + len(extensible_data),
         45,
         45,
         0,
@@ -85,7 +89,7 @@ def _rewrite_always_zip64_eocd(path) -> None:
         total_entries,
         central_size,
         central_offset,
-    )
+    ) + extensible_data
     locator = struct.pack(
         "<4sLQL",
         b"PK\x06\x07",
@@ -337,6 +341,59 @@ class TestArtifactKind:
         _rewrite_always_zip64_eocd(path)
         prefix = b"MZ" + b"\x00" * 62
         path.write_bytes(prefix + path.read_bytes())
+
+        with zipfile.ZipFile(path) as archive:
+            assert archive.testzip() is None
+        assert detect_artifact_kind(str(path), "application/zip") == "xlsx"
+        assert build_manifest(str(tmp_path))["artifact.xlsx"].kind == "xlsx"
+
+    @pytest.mark.parametrize("prefixed", [False, True])
+    def test_zip64_extensible_data_signature_collision_is_ignored(
+        self, tmp_path, prefixed
+    ) -> None:
+        path = tmp_path / "artifact.xlsx"
+        _write_ooxml(path, "xlsx")
+        if prefixed:
+            _rewrite_always_zip64_eocd(path)
+            payload = path.read_bytes()
+            locator_offset = payload.rfind(b"PK\x06\x07")
+            assert locator_offset >= 0
+            prefix_size = 64
+            fake_record_size = prefix_size + locator_offset - 12
+            fake_record = struct.pack(
+                "<4sQ2H2L4Q",
+                b"PK\x06\x06",
+                fake_record_size,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+            path.write_bytes(
+                fake_record.ljust(prefix_size, b"\x00") + payload
+            )
+        else:
+            fake_record = struct.pack(
+                "<4sQ2H2L4Q",
+                b"PK\x06\x06",
+                44,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+            _rewrite_always_zip64_eocd(
+                path,
+                extensible_data=fake_record,
+            )
 
         with zipfile.ZipFile(path) as archive:
             assert archive.testzip() is None

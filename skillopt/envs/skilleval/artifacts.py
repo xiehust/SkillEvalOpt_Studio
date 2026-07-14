@@ -240,6 +240,8 @@ def _safe_zip_member(name: str) -> bool:
 def _find_zip64_eocd_record(
     descriptor: int,
     locator_offset: int,
+    zip64_offset: int,
+    classic_fields: tuple[int, int, int, int, int, int],
 ) -> tuple[int, bytes, int] | None:
     window_start = max(0, locator_offset - _MAX_ZIP64_EOCD_BYTES)
     window = _read_descriptor(
@@ -248,6 +250,21 @@ def _find_zip64_eocd_record(
         window_start,
     )
     if len(window) != locator_offset - window_start:
+        return None
+
+    try:
+        with os.fdopen(os.dup(descriptor), "rb") as source:
+            with zipfile.ZipFile(source) as archive:
+                parsed_central_start = archive.start_dir
+                parsed_entry_count = len(archive.infolist())
+    except (
+        OSError,
+        RuntimeError,
+        NotImplementedError,
+        ValueError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ):
         return None
 
     candidates: list[tuple[int, bytes, int]] = []
@@ -262,18 +279,74 @@ def _find_zip64_eocd_record(
         record_size = struct.unpack_from("<Q", window, index + 4)[0]
         total_size = 12 + record_size
         physical_offset = window_start + index
-        if (
+        if not (
             record_size >= 44
             and total_size <= _MAX_ZIP64_EOCD_BYTES
             and physical_offset + total_size == locator_offset
         ):
-            candidates.append(
+            continue
+        fixed = window[index:index + _ZIP64_EOCD_FIXED_SIZE]
+        try:
+            (
+                signature,
+                parsed_record_size,
+                version_made,
+                version_needed,
+                disk_number,
+                central_disk,
+                entries_on_disk,
+                total_entries,
+                central_size,
+                central_offset,
+            ) = struct.unpack("<4sQ2H2L4Q", fixed)
+        except struct.error:
+            continue
+        archive_prefix = physical_offset - zip64_offset
+        central_start = central_offset + archive_prefix
+        classic_pairs = tuple(
+            zip(
+                classic_fields,
                 (
-                    physical_offset,
-                    window[index:index + _ZIP64_EOCD_FIXED_SIZE],
-                    total_size,
-                )
+                    0xFFFF,
+                    0xFFFF,
+                    0xFFFF,
+                    0xFFFF,
+                    0xFFFFFFFF,
+                    0xFFFFFFFF,
+                ),
+                (
+                    disk_number,
+                    central_disk,
+                    entries_on_disk,
+                    total_entries,
+                    central_size,
+                    central_offset,
+                ),
             )
+        )
+        if (
+            signature != b"PK\x06\x06"
+            or parsed_record_size != record_size
+            or not 45 <= (version_made & 0xFF) <= 63
+            or not 45 <= version_needed <= 63
+            or disk_number != 0
+            or central_disk != 0
+            or entries_on_disk != total_entries
+            or total_entries > _MAX_OOXML_ENTRIES
+            or central_size > _MAX_OOXML_CENTRAL_DIRECTORY_BYTES
+            or central_offset + central_size != zip64_offset
+            or archive_prefix < 0
+            or central_start < archive_prefix
+            or central_start + central_size != physical_offset
+            or parsed_central_start != central_start
+            or parsed_entry_count != total_entries
+            or any(
+                classic not in {sentinel, resolved}
+                for classic, sentinel, resolved in classic_pairs
+            )
+        ):
+            continue
+        candidates.append((physical_offset, fixed, total_size))
     return candidates[0] if len(candidates) == 1 else None
 
 
@@ -413,6 +486,15 @@ def _preflight_zip_descriptor(
         located_record = _find_zip64_eocd_record(
             descriptor,
             locator_offset,
+            zip64_offset,
+            (
+                disk_number,
+                central_directory_disk,
+                entries_on_disk,
+                total_entries,
+                central_directory_size,
+                central_directory_offset,
+            ),
         )
         if located_record is None:
             return False

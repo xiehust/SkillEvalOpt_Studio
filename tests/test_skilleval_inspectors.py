@@ -1730,6 +1730,45 @@ class TestSpreadsheetInspector:
         book.save(path)
         book.close()
 
+    @classmethod
+    def _add_shared_strings_part(cls, path: Path) -> None:
+        shared_strings = (
+            b'<?xml version="1.0" encoding="UTF-8"?>'
+            b'<sst xmlns="http://schemas.openxmlformats.org/'
+            b'spreadsheetml/2006/main" count="1" uniqueCount="1">'
+            b"<si><t>Revenue</t></si></sst>"
+        )
+        with zipfile.ZipFile(path, "a") as archive:
+            archive.writestr("xl/sharedStrings.xml", shared_strings)
+        override = (
+            b'<Override PartName="/xl/sharedStrings.xml" '
+            b'ContentType="application/vnd.openxmlformats-'
+            b'officedocument.spreadsheetml.sharedStrings+xml"/>'
+        )
+        relationship = (
+            b'<Relationship Type="http://schemas.openxmlformats.org/'
+            b'officeDocument/2006/relationships/sharedStrings" '
+            b'Target="/xl/sharedStrings.xml" Id="rIdShared"/>'
+        )
+        cls._rewrite_xlsx_member(
+            path,
+            "[Content_Types].xml",
+            lambda payload: payload.replace(
+                b"</Types>",
+                override + b"</Types>",
+                1,
+            ),
+        )
+        cls._rewrite_xlsx_member(
+            path,
+            "xl/_rels/workbook.xml.rels",
+            lambda payload: payload.replace(
+                b"</Relationships>",
+                relationship + b"</Relationships>",
+                1,
+            ),
+        )
+
     @staticmethod
     def _rewrite_xlsx_member(path: Path, member_name: str, transform) -> None:
         rewritten = path.with_name(f"{path.stem}-rewritten.xlsx")
@@ -1762,6 +1801,35 @@ class TestSpreadsheetInspector:
                 )
                 destination.writestr(name, payload)
         os.replace(rewritten, path)
+
+    @staticmethod
+    def _assert_inspect_rejected_before_openpyxl(
+        evidence: Path,
+        scratch: Path,
+        filename: str,
+        monkeypatch,
+        match: str,
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors import spreadsheet
+
+        load_calls = []
+
+        def forbidden_load(*args, **kwargs):
+            load_calls.append((args, kwargs))
+            raise AssertionError("load_workbook must not be called")
+
+        monkeypatch.setattr(
+            spreadsheet.openpyxl,
+            "load_workbook",
+            forbidden_load,
+        )
+        with pytest.raises(InspectionError, match=match):
+            inspect_artifact(
+                filename,
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+        assert load_calls == []
 
     @staticmethod
     def _mutate_local_header(
@@ -2688,6 +2756,163 @@ class TestSpreadsheetInspector:
 
         spreadsheet.preflight_xlsx(str(path))
 
+    @pytest.mark.parametrize(
+        ("probe", "member_name", "marker", "injection", "reason"),
+        [
+            (
+                "worksheet",
+                "xl/worksheets/sheet1.xml",
+                b"</row>",
+                b'<x:c xmlns:x="urn:extension" r="C1" t="n">'
+                b"<x:v>1</x:v></x:c></row>",
+                "worksheet",
+            ),
+            (
+                "styles",
+                "xl/styles.xml",
+                b"</cellXfs>",
+                b'<x:xf xmlns:x="urn:extension" numFmtId="0"/>'
+                b"</cellXfs>",
+                "styles",
+            ),
+        ],
+    )
+    def test_xlsx_rejects_foreign_parser_sensitive_child_before_load(
+        self,
+        tmp_path,
+        monkeypatch,
+        probe,
+        member_name,
+        marker,
+        injection,
+        reason,
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / f"foreign-{probe}-child.xlsx"
+        self._save_xlsx(path)
+        self._rewrite_xlsx_member(
+            path,
+            member_name,
+            lambda payload: payload.replace(marker, injection, 1),
+        )
+
+        self._assert_inspect_rejected_before_openpyxl(
+            evidence,
+            scratch,
+            path.name,
+            monkeypatch,
+            reason,
+        )
+
+    def test_xlsx_rejects_parser_sensitive_child_at_wrong_parent_before_load(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "misnested-style-record.xlsx"
+        self._save_xlsx(path)
+        self._rewrite_xlsx_member(
+            path,
+            "xl/styles.xml",
+            lambda payload: payload.replace(
+                b"</styleSheet>",
+                b'<xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>'
+                b"</styleSheet>",
+                1,
+            ),
+        )
+
+        self._assert_inspect_rejected_before_openpyxl(
+            evidence,
+            scratch,
+            path.name,
+            monkeypatch,
+            "styles record has invalid nesting",
+        )
+
+    @pytest.mark.parametrize(
+        ("probe", "member_name", "marker", "injection", "reason"),
+        [
+            (
+                "drawing",
+                "xl/drawings/drawing1.xml",
+                b"</oneCellAnchor>",
+                b'<x:graphicFrame xmlns:x="urn:extension"/>'
+                b"</oneCellAnchor>",
+                "drawing",
+            ),
+            (
+                "chart",
+                "xl/charts/chart1.xml",
+                b"</plotArea>",
+                b'<x:barChart xmlns:x="urn:extension"/>'
+                b"</plotArea>",
+                "chart",
+            ),
+        ],
+    )
+    def test_xlsx_rejects_foreign_drawing_chart_child_before_load(
+        self,
+        tmp_path,
+        monkeypatch,
+        probe,
+        member_name,
+        marker,
+        injection,
+        reason,
+    ) -> None:
+        from openpyxl import Workbook
+        from openpyxl.chart import BarChart, Reference
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / f"foreign-{probe}-child.xlsx"
+        book = Workbook()
+        sheet = book.active
+        sheet["A1"] = 1
+        chart = BarChart()
+        chart.add_data(Reference(sheet, min_col=1, min_row=1))
+        sheet.add_chart(chart, "C1")
+        book.save(path)
+        book.close()
+        self._rewrite_xlsx_member(
+            path,
+            member_name,
+            lambda payload: payload.replace(marker, injection, 1),
+        )
+
+        self._assert_inspect_rejected_before_openpyxl(
+            evidence,
+            scratch,
+            path.name,
+            monkeypatch,
+            reason,
+        )
+
+    def test_xlsx_preflight_accepts_extension_payload_in_extlst(
+        self, tmp_path
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors.spreadsheet import (
+            preflight_xlsx,
+        )
+
+        path = tmp_path / "worksheet-extension.xlsx"
+        self._save_xlsx(path)
+        extension = (
+            b'<extLst><ext uri="{00000000-0000-0000-0000-000000000000}">'
+            b'<x:c xmlns:x="urn:extension"><x:xf/></x:c>'
+            b"</ext></extLst>"
+        )
+        self._rewrite_xlsx_member(
+            path,
+            "xl/worksheets/sheet1.xml",
+            lambda payload: payload.replace(
+                b"</worksheet>",
+                extension + b"</worksheet>",
+                1,
+            ),
+        )
+
+        preflight_xlsx(str(path))
+
     def test_xlsx_structure_limits_follow_content_type_not_part_path(
         self, tmp_path, monkeypatch
     ) -> None:
@@ -2753,6 +2978,357 @@ class TestSpreadsheetInspector:
         self._rewrite_xlsx_package(path, rename)
 
         preflight_xlsx(str(path))
+
+    def test_xlsx_workbook_rejects_second_sheets_container_before_load(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "second-sheets.xlsx"
+        self._save_xlsx(path)
+        bypass_part = "xl/worksheets/bypass.xml"
+        bypass_sheet = (
+            b'<worksheet xmlns="http://schemas.openxmlformats.org/'
+            b'spreadsheetml/2006/main"><sheetData/>'
+            b'<mergeCells count="1"><mergeCell ref="A1:XFD1048576"/>'
+            b"</mergeCells></worksheet>"
+        )
+        with zipfile.ZipFile(path, "a") as archive:
+            archive.writestr(bypass_part, bypass_sheet)
+        override = (
+            f'<Override PartName="/{bypass_part}" '
+            'ContentType="application/vnd.openxmlformats-officedocument.'
+            'spreadsheetml.worksheet+xml"/>'
+        ).encode()
+        relationship = (
+            b'<Relationship Type="http://schemas.openxmlformats.org/'
+            b'officeDocument/2006/relationships/worksheet" '
+            b'Target="/xl/worksheets/bypass.xml" Id="rIdBypass"/>'
+        )
+        second_container = (
+            b'<sheets><sheet xmlns:r="http://schemas.openxmlformats.org/'
+            b'officeDocument/2006/relationships" name="Bypass" '
+            b'sheetId="2" state="visible" r:id="rIdBypass"/></sheets>'
+        )
+        self._rewrite_xlsx_member(
+            path,
+            "[Content_Types].xml",
+            lambda payload: payload.replace(
+                b"</Types>",
+                override + b"</Types>",
+                1,
+            ),
+        )
+        self._rewrite_xlsx_member(
+            path,
+            "xl/_rels/workbook.xml.rels",
+            lambda payload: payload.replace(
+                b"</Relationships>",
+                relationship + b"</Relationships>",
+                1,
+            ),
+        )
+        self._rewrite_xlsx_member(
+            path,
+            "xl/workbook.xml",
+            lambda payload: payload.replace(
+                b"</sheets>",
+                b"</sheets>" + second_container,
+                1,
+            ),
+        )
+
+        self._assert_inspect_rejected_before_openpyxl(
+            evidence,
+            scratch,
+            path.name,
+            monkeypatch,
+            "workbook sheets",
+        )
+
+    def test_xlsx_workbook_rejects_foreign_sheet_before_load(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "foreign-sheet.xlsx"
+        self._save_xlsx(path)
+        foreign_sheet = (
+            b'<x:sheet xmlns:x="urn:extension" '
+            b'xmlns:r="http://schemas.openxmlformats.org/officeDocument/'
+            b'2006/relationships" name="Foreign" sheetId="2" '
+            b'state="visible" r:id="rId1"/>'
+        )
+        self._rewrite_xlsx_member(
+            path,
+            "xl/workbook.xml",
+            lambda payload: payload.replace(
+                b"</sheets>",
+                foreign_sheet + b"</sheets>",
+                1,
+            ),
+        )
+
+        self._assert_inspect_rejected_before_openpyxl(
+            evidence,
+            scratch,
+            path.name,
+            monkeypatch,
+            "workbook sheet",
+        )
+
+    def test_xlsx_workbook_rejects_nested_sheet_before_load(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "nested-sheet.xlsx"
+        self._save_xlsx(path)
+        nested_sheet = (
+            b'<extLst><ext uri="{00000000-0000-0000-0000-000000000000}">'
+            b'<sheet xmlns:r="http://schemas.openxmlformats.org/'
+            b'officeDocument/2006/relationships" name="Nested" '
+            b'sheetId="2" state="visible" r:id="rId1"/>'
+            b"</ext></extLst>"
+        )
+        self._rewrite_xlsx_member(
+            path,
+            "xl/workbook.xml",
+            lambda payload: payload.replace(
+                b"</workbook>",
+                nested_sheet + b"</workbook>",
+                1,
+            ),
+        )
+
+        self._assert_inspect_rejected_before_openpyxl(
+            evidence,
+            scratch,
+            path.name,
+            monkeypatch,
+            "workbook sheet",
+        )
+
+    def test_xlsx_workbook_rejects_external_sheet_relationship_before_load(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "external-sheet.xlsx"
+        self._save_xlsx(path)
+        self._rewrite_xlsx_member(
+            path,
+            "xl/_rels/workbook.xml.rels",
+            lambda payload: payload.replace(
+                b'Target="/xl/worksheets/sheet1.xml"',
+                (
+                    b'Target="https://example.invalid/sheet.xml" '
+                    b'TargetMode="External"'
+                ),
+                1,
+            ),
+        )
+
+        self._assert_inspect_rejected_before_openpyxl(
+            evidence,
+            scratch,
+            path.name,
+            monkeypatch,
+            "worksheet relationship must target an internal part",
+        )
+
+    @pytest.mark.parametrize(
+        ("role", "relationship_suffix"),
+        [
+            ("styles", "/styles"),
+            ("shared strings", "/sharedStrings"),
+        ],
+    )
+    def test_xlsx_rejects_parser_part_without_workbook_relationship(
+        self,
+        tmp_path,
+        monkeypatch,
+        role,
+        relationship_suffix,
+    ) -> None:
+        from xml.etree import ElementTree
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / f"missing-{role.replace(' ', '-')}-relationship.xlsx"
+        self._save_xlsx(path)
+        if role == "shared strings":
+            self._add_shared_strings_part(path)
+
+        def remove_relationship(payload: bytes) -> bytes:
+            root = ElementTree.fromstring(payload)
+            for child in list(root):
+                if child.attrib.get("Type", "").endswith(relationship_suffix):
+                    root.remove(child)
+            return ElementTree.tostring(root)
+
+        self._rewrite_xlsx_member(
+            path,
+            "xl/_rels/workbook.xml.rels",
+            remove_relationship,
+        )
+
+        self._assert_inspect_rejected_before_openpyxl(
+            evidence,
+            scratch,
+            path.name,
+            monkeypatch,
+            role,
+        )
+
+    @pytest.mark.parametrize(
+        ("role", "relationship_type", "target"),
+        [
+            (
+                "styles",
+                "http://schemas.openxmlformats.org/officeDocument/"
+                "2006/relationships/styles",
+                "/xl/styles.xml",
+            ),
+            (
+                "shared strings",
+                "http://schemas.openxmlformats.org/officeDocument/"
+                "2006/relationships/sharedStrings",
+                "/xl/sharedStrings.xml",
+            ),
+        ],
+    )
+    def test_xlsx_rejects_duplicate_parser_part_relationship(
+        self,
+        tmp_path,
+        monkeypatch,
+        role,
+        relationship_type,
+        target,
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / f"duplicate-{role.replace(' ', '-')}-relationship.xlsx"
+        self._save_xlsx(path)
+        if role == "shared strings":
+            self._add_shared_strings_part(path)
+        duplicate = (
+            f'<Relationship Type="{relationship_type}" '
+            f'Target="{target}" Id="rIdDuplicate"/>'
+        ).encode()
+        self._rewrite_xlsx_member(
+            path,
+            "xl/_rels/workbook.xml.rels",
+            lambda payload: payload.replace(
+                b"</Relationships>",
+                duplicate + b"</Relationships>",
+                1,
+            ),
+        )
+
+        self._assert_inspect_rejected_before_openpyxl(
+            evidence,
+            scratch,
+            path.name,
+            monkeypatch,
+            role,
+        )
+
+    @pytest.mark.parametrize(
+        ("role", "source_part", "duplicate_part", "content_type"),
+        [
+            (
+                "styles",
+                "xl/styles.xml",
+                "xl/custom/styles2.xml",
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.styles+xml",
+            ),
+            (
+                "shared strings",
+                "xl/sharedStrings.xml",
+                "xl/custom/shared2.xml",
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sharedStrings+xml",
+            ),
+        ],
+    )
+    def test_xlsx_rejects_multiple_parser_parts_by_content_type(
+        self,
+        tmp_path,
+        monkeypatch,
+        role,
+        source_part,
+        duplicate_part,
+        content_type,
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / f"multiple-{role.replace(' ', '-')}-parts.xlsx"
+        self._save_xlsx(path)
+        if role == "shared strings":
+            self._add_shared_strings_part(path)
+        with zipfile.ZipFile(path) as archive:
+            duplicate_payload = archive.read(source_part)
+        with zipfile.ZipFile(path, "a") as archive:
+            archive.writestr(duplicate_part, duplicate_payload)
+        override = (
+            f'<Override PartName="/{duplicate_part}" '
+            f'ContentType="{content_type}"/>'
+        ).encode()
+        self._rewrite_xlsx_member(
+            path,
+            "[Content_Types].xml",
+            lambda payload: payload.replace(
+                b"</Types>",
+                override + b"</Types>",
+                1,
+            ),
+        )
+
+        self._assert_inspect_rejected_before_openpyxl(
+            evidence,
+            scratch,
+            path.name,
+            monkeypatch,
+            role,
+        )
+
+    def test_xlsx_rejects_styles_relationship_targeting_custom_part(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "custom-styles-target.xlsx"
+        self._save_xlsx(path)
+        custom_part = "xl/custom/styles.xml"
+        with zipfile.ZipFile(path) as archive:
+            styles = archive.read("xl/styles.xml")
+        with zipfile.ZipFile(path, "a") as archive:
+            archive.writestr(custom_part, styles)
+        override = (
+            f'<Override PartName="/{custom_part}" '
+            'ContentType="application/vnd.openxmlformats-officedocument.'
+            'spreadsheetml.styles+xml"/>'
+        ).encode()
+        self._rewrite_xlsx_member(
+            path,
+            "[Content_Types].xml",
+            lambda payload: payload.replace(
+                b"</Types>",
+                override + b"</Types>",
+                1,
+            ),
+        )
+        self._rewrite_xlsx_member(
+            path,
+            "xl/_rels/workbook.xml.rels",
+            lambda payload: payload.replace(
+                b'Target="styles.xml"',
+                b'Target="/xl/custom/styles.xml"',
+                1,
+            ),
+        )
+
+        self._assert_inspect_rejected_before_openpyxl(
+            evidence,
+            scratch,
+            path.name,
+            monkeypatch,
+            "styles",
+        )
 
     def test_xlsx_relationship_graph_rejects_sheet_content_type_mismatch(
         self, tmp_path, monkeypatch
@@ -2844,13 +3420,10 @@ class TestSpreadsheetInspector:
             preflight_xlsx(str(path))
 
     def test_xlsx_relationship_graph_rejects_duplicate_sheet_relationship_id(
-        self, tmp_path
+        self, tmp_path, monkeypatch
     ) -> None:
-        from skillopt.envs.skilleval.inspectors.spreadsheet import (
-            preflight_xlsx,
-        )
-
-        path = tmp_path / "duplicate-sheet-id.xlsx"
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "duplicate-sheet-id.xlsx"
         self._save_xlsx(path)
         duplicate = (
             b'<sheet xmlns:r="http://schemas.openxmlformats.org/'
@@ -2867,11 +3440,13 @@ class TestSpreadsheetInspector:
             ),
         )
 
-        with pytest.raises(
-            InspectionError,
-            match="sheet relationship id",
-        ):
-            preflight_xlsx(str(path))
+        self._assert_inspect_rejected_before_openpyxl(
+            evidence,
+            scratch,
+            path.name,
+            monkeypatch,
+            "sheet relationship id",
+        )
 
     @pytest.mark.parametrize(
         "target",

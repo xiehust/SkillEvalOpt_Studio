@@ -910,9 +910,38 @@ def _build_part_roles(
     )
     if workbook.tag != workbook_tag:
         raise InspectionError("OOXML workbook root is invalid")
-    sheets = workbook.find(sheets_tag)
-    if sheets is None:
-        raise InspectionError("OOXML workbook sheets are missing")
+    parents = {
+        id(child): parent
+        for parent in workbook.iter()
+        for child in parent
+    }
+    sheets_nodes = []
+    sheet_nodes = []
+    for element in workbook.iter():
+        local_name = _xml_local_name(element.tag)
+        if local_name == "sheets":
+            if (
+                element.tag != sheets_tag
+                or parents.get(id(element)) is not workbook
+            ):
+                raise InspectionError(
+                    "OOXML workbook sheets container is invalid"
+                )
+            sheets_nodes.append(element)
+        elif local_name == "sheet":
+            sheet_nodes.append(element)
+    if len(sheets_nodes) != 1:
+        raise InspectionError(
+            "OOXML workbook sheets container must appear exactly once"
+        )
+    sheets = sheets_nodes[0]
+    if any(
+        sheet.tag != sheet_tag or parents.get(id(sheet)) is not sheets
+        for sheet in sheet_nodes
+    ) or any(child.tag != sheet_tag for child in sheets):
+        raise InspectionError("OOXML workbook sheet element is invalid")
+    if len(sheet_nodes) != len(sheets):
+        raise InspectionError("OOXML workbook sheet structure is invalid")
 
     roles: dict[str, set[str]] = {workbook_name: {"workbook"}}
     relationship_parts: set[str] = set()
@@ -946,8 +975,6 @@ def _build_part_roles(
     sheet_targets: set[str] = set()
     sheet_parts: list[str] = []
     for sheet in sheets:
-        if sheet.tag != sheet_tag:
-            continue
         relationship_id = sheet.attrib.get(relationship_id_attr)
         if (
             not relationship_id
@@ -980,23 +1007,59 @@ def _build_part_roles(
         sheet_targets.add(target)
         sheet_parts.append(target)
 
-    for relationship in workbook_relationships.values():
-        if relationship.type == _STYLES_RELATIONSHIP_TYPE:
-            _require_relationship_role(
-                roles,
-                part_content_types,
-                relationship,
-                "styles",
-                _STYLES_CONTENT_TYPE,
+    def require_unique_parser_part(
+        *,
+        label: str,
+        role: str,
+        relationship_type: str,
+        content_type: str,
+        parser_path: str | None = None,
+    ) -> None:
+        declared_parts = [
+            part
+            for part, mapped_type in part_content_types.items()
+            if mapped_type == content_type
+        ]
+        relationships = [
+            relationship
+            for relationship in workbook_relationships.values()
+            if relationship.type == relationship_type
+        ]
+        parser_part_exists = parser_path is not None and parser_path in names
+        if not declared_parts and not relationships and not parser_part_exists:
+            return
+        if len(declared_parts) != 1 or len(relationships) != 1:
+            raise InspectionError(
+                f"OOXML {label} part and relationship must be unique"
             )
-        elif relationship.type == _SHARED_STRINGS_RELATIONSHIP_TYPE:
-            _require_relationship_role(
-                roles,
-                part_content_types,
-                relationship,
-                "shared_strings",
-                _SHARED_STRINGS_CONTENT_TYPE,
+        target = _require_relationship_role(
+            roles,
+            part_content_types,
+            relationships[0],
+            role,
+            content_type,
+        )
+        if target != declared_parts[0] or (
+            parser_path is not None and target != parser_path
+        ):
+            raise InspectionError(
+                f"OOXML {label} part, relationship, and parser target "
+                "are inconsistent"
             )
+
+    require_unique_parser_part(
+        label="styles",
+        role="styles",
+        relationship_type=_STYLES_RELATIONSHIP_TYPE,
+        content_type=_STYLES_CONTENT_TYPE,
+        parser_path="xl/styles.xml",
+    )
+    require_unique_parser_part(
+        label="shared strings",
+        role="shared_strings",
+        relationship_type=_SHARED_STRINGS_RELATIONSHIP_TYPE,
+        content_type=_SHARED_STRINGS_CONTENT_TYPE,
+    )
 
     drawing_parts: set[str] = set()
     for sheet_part in sheet_parts:
@@ -1043,6 +1106,18 @@ def _xml_local_name(tag: object) -> str:
 
 
 class _XmlStructureValidator:
+    _WORKSHEET_ROOT_TAG = f"{{{_SPREADSHEET_NAMESPACE}}}worksheet"
+    _STYLE_ROOT_TAG = f"{{{_SPREADSHEET_NAMESPACE}}}styleSheet"
+    _DRAWING_ROOT_TAG = f"{{{_SPREADSHEET_DRAWING_NAMESPACE}}}wsDr"
+    _CHART_ROOT_TAG = f"{{{_CHART_NAMESPACE}}}chartSpace"
+    _EXTENSION_LIST_TAGS = {
+        f"{{{namespace}}}extLst"
+        for namespace in {
+            _SPREADSHEET_NAMESPACE,
+            _SPREADSHEET_DRAWING_NAMESPACE,
+            _CHART_NAMESPACE,
+        }
+    }
     _STYLE_TAGS = {
         f"{{{_SPREADSHEET_NAMESPACE}}}{name}"
         for name in {
@@ -1056,10 +1131,99 @@ class _XmlStructureValidator:
             "tableStyle",
         }
     }
+    _STYLE_CONTAINERS = {
+        name: f"{{{_SPREADSHEET_NAMESPACE}}}{name}"
+        for name in {
+            "numFmts",
+            "fonts",
+            "fills",
+            "borders",
+            "cellStyleXfs",
+            "cellXfs",
+            "cellStyles",
+            "dxfs",
+            "tableStyles",
+        }
+    }
+    _STYLE_SEQUENCE_CHILDREN = {
+        _STYLE_CONTAINERS["numFmts"]: f"{{{_SPREADSHEET_NAMESPACE}}}numFmt",
+        _STYLE_CONTAINERS["fonts"]: f"{{{_SPREADSHEET_NAMESPACE}}}font",
+        _STYLE_CONTAINERS["fills"]: f"{{{_SPREADSHEET_NAMESPACE}}}fill",
+        _STYLE_CONTAINERS["borders"]: f"{{{_SPREADSHEET_NAMESPACE}}}border",
+        _STYLE_CONTAINERS["cellStyleXfs"]: f"{{{_SPREADSHEET_NAMESPACE}}}xf",
+        _STYLE_CONTAINERS["cellXfs"]: f"{{{_SPREADSHEET_NAMESPACE}}}xf",
+        _STYLE_CONTAINERS["cellStyles"]: (
+            f"{{{_SPREADSHEET_NAMESPACE}}}cellStyle"
+        ),
+        _STYLE_CONTAINERS["dxfs"]: f"{{{_SPREADSHEET_NAMESPACE}}}dxf",
+        _STYLE_CONTAINERS["tableStyles"]: (
+            f"{{{_SPREADSHEET_NAMESPACE}}}tableStyle"
+        ),
+    }
+    _STYLE_ENTRY_PARENTS = {
+        "numFmt": {
+            _STYLE_CONTAINERS["numFmts"],
+            f"{{{_SPREADSHEET_NAMESPACE}}}dxf",
+        },
+        "font": {
+            _STYLE_CONTAINERS["fonts"],
+            f"{{{_SPREADSHEET_NAMESPACE}}}dxf",
+        },
+        "fill": {
+            _STYLE_CONTAINERS["fills"],
+            f"{{{_SPREADSHEET_NAMESPACE}}}dxf",
+        },
+        "border": {
+            _STYLE_CONTAINERS["borders"],
+            f"{{{_SPREADSHEET_NAMESPACE}}}dxf",
+        },
+        "xf": {
+            _STYLE_CONTAINERS["cellStyleXfs"],
+            _STYLE_CONTAINERS["cellXfs"],
+        },
+        "cellStyle": {_STYLE_CONTAINERS["cellStyles"]},
+        "dxf": {_STYLE_CONTAINERS["dxfs"]},
+        "tableStyle": {_STYLE_CONTAINERS["tableStyles"]},
+    }
     _DRAWING_TAGS = {
         f"{{{_SPREADSHEET_DRAWING_NAMESPACE}}}{name}"
         for name in {"sp", "pic", "graphicFrame", "cxnSp", "grpSp"}
     }
+    _DRAWING_ANCHOR_NAMES = {
+        "absoluteAnchor",
+        "oneCellAnchor",
+        "twoCellAnchor",
+    }
+    _DRAWING_ANCHOR_TAGS = {
+        f"{{{_SPREADSHEET_DRAWING_NAMESPACE}}}{name}"
+        for name in _DRAWING_ANCHOR_NAMES
+    }
+    _DRAWING_OBJECT_NAMES = {
+        "sp",
+        "pic",
+        "graphicFrame",
+        "cxnSp",
+        "grpSp",
+    }
+    _CHART_TYPE_NAMES = {
+        "areaChart",
+        "area3DChart",
+        "barChart",
+        "bar3DChart",
+        "bubbleChart",
+        "doughnutChart",
+        "lineChart",
+        "line3DChart",
+        "ofPieChart",
+        "pieChart",
+        "pie3DChart",
+        "radarChart",
+        "scatterChart",
+        "stockChart",
+        "surfaceChart",
+        "surface3DChart",
+    }
+    _CHART_AXIS_NAMES = {"catAx", "dateAx", "serAx", "valAx"}
     _ROW_TAG = f"{{{_SPREADSHEET_NAMESPACE}}}row"
     _CELL_TAG = f"{{{_SPREADSHEET_NAMESPACE}}}c"
     _MERGE_TAG = f"{{{_SPREADSHEET_NAMESPACE}}}mergeCell"
@@ -1082,6 +1246,8 @@ class _XmlStructureValidator:
         self._parser = ElementTree.XMLPullParser(events=("start", "end"))
         self._bytes = 0
         self._depth = 0
+        self._tag_stack: list[str] = []
+        self._extension_depth = 0
         self._declaration_tail = b""
         self._worksheet = "worksheet" in roles
         self._shared_strings = "shared_strings" in roles
@@ -1123,10 +1289,181 @@ class _XmlStructureValidator:
                 "OOXML cumulative merged cell area exceeds configured limit"
             )
 
+    def _validate_root(self, tag: str, parent: str | None) -> None:
+        if parent is not None:
+            return
+        expected = None
+        label = ""
+        if self._worksheet:
+            expected = self._WORKSHEET_ROOT_TAG
+            label = "worksheet"
+        elif self._styles:
+            expected = self._STYLE_ROOT_TAG
+            label = "styles"
+        elif self._drawing:
+            expected = self._DRAWING_ROOT_TAG
+            label = "drawing"
+        elif self._chart:
+            expected = self._CHART_ROOT_TAG
+            label = "chart"
+        if expected is not None and tag != expected:
+            raise InspectionError(f"OOXML {label} root is invalid")
+
+    def _validate_worksheet_element(
+        self,
+        tag: str,
+        local_name: str,
+        parent: str | None,
+    ) -> None:
+        sheet_data = f"{{{_SPREADSHEET_NAMESPACE}}}sheetData"
+        merge_cells = f"{{{_SPREADSHEET_NAMESPACE}}}mergeCells"
+        if parent == self._ROW_TAG and tag != self._CELL_TAG:
+            raise InspectionError(
+                "OOXML worksheet row contains a non-cell child"
+            )
+        if parent == merge_cells and tag != self._MERGE_TAG:
+            raise InspectionError(
+                "OOXML worksheet merge container contains an invalid child"
+            )
+        expected = {
+            "sheetData": (sheet_data, self._WORKSHEET_ROOT_TAG),
+            "row": (self._ROW_TAG, sheet_data),
+            "c": (self._CELL_TAG, self._ROW_TAG),
+            "mergeCells": (merge_cells, self._WORKSHEET_ROOT_TAG),
+            "mergeCell": (self._MERGE_TAG, merge_cells),
+        }.get(local_name)
+        if expected is None:
+            return
+        expected_tag, expected_parent = expected
+        if tag == expected_tag and parent != expected_parent:
+            raise InspectionError(
+                "OOXML worksheet parser-sensitive element has invalid nesting"
+            )
+        if parent == expected_parent and tag != expected_tag:
+            raise InspectionError(
+                "OOXML worksheet parser-sensitive element has invalid namespace"
+            )
+
+    def _validate_style_element(
+        self,
+        tag: str,
+        local_name: str,
+        parent: str | None,
+    ) -> None:
+        if local_name in self._STYLE_CONTAINERS:
+            if (
+                tag != self._STYLE_CONTAINERS[local_name]
+                or parent != self._STYLE_ROOT_TAG
+            ):
+                raise InspectionError(
+                    "OOXML styles container has invalid namespace or nesting"
+                )
+        expected_child = self._STYLE_SEQUENCE_CHILDREN.get(parent)
+        if expected_child is not None and tag != expected_child:
+            raise InspectionError(
+                "OOXML styles sequence contains an invalid child"
+            )
+        allowed_parents = self._STYLE_ENTRY_PARENTS.get(local_name)
+        if allowed_parents is None:
+            return
+        expected_tag = f"{{{_SPREADSHEET_NAMESPACE}}}{local_name}"
+        if tag == expected_tag and parent not in allowed_parents:
+            raise InspectionError(
+                "OOXML styles record has invalid nesting"
+            )
+        if parent in allowed_parents and tag != expected_tag:
+            raise InspectionError(
+                "OOXML styles record has invalid namespace"
+            )
+
+    def _validate_drawing_element(
+        self,
+        tag: str,
+        local_name: str,
+        parent: str | None,
+    ) -> None:
+        expected_tag = (
+            f"{{{_SPREADSHEET_DRAWING_NAMESPACE}}}{local_name}"
+        )
+        if local_name in self._DRAWING_ANCHOR_NAMES:
+            if tag == expected_tag and parent != self._DRAWING_ROOT_TAG:
+                raise InspectionError("OOXML drawing anchor has invalid nesting")
+            if parent == self._DRAWING_ROOT_TAG and tag != expected_tag:
+                raise InspectionError(
+                    "OOXML drawing anchor has invalid namespace"
+                )
+        if local_name not in self._DRAWING_OBJECT_NAMES:
+            return
+        allowed_parents = self._DRAWING_ANCHOR_TAGS | {
+            f"{{{_SPREADSHEET_DRAWING_NAMESPACE}}}grpSp"
+        }
+        if tag == expected_tag and parent not in allowed_parents:
+            raise InspectionError("OOXML drawing object has invalid nesting")
+        if parent in allowed_parents and tag != expected_tag:
+            raise InspectionError("OOXML drawing object has invalid namespace")
+
+    def _validate_chart_element(
+        self,
+        tag: str,
+        local_name: str,
+        parent: str | None,
+    ) -> None:
+        chart = f"{{{_CHART_NAMESPACE}}}chart"
+        plot_area = f"{{{_CHART_NAMESPACE}}}plotArea"
+        expected_tag = f"{{{_CHART_NAMESPACE}}}{local_name}"
+        expected_parent = None
+        if local_name == "chart":
+            expected_parent = self._CHART_ROOT_TAG
+        elif local_name == "plotArea":
+            expected_parent = chart
+        elif (
+            local_name in self._CHART_TYPE_NAMES
+            or local_name in self._CHART_AXIS_NAMES
+        ):
+            expected_parent = plot_area
+        elif local_name == "ser":
+            if parent is not None and _xml_local_name(parent) in self._CHART_TYPE_NAMES:
+                if tag != expected_tag or not parent.startswith(
+                    f"{{{_CHART_NAMESPACE}}}"
+                ):
+                    raise InspectionError(
+                        "OOXML chart series has invalid namespace or nesting"
+                    )
+            elif tag == expected_tag:
+                raise InspectionError("OOXML chart series has invalid nesting")
+            return
+        if expected_parent is None:
+            return
+        if tag == expected_tag and parent != expected_parent:
+            raise InspectionError(
+                "OOXML chart element has invalid nesting"
+            )
+        if parent == expected_parent and tag != expected_tag:
+            raise InspectionError(
+                "OOXML chart element has invalid namespace"
+            )
+
+    def _validate_parser_sensitive_element(
+        self,
+        tag: str,
+        local_name: str,
+        parent: str | None,
+    ) -> None:
+        self._validate_root(tag, parent)
+        if self._worksheet:
+            self._validate_worksheet_element(tag, local_name, parent)
+        if self._styles:
+            self._validate_style_element(tag, local_name, parent)
+        if self._drawing:
+            self._validate_drawing_element(tag, local_name, parent)
+        if self._chart:
+            self._validate_chart_element(tag, local_name, parent)
+
     def _drain_events(self) -> None:
         for event, element in self._parser.read_events():
             local_name = _xml_local_name(element.tag)
             if event == "start":
+                parent = self._tag_stack[-1] if self._tag_stack else None
                 self._depth += 1
                 if self._depth > _MAX_OOXML_XML_DEPTH:
                     raise InspectionError(
@@ -1137,7 +1474,19 @@ class _XmlStructureValidator:
                     _MAX_OOXML_XML_NODES,
                     "XML node",
                 )
-                if self._worksheet:
+                inside_extension = self._extension_depth > 0
+                if not inside_extension:
+                    self._validate_parser_sensitive_element(
+                        element.tag,
+                        local_name,
+                        parent,
+                    )
+                if inside_extension:
+                    self._extension_depth += 1
+                elif element.tag in self._EXTENSION_LIST_TAGS:
+                    self._extension_depth = 1
+                self._tag_stack.append(element.tag)
+                if self._worksheet and not inside_extension:
                     if element.tag == self._ROW_TAG:
                         dimension_attributes = {
                             key
@@ -1165,6 +1514,7 @@ class _XmlStructureValidator:
                         self._count_merge_area(element)
                 if (
                     self._shared_strings
+                    and not inside_extension
                     and element.tag == self._SHARED_STRING_ITEM_TAG
                 ):
                     self._increment(
@@ -1172,7 +1522,11 @@ class _XmlStructureValidator:
                         _MAX_SHARED_STRING_ITEMS,
                         "shared string item",
                     )
-                if self._styles and element.tag in self._STYLE_TAGS:
+                if (
+                    self._styles
+                    and not inside_extension
+                    and element.tag in self._STYLE_TAGS
+                ):
                     self._increment(
                         "style_records",
                         _MAX_STYLE_RECORDS,
@@ -1180,6 +1534,7 @@ class _XmlStructureValidator:
                     )
                 if (
                     self._relationships
+                    and not inside_extension
                     and element.tag == self._RELATIONSHIP_TAG
                 ):
                     self._increment(
@@ -1187,13 +1542,17 @@ class _XmlStructureValidator:
                         _MAX_RELATIONSHIPS,
                         "relationship",
                     )
-                if self._drawing and element.tag in self._DRAWING_TAGS:
+                if (
+                    self._drawing
+                    and not inside_extension
+                    and element.tag in self._DRAWING_TAGS
+                ):
                     self._increment(
                         "drawing_objects",
                         _MAX_DRAWING_OBJECTS,
                         "drawing object",
                     )
-                if self._chart and (
+                if self._chart and not inside_extension and (
                     element.tag in {self._CHART_TAG, self._CHART_SERIES_TAG}
                     or (
                         element.tag.startswith(f"{{{_CHART_NAMESPACE}}}")
@@ -1206,7 +1565,12 @@ class _XmlStructureValidator:
                         "chart object",
                     )
             else:
-                if self._shared_strings and element.tag == self._TEXT_TAG:
+                inside_extension = self._extension_depth > 0
+                if (
+                    self._shared_strings
+                    and not inside_extension
+                    and element.tag == self._TEXT_TAG
+                ):
                     chars = len(element.text or "")
                     self._totals["shared_string_chars"] = (
                         self._totals.get("shared_string_chars", 0) + chars
@@ -1219,6 +1583,11 @@ class _XmlStructureValidator:
                             "OOXML shared string character count "
                             "exceeds configured limit"
                         )
+                if not self._tag_stack or self._tag_stack[-1] != element.tag:
+                    raise InspectionError("OOXML XML part has invalid nesting")
+                self._tag_stack.pop()
+                if self._extension_depth > 0:
+                    self._extension_depth -= 1
                 self._depth -= 1
                 element.clear()
 
@@ -1253,7 +1622,7 @@ class _XmlStructureValidator:
                 f"OOXML XML part is malformed: "
                 f"{bounded_diagnostic(self._name)!r}"
             ) from exc
-        if self._depth != 0:
+        if self._depth != 0 or self._tag_stack or self._extension_depth:
             raise InspectionError("OOXML XML part has invalid nesting")
 
 
