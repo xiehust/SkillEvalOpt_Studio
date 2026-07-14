@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures
+import errno
 import hashlib
 import json
 import multiprocessing
@@ -22,6 +24,9 @@ from PIL import Image as PillowImage
 
 from skillopt.envs.skilleval import artifact_mcp
 from skillopt.envs.skilleval import inspectors as inspectors_mod
+from skillopt.envs.skilleval.inspectors import _process as process_mod
+from skillopt.envs.skilleval.inspectors import _scratch as scratch_mod
+from skillopt.envs.skilleval.inspectors import _scratch_root as scratch_root_mod
 from skillopt.envs.skilleval.inspectors import base as inspector_base
 from skillopt.envs.skilleval.inspectors import (
     InspectionError,
@@ -103,6 +108,42 @@ def _scratch_commit_worker(
         results.put("ok")
     except BaseException as exc:
         results.put(f"error:{type(exc).__name__}:{exc}")
+
+
+def _nested_transaction_worker(scratch: str, results) -> None:
+    try:
+        with scratch_transaction(
+            scratch,
+            max_bytes=1_000,
+            max_entries=20,
+            max_depth=4,
+        ):
+            with scratch_transaction(
+                scratch,
+                max_bytes=1_000,
+                max_entries=20,
+                max_depth=4,
+            ):
+                pass
+    except BaseException as exc:
+        results.put(f"error:{type(exc).__name__}:{exc}")
+    else:
+        results.put("ok")
+
+
+def _single_transaction_worker(scratch: str, results) -> None:
+    try:
+        with scratch_transaction(
+            scratch,
+            max_bytes=1_000,
+            max_entries=20,
+            max_depth=4,
+        ):
+            pass
+    except BaseException as exc:
+        results.put(f"error:{type(exc).__name__}:{exc}")
+    else:
+        results.put("ok")
 
 
 def _wait_for_pid_exit(pid: int, timeout: float = 5.0) -> bool:
@@ -351,6 +392,46 @@ class TestSafeRun:
         assert len(proc.stderr) <= MAX_COMMAND_OUTPUT_CHARS + 100
         assert "truncated" in proc.stdout
         assert "truncated" in proc.stderr
+
+    def test_supervisor_spawn_does_not_use_preexec_fn(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        real_popen = process_mod.subprocess.Popen
+        missing = object()
+        preexec_values = []
+
+        def recording_popen(*args, **kwargs):
+            preexec_values.append(kwargs.get("preexec_fn", missing))
+            return real_popen(*args, **kwargs)
+
+        monkeypatch.setattr(process_mod.subprocess, "Popen", recording_popen)
+
+        process = safe_run(
+            [sys.executable, "-c", "print('ok')"],
+            timeout=5,
+            cwd=str(tmp_path),
+            home=str(tmp_path),
+        )
+
+        assert process.stdout.strip() == "ok"
+        assert preexec_values == [missing]
+
+    def test_safe_run_is_stable_across_concurrent_threads(
+        self, tmp_path
+    ) -> None:
+        def run(index: int) -> str:
+            process = safe_run(
+                [sys.executable, "-c", f"print({index})"],
+                timeout=5,
+                cwd=str(tmp_path),
+                home=str(tmp_path),
+            )
+            return process.stdout.strip()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            outputs = list(pool.map(run, range(16)))
+
+        assert outputs == [str(index) for index in range(16)]
 
     def test_normal_parent_exit_terminates_lingering_process_group(
         self, tmp_path
@@ -1160,6 +1241,136 @@ class TestRegistry:
 
         assert list(scratch.iterdir()) == []
 
+    @pytest.mark.parametrize(
+        "operation",
+        ["delete", "overwrite", "truncate", "rename"],
+    )
+    def test_transaction_cannot_modify_preexisting_scratch_content(
+        self,
+        tmp_path,
+        fake_pdf_inspector,
+        monkeypatch,
+        operation,
+    ) -> None:
+        evidence, scratch = _roots(tmp_path)
+        _write_pdf(evidence / "report.pdf")
+        existing = scratch / "existing.bin"
+        moved = scratch / "moved.bin"
+        existing.write_bytes(b"ORIGINAL")
+
+        def destructive_inspect(
+            self, path, scratch_dir, *, response_budget
+        ):
+            target = Path(scratch_dir) / ".." / "existing.bin"
+            destination = Path(scratch_dir) / ".." / "moved.bin"
+            if operation == "delete":
+                target.unlink(missing_ok=True)
+            elif operation == "overwrite":
+                target.write_bytes(b"CHANGED")
+            elif operation == "truncate":
+                target.open("wb").close()
+            elif target.exists():
+                target.rename(destination)
+            return {"ok": True}
+
+        monkeypatch.setattr(
+            _FakePdfInspector,
+            "inspect",
+            destructive_inspect,
+        )
+
+        result = inspect_artifact(
+            "report.pdf",
+            evidence_dir=str(evidence),
+            scratch_dir=str(scratch),
+        )
+
+        assert result == {"ok": True}
+        assert existing.read_bytes() == b"ORIGINAL"
+        assert not moved.exists()
+
+    def test_same_thread_nested_transaction_fails_without_hanging(
+        self, tmp_path
+    ) -> None:
+        _evidence, scratch = _roots(tmp_path)
+        context = multiprocessing.get_context("fork")
+        results = context.Queue()
+        process = context.Process(
+            target=_nested_transaction_worker,
+            args=(str(scratch), results),
+        )
+        process.start()
+        try:
+            process.join(timeout=1)
+            assert not process.is_alive()
+            outcome = results.get(timeout=1)
+        finally:
+            if process.is_alive():
+                process.kill()
+                process.join()
+
+        assert outcome.startswith("error:InspectionError:")
+        assert "nested" in outcome
+
+    def test_fork_after_lock_rebuilds_child_lock_state(
+        self, tmp_path
+    ) -> None:
+        _evidence, scratch = _roots(tmp_path)
+        context = multiprocessing.get_context("fork")
+        results = context.Queue()
+        process = context.Process(
+            target=_single_transaction_worker,
+            args=(str(scratch), results),
+        )
+        try:
+            with scratch_transaction(
+                str(scratch),
+                max_bytes=1_000,
+                max_entries=20,
+                max_depth=4,
+            ):
+                process.start()
+                time.sleep(0.1)
+                assert process.is_alive()
+
+            process.join(timeout=3)
+            assert not process.is_alive()
+            assert results.get(timeout=1) == "ok"
+        finally:
+            if process.is_alive():
+                process.kill()
+                process.join()
+
+    def test_interrupted_lock_acquisition_does_not_leak_root_fd(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        _evidence, scratch = _roots(tmp_path)
+
+        class InterruptingLock:
+            def acquire(self):
+                raise KeyboardInterrupt
+
+            def release(self):
+                pytest.fail("unacquired lock must not be released")
+
+        monkeypatch.setattr(
+            scratch_root_mod,
+            "_thread_lock",
+            lambda _path: InterruptingLock(),
+        )
+        before = set(os.listdir("/proc/self/fd"))
+
+        with pytest.raises(KeyboardInterrupt):
+            with scratch_transaction(
+                str(scratch),
+                max_bytes=1_000,
+                max_entries=20,
+                max_depth=4,
+            ):
+                pass
+
+        assert set(os.listdir("/proc/self/fd")) == before
+
     def test_stable_evidence_fd_is_inherited_by_real_child(
         self, tmp_path, fake_pdf_inspector, monkeypatch
     ) -> None:
@@ -1230,6 +1441,42 @@ class TestRegistry:
         files = [path for path in scratch.rglob("*") if path.is_file()]
         assert len(files) == 1
         assert files[0].stat().st_size == 80
+
+    def test_cross_filesystem_commit_reserves_copy_peak(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        _evidence, scratch = _roots(tmp_path)
+        copy_called = False
+        real_copy = scratch_mod._copy_stable_file
+
+        def cross_device(*args, **kwargs):
+            raise OSError(errno.EXDEV, "cross-device link")
+
+        def recording_copy(*args, **kwargs):
+            nonlocal copy_called
+            copy_called = True
+            return real_copy(*args, **kwargs)
+
+        monkeypatch.setattr(scratch_mod.os, "rename", cross_device)
+        monkeypatch.setattr(
+            scratch_mod,
+            "_copy_stable_file",
+            recording_copy,
+        )
+
+        with pytest.raises(InspectionError, match="scratch byte"):
+            with scratch_transaction(
+                str(scratch),
+                max_bytes=100,
+                max_entries=20,
+                max_depth=4,
+            ) as transaction:
+                output = Path(transaction.proc_path) / "render.bin"
+                output.write_bytes(b"x" * 80)
+                transaction.commit_outputs([str(output)])
+
+        assert copy_called is False
+        assert list(scratch.iterdir()) == []
 
     @pytest.mark.parametrize(
         ("limit_name", "limit_value", "script"),

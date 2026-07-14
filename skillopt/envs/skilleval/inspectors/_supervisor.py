@@ -235,12 +235,14 @@ def supervise(config: dict, parent_liveness_fd: int) -> dict:
 
 
 def main() -> int:
-    if len(sys.argv) != 4:
+    if len(sys.argv) != 5:
         return 2
     config_fd = int(sys.argv[1])
     status_fd = int(sys.argv[2])
     parent_liveness_fd = int(sys.argv[3])
+    parent_pid = int(sys.argv[4])
     try:
+        _set_parent_death_signal(signal.SIGTERM, parent_pid)
         with os.fdopen(config_fd, "rb", closefd=True) as source:
             config = json.loads(source.read().decode("utf-8"))
         status = supervise(config, parent_liveness_fd)

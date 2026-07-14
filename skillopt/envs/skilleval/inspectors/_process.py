@@ -1,7 +1,6 @@
 """Bounded subprocess execution for trusted inspector adapters."""
 from __future__ import annotations
 
-import ctypes
 import json
 import math
 import os
@@ -21,20 +20,6 @@ from .base import (
     _open_real_directory,
     bounded_diagnostic,
 )
-
-_PR_SET_PDEATHSIG = 1
-
-
-def _set_parent_death_signal(
-    signum: int,
-    expected_parent: int,
-) -> None:
-    libc = ctypes.CDLL(None, use_errno=True)
-    if libc.prctl(_PR_SET_PDEATHSIG, signum, 0, 0, 0) != 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error))
-    if os.getppid() != expected_parent:
-        os.kill(os.getpid(), signum)
 
 
 def _bounded_pipe_reader(
@@ -88,15 +73,9 @@ def _supervisor_config(
     pass_fds: tuple[int, ...],
 ) -> tuple[dict, tuple[int, ...]]:
     transaction = current_scratch_transaction()
-    inherited = set(pass_fds)
-    inherited.update(current_evidence_fds())
-    for descriptor in inherited:
-        try:
-            os.fstat(descriptor)
-        except OSError as exc:
-            raise InspectionError(
-                "pass_fds contains an unavailable descriptor"
-            ) from exc
+    payload_fds = set(pass_fds)
+    payload_fds.update(current_evidence_fds())
+    supervisor_fds = set(payload_fds)
     config = {
         "command": command,
         "timeout": timeout,
@@ -107,25 +86,27 @@ def _supervisor_config(
         "pass_fds": [],
     }
     if transaction is not None:
-        inherited.add(transaction.descriptor)
-        inherited.add(transaction.root_descriptor)
+        payload_fds.add(transaction.descriptor)
+        supervisor_fds.add(transaction.descriptor)
+        supervisor_fds.add(transaction.outer_descriptor)
         config.update(
             {
-                "transaction_fd": transaction.root_descriptor,
+                "transaction_fd": transaction.outer_descriptor,
                 "max_file_bytes": transaction.remaining_bytes(),
-                "max_scratch_bytes": (
-                    transaction.requested_limits.max_bytes
-                ),
-                "max_scratch_entries": (
-                    transaction.requested_limits.max_entries
-                ),
-                "max_scratch_depth": (
-                    transaction.requested_limits.max_depth
-                ),
+                "max_scratch_bytes": transaction.limits.max_bytes,
+                "max_scratch_entries": transaction.limits.max_entries,
+                "max_scratch_depth": transaction.limits.max_depth,
             }
         )
-    config["pass_fds"] = sorted(inherited)
-    return config, tuple(sorted(inherited))
+    for descriptor in supervisor_fds:
+        try:
+            os.fstat(descriptor)
+        except OSError as exc:
+            raise InspectionError(
+                "pass_fds contains an unavailable descriptor"
+            ) from exc
+    config["pass_fds"] = sorted(payload_fds)
+    return config, tuple(sorted(supervisor_fds))
 
 
 def _start_supervisor(
@@ -152,6 +133,7 @@ def _start_supervisor(
                 str(config_read),
                 str(status_write),
                 str(liveness_read),
+                str(parent_pid),
             ],
             cwd=os.path.abspath(os.sep),
             env=supervisor_env,
@@ -167,10 +149,6 @@ def _start_supervisor(
                 *inherited_fds,
             ),
             start_new_session=True,
-            preexec_fn=lambda: _set_parent_death_signal(
-                signal.SIGTERM,
-                parent_pid,
-            ),
         )
     except Exception:
         os.close(config_read)

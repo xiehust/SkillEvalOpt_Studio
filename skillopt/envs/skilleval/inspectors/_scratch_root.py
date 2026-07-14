@@ -1,4 +1,4 @@
-"""Locked scratch-root accounting, snapshots, and delta cleanup."""
+"""Scratch-root accounting and process-safe exclusive locking."""
 from __future__ import annotations
 
 import fcntl
@@ -11,8 +11,6 @@ from .base import InspectionError, _open_real_directory
 
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
 _FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-_thread_locks_guard = threading.Lock()
-_thread_locks: dict[str, threading.Lock] = {}
 
 
 @dataclass(frozen=True)
@@ -36,15 +34,6 @@ class ScratchUsage:
         )
 
 
-EntryIdentity = tuple[int, ...]
-
-
-@dataclass(frozen=True)
-class ScratchSnapshot:
-    usage: ScratchUsage
-    entries: dict[tuple[str, ...], EntryIdentity]
-
-
 @dataclass
 class _RemovalFrame:
     descriptor: int
@@ -56,26 +45,91 @@ class _RemovalFrame:
     index: int = 0
 
 
+class _OwnedThreadLock:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.owner: tuple[int, int] | None = None
+
+    def acquire(self) -> None:
+        owner = (os.getpid(), threading.get_ident())
+        with _thread_locks_guard:
+            if self.owner == owner:
+                raise InspectionError(
+                    "nested scratch transaction for the same root is forbidden"
+                )
+        self.lock.acquire()
+        with _thread_locks_guard:
+            self.owner = owner
+
+    def release(self) -> None:
+        with _thread_locks_guard:
+            self.owner = None
+        self.lock.release()
+
+
+_thread_locks_guard = threading.Lock()
+_thread_locks: dict[str, _OwnedThreadLock] = {}
+_active_root_fds: set[int] = set()
+_registry_pid = os.getpid()
+
+
+def _after_fork_child() -> None:
+    global _active_root_fds
+    global _registry_pid
+    global _thread_locks
+    global _thread_locks_guard
+
+    for descriptor in _active_root_fds:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    _active_root_fds = set()
+    _thread_locks_guard = threading.Lock()
+    _thread_locks = {}
+    _registry_pid = os.getpid()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_child)
+
+
 @dataclass
 class ScratchRootLease:
     path: str
     descriptor: int
     identity: os.stat_result
     limits: ScratchLimits
-    baseline: ScratchSnapshot
-    thread_lock: threading.Lock
+    usage: ScratchUsage
+    thread_lock: _OwnedThreadLock
+    owner_pid: int
     active: bool = True
+
+    def validate_identity(self) -> None:
+        current = _open_real_directory(self.path, "scratch root")
+        try:
+            if not _same_object(self.identity, os.fstat(current)):
+                raise InspectionError(
+                    "scratch root changed during artifact operation"
+                )
+        finally:
+            os.close(current)
 
     def release(self) -> None:
         if not self.active:
             return
         self.active = False
+        if os.getpid() != self.owner_pid:
+            return
+        _active_root_fds.discard(self.descriptor)
         try:
             fcntl.flock(self.descriptor, fcntl.LOCK_UN)
         finally:
-            os.close(self.descriptor)
-            self.descriptor = -1
-            self.thread_lock.release()
+            try:
+                os.close(self.descriptor)
+            finally:
+                self.descriptor = -1
+                self.thread_lock.release()
 
 
 def _same_object(left: os.stat_result, right: os.stat_result) -> bool:
@@ -88,23 +142,6 @@ def _same_object(left: os.stat_result, right: os.stat_result) -> bool:
         right.st_ino,
         stat.S_IFMT(right.st_mode),
     )
-
-
-def _entry_identity(info: os.stat_result) -> EntryIdentity:
-    common = (
-        info.st_dev,
-        info.st_ino,
-        stat.S_IFMT(info.st_mode),
-    )
-    if stat.S_ISREG(info.st_mode):
-        return (
-            *common,
-            info.st_size,
-            info.st_mtime_ns,
-            info.st_ctime_ns,
-            info.st_nlink,
-        )
-    return common
 
 
 def _raise_if_over(usage: ScratchUsage, limits: ScratchLimits) -> None:
@@ -128,7 +165,6 @@ def _raise_if_over(usage: ScratchUsage, limits: ScratchLimits) -> None:
 def _scan_tree(
     descriptor: int,
     limits: ScratchLimits,
-    snapshot: dict[tuple[str, ...], EntryIdentity],
     *,
     depth: int = 0,
     parts: tuple[str, ...] = (),
@@ -145,7 +181,6 @@ def _scan_tree(
         )
         entry_depth = depth + 1
         child_usage = ScratchUsage(entries=1, depth=entry_depth)
-        _raise_if_over(usage.plus(child_usage), limits)
         if stat.S_ISLNK(before.st_mode):
             raise InspectionError(
                 f"scratch contains a symlink: {'/'.join(child_parts)}"
@@ -159,12 +194,10 @@ def _scan_tree(
                         "scratch directory changed while scanning: "
                         f"{'/'.join(child_parts)}"
                     )
-                snapshot[child_parts] = _entry_identity(opened)
                 child_usage = child_usage.plus(
                     _scan_tree(
                         child,
                         limits,
-                        snapshot,
                         depth=entry_depth,
                         parts=child_parts,
                     )
@@ -180,7 +213,6 @@ def _scan_tree(
                         "scratch file changed while scanning: "
                         f"{'/'.join(child_parts)}"
                     )
-                snapshot[child_parts] = _entry_identity(opened)
                 child_usage = ScratchUsage(
                     bytes=opened.st_size,
                     entries=1,
@@ -198,25 +230,17 @@ def _scan_tree(
     return usage
 
 
-def _snapshot_descriptor(
-    descriptor: int,
-    limits: ScratchLimits,
-) -> ScratchSnapshot:
-    scan = os.open(".", _DIRECTORY_FLAGS, dir_fd=descriptor)
-    entries: dict[tuple[str, ...], EntryIdentity] = {}
-    try:
-        usage = _scan_tree(scan, limits, entries)
-    finally:
-        os.close(scan)
-    _raise_if_over(usage, limits)
-    return ScratchSnapshot(usage, entries)
-
-
 def _scan_descriptor(
     descriptor: int,
     limits: ScratchLimits,
 ) -> ScratchUsage:
-    return _snapshot_descriptor(descriptor, limits).usage
+    scan = os.open(".", _DIRECTORY_FLAGS, dir_fd=descriptor)
+    try:
+        usage = _scan_tree(scan, limits)
+    finally:
+        os.close(scan)
+    _raise_if_over(usage, limits)
+    return usage
 
 
 def _remove_tree(descriptor: int) -> None:
@@ -246,7 +270,7 @@ def _remove_tree(descriptor: int) -> None:
                     if not _same_object(info, opened):
                         os.close(child)
                         raise InspectionError(
-                            "scratch entry changed during rollback"
+                            "scratch entry changed during cleanup"
                         )
                     with os.scandir(child) as entries:
                         child_names = sorted(
@@ -276,7 +300,7 @@ def _remove_tree(descriptor: int) -> None:
                     or not _same_object(frame.identity, current)
                 ):
                     raise InspectionError(
-                        "scratch directory changed during rollback"
+                        "scratch directory changed during cleanup"
                     )
                 os.rmdir(frame.name, dir_fd=frame.parent_descriptor)
                 os.close(frame.descriptor)
@@ -293,124 +317,29 @@ def _remove_tree(descriptor: int) -> None:
         raise
 
 
-def _remove_named_entry(
-    parent_descriptor: int,
-    name: str,
-    info: os.stat_result,
-) -> None:
-    if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
-        child = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_descriptor)
-        try:
-            opened = os.fstat(child)
-            if not _same_object(info, opened):
-                raise InspectionError(
-                    "scratch entry changed during rollback"
-                )
-            _remove_tree(child)
-        finally:
-            os.close(child)
-        current = os.stat(
-            name,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-        if not _same_object(info, current):
-            raise InspectionError(
-                "scratch directory changed during rollback"
-            )
-        os.rmdir(name, dir_fd=parent_descriptor)
-    else:
-        os.unlink(name, dir_fd=parent_descriptor)
-
-
-def cleanup_new_entries(
-    descriptor: int,
-    baseline: ScratchSnapshot,
-    *,
-    preserve_top_level: frozenset[str] = frozenset(),
-) -> None:
-    """Remove every current entry not owned by the locked baseline."""
-    changed: list[str] = []
-
-    def clean(
-        directory: int,
-        parts: tuple[str, ...] = (),
-    ) -> None:
-        with os.scandir(directory) as entries:
-            names = sorted(entry.name for entry in entries)
-        for name in names:
-            child_parts = (*parts, name)
-            if len(child_parts) == 1 and name in preserve_top_level:
-                continue
-            info = os.stat(
-                name,
-                dir_fd=directory,
-                follow_symlinks=False,
-            )
-            expected = baseline.entries.get(child_parts)
-            if expected is None:
-                _remove_named_entry(directory, name, info)
-                continue
-            current_identity = _entry_identity(info)
-            same_object = current_identity[:3] == expected[:3]
-            if not same_object:
-                _remove_named_entry(directory, name, info)
-                changed.append("/".join(child_parts))
-                continue
-            if current_identity != expected:
-                changed.append("/".join(child_parts))
-            if stat.S_ISDIR(info.st_mode):
-                child = os.open(
-                    name,
-                    _DIRECTORY_FLAGS,
-                    dir_fd=directory,
-                )
-                try:
-                    opened = os.fstat(child)
-                    if not _same_object(info, opened):
-                        raise InspectionError(
-                            "scratch entry changed during rollback"
-                        )
-                    clean(child, child_parts)
-                finally:
-                    os.close(child)
-
-    clean(descriptor)
-    if changed:
-        raise InspectionError(
-            "scratch baseline changed during artifact operation: "
-            f"{changed[0]}"
-        )
-
-
-def verify_baseline(
-    current: ScratchSnapshot,
-    baseline: ScratchSnapshot,
-) -> None:
-    for path, expected in baseline.entries.items():
-        if current.entries.get(path) != expected:
-            raise InspectionError(
-                "scratch baseline changed during artifact operation: "
-                f"{'/'.join(path)}"
-            )
-
-
-def _thread_lock(path: str) -> threading.Lock:
+def _thread_lock(path: str) -> _OwnedThreadLock:
+    global _registry_pid
+    if _registry_pid != os.getpid():
+        _after_fork_child()
     with _thread_locks_guard:
-        return _thread_locks.setdefault(path, threading.Lock())
+        return _thread_locks.setdefault(path, _OwnedThreadLock())
 
 
 def acquire_root_lease(
     path: str,
     limits: ScratchLimits,
 ) -> ScratchRootLease:
-    descriptor = _open_real_directory(path, "scratch root")
     thread_lock = _thread_lock(path)
-    thread_lock.acquire()
-    locked = False
+    thread_acquired = False
+    descriptor = -1
+    file_locked = False
     try:
+        thread_lock.acquire()
+        thread_acquired = True
+        descriptor = _open_real_directory(path, "scratch root")
+        _active_root_fds.add(descriptor)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
-        locked = True
+        file_locked = True
         identity = os.fstat(descriptor)
         current = _open_real_directory(path, "scratch root")
         try:
@@ -420,20 +349,25 @@ def acquire_root_lease(
                 )
         finally:
             os.close(current)
-        baseline = _snapshot_descriptor(descriptor, limits)
+        usage = _scan_descriptor(descriptor, limits)
+        _active_root_fds.add(descriptor)
         return ScratchRootLease(
             path=path,
             descriptor=descriptor,
             identity=identity,
             limits=limits,
-            baseline=baseline,
+            usage=usage,
             thread_lock=thread_lock,
+            owner_pid=os.getpid(),
         )
     except BaseException:
-        try:
-            if locked:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
+        if descriptor >= 0:
+            _active_root_fds.discard(descriptor)
+            try:
+                if file_locked:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+        if thread_acquired:
             thread_lock.release()
         raise
