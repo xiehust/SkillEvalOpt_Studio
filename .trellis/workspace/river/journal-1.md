@@ -71,3 +71,36 @@ Implemented and verified directed multi-Skill Plugin training with complete-Plug
 ### Next Steps
 
 - None - task complete
+
+
+## Session 3: Trainable-aware Plugin validation coverage
+
+**Date**: 2026-07-14
+**Task**: Trainable-aware Plugin validation coverage
+**Branch**: `main`
+
+### Summary
+
+Made Plugin validation coverage and per-Skill regression checks follow trainable_skill_ids, added deterministic coverage-aware ratio splits, and verified the full test suite.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `a0d884f` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
