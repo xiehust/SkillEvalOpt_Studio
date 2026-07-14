@@ -570,6 +570,52 @@ class TestRunBatch:
         assert [row["path"] for row in results[1]["artifacts"]] == ["ok.pdf"]
         assert "artifact_error" not in results[1]
 
+    def test_hard_linked_target_output_is_artifact_failure_and_batch_isolated(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        def produce(*, work_dir, **kwargs):
+            output = os.path.join(work_dir, "report.pdf")
+            with open(output, "wb") as handle:
+                handle.write(b"%PDF-1.4\n")
+            if work_dir.endswith("t1"):
+                os.link(output, os.path.join(work_dir, "report-copy.pdf"))
+            return "done", "raw"
+
+        self._patch_harness(monkeypatch, produce)
+        results = run_batch(_three_items()[:2], "# skill", str(tmp_path), workers=2)
+
+        assert results[0]["response"] == "done"
+        assert "single-link" in results[0]["artifact_error"]
+        assert results[0]["artifact_failure"] is True
+        assert results[0]["artifacts"] == []
+        assert "error" not in results[0]
+        assert [row["path"] for row in results[1]["artifacts"]] == ["report.pdf"]
+        assert "artifact_error" not in results[1]
+
+    def test_codex_last_message_is_not_target_output(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        def produce(*, work_dir, **kwargs):
+            with open(
+                os.path.join(work_dir, "codex_last_message.txt"),
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                handle.write("final response")
+            with open(os.path.join(work_dir, "report.pdf"), "wb") as handle:
+                handle.write(b"%PDF-1.4\n")
+            return "done", "raw"
+
+        monkeypatch.setattr(rollout_mod, "prepare_workspace", self._seed_workspace)
+        monkeypatch.setattr(rollout_mod, "run_codex_exec", produce)
+        monkeypatch.setattr(rollout_mod, "get_target_backend", lambda: "codex_exec")
+
+        result = run_batch([_valid_item("t1")], "# skill", str(tmp_path))[0]
+
+        assert result["response"] == "done"
+        assert [row["path"] for row in result["artifacts"]] == ["report.pdf"]
+        assert "artifact_error" not in result
+
 
 # ── CLI / report ──────────────────────────────────────────────────────────
 

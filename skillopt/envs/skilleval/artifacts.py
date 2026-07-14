@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass
 from pathlib import PurePosixPath
 
 _SKIP_ROOTS = {".agents", ".claude", ".codex", ".git"}
+_SKIP_ROOT_FILES = {"task.md", "codex_last_message.txt"}
 _SUPPORTED_KINDS = {"xlsx", "xls", "docx", "doc", "pdf", "image", "pptx", "ppt"}
 _SUFFIX_KINDS = {
     ".xlsx": "xlsx",
@@ -405,7 +406,10 @@ def _scan_directory(
             continue
         if not stat.S_ISREG(info.st_mode):
             raise ValueError(f"non-regular artifact is not allowed: {rel}")
-        if skip_runtime and (name in _SKIP_ROOTS or (not rel_parts and name == "task.md")):
+        if skip_runtime and (
+            name in _SKIP_ROOTS
+            or (not rel_parts and name in _SKIP_ROOT_FILES)
+        ):
             continue
         try:
             descriptor = os.open(name, _file_flags(), dir_fd=directory_descriptor)
@@ -488,7 +492,7 @@ def build_manifest(root: str) -> dict[str, ManifestEntry]:
     rows, _directories = _scan_manifest(
         root,
         skip_runtime=True,
-        require_single_link=False,
+        require_single_link=True,
     )
     return rows
 
@@ -544,7 +548,7 @@ def _logical_parts(raw_path: object) -> tuple[str, ...]:
         raise ValueError(f"invalid relative artifact path: {raw_path!r}")
     if logical.as_posix() != raw_path:
         raise ValueError(f"invalid relative artifact path: {raw_path!r}")
-    if any(part in _SKIP_ROOTS for part in parts) or raw_path == "task.md":
+    if any(part in _SKIP_ROOTS for part in parts) or raw_path in _SKIP_ROOT_FILES:
         raise ValueError(f"runtime path is not candidate evidence: {raw_path!r}")
     return parts
 
@@ -593,10 +597,17 @@ def _same_filesystem_object(left: os.stat_result, right: os.stat_result) -> bool
     )
 
 
-def _remove_directory_at(parent_descriptor: int, name: str) -> None:
+def _remove_directory_at(
+    parent_descriptor: int,
+    name: str,
+    *,
+    expected: os.stat_result | None = None,
+) -> None:
     before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
     if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
         raise ValueError(f"refusing to remove non-directory entry: {name}")
+    if expected is not None and not _same_filesystem_object(before, expected):
+        raise ValueError(f"refusing to remove replaced directory: {name}")
     try:
         directory_descriptor = os.open(name, _directory_flags(), dir_fd=parent_descriptor)
     except OSError as exc:
@@ -688,12 +699,21 @@ def _prepare_judge_dirs(judge_root: str) -> _JudgeDirs:
         if not _same_filesystem_object(named_root, os.fstat(root_descriptor)):
             raise ValueError("judge root changed after creation")
     except Exception:
+        expected_root = (
+            os.fstat(root_descriptor)
+            if created_root and root_descriptor >= 0
+            else None
+        )
         for descriptor in (scratch_descriptor, evidence_descriptor, root_descriptor):
             if descriptor >= 0:
                 os.close(descriptor)
         if created_root:
             try:
-                _remove_directory_at(parent_descriptor, root_name)
+                _remove_directory_at(
+                    parent_descriptor,
+                    root_name,
+                    expected=expected_root,
+                )
             except (FileNotFoundError, ValueError, OSError):
                 pass
         os.close(parent_descriptor)
@@ -780,7 +800,7 @@ def _copy_validated_file(
     expected_size: object,
     expected_sha256: object,
     initial_info: os.stat_result,
-) -> None:
+) -> int:
     if isinstance(expected_size, bool) or not isinstance(expected_size, int):
         raise ValueError(f"artifact manifest size is invalid: {rel}")
     if initial_info.st_size != expected_size:
@@ -792,13 +812,17 @@ def _copy_validated_file(
 
     source_digest = hashlib.sha256()
     copied = 0
-    while True:
-        chunk = os.read(source_descriptor, _HASH_CHUNK_SIZE)
+    remaining = initial_info.st_size
+    while remaining:
+        chunk = os.read(source_descriptor, min(_HASH_CHUNK_SIZE, remaining))
         if not chunk:
-            break
+            raise ValueError(f"artifact ended before its validated size: {rel}")
         source_digest.update(chunk)
         copied += len(chunk)
+        remaining -= len(chunk)
         _write_all(destination_descriptor, chunk)
+    if os.read(source_descriptor, 1):
+        raise ValueError(f"artifact grew beyond its validated size: {rel}")
 
     final_info = os.fstat(source_descriptor)
     if (
@@ -830,6 +854,53 @@ def _copy_validated_file(
     destination_info = os.fstat(destination_descriptor)
     if not stat.S_ISREG(destination_info.st_mode) or destination_info.st_nlink != 1:
         raise ValueError(f"copied evidence must be a single-link regular file: {rel}")
+    return copied
+
+
+def _revalidate_source_entry(
+    work_descriptor: int,
+    source_descriptor: int,
+    parts: tuple[str, ...],
+    initial_info: os.stat_result,
+    row: dict,
+) -> ManifestEntry:
+    rel = "/".join(parts)
+    retained_info = os.fstat(source_descriptor)
+    if (
+        not stat.S_ISREG(retained_info.st_mode)
+        or retained_info.st_nlink != 1
+        or _stat_identity(retained_info) != _stat_identity(initial_info)
+    ):
+        raise ValueError(f"artifact source changed after evidence copy: {rel}")
+
+    named_descriptor = _open_relative_file(work_descriptor, parts)
+    try:
+        named_info = os.fstat(named_descriptor)
+        if _stat_identity(named_info) != _stat_identity(retained_info):
+            raise ValueError(f"artifact source name changed after evidence copy: {rel}")
+        entry = _manifest_entry_from_descriptor(
+            named_descriptor,
+            rel,
+            require_single_link=True,
+        )
+        final_named_info = os.fstat(named_descriptor)
+        if _stat_identity(final_named_info) != _stat_identity(retained_info):
+            raise ValueError(f"artifact source changed after evidence copy: {rel}")
+    finally:
+        os.close(named_descriptor)
+
+    confirmation_descriptor = _open_relative_file(work_descriptor, parts)
+    try:
+        if _stat_identity(os.fstat(confirmation_descriptor)) != _stat_identity(
+            final_named_info
+        ):
+            raise ValueError(f"artifact source name changed after evidence copy: {rel}")
+    finally:
+        os.close(confirmation_descriptor)
+
+    if entry.size != row.get("size") or entry.sha256 != row.get("sha256"):
+        raise ValueError(f"artifact source content changed after evidence copy: {rel}")
+    return entry
 
 
 def _lock_evidence_directories(evidence_descriptor: int) -> None:
@@ -922,14 +993,19 @@ def create_evidence_snapshot(
                     f"candidate output bytes exceed configured limit {max_bytes}"
                 )
 
+        copied_total = 0
         for row, parts, source_descriptor, info in validated_sources:
             rel = "/".join(parts)
+            if info.st_size > max_bytes - copied_total:
+                raise EvidenceLimitError(
+                    f"candidate output bytes exceed configured limit {max_bytes}"
+                )
             destination_descriptor = _open_destination_file(
                 prepared.evidence_descriptor,
                 parts,
             )
             try:
-                _copy_validated_file(
+                copied_total += _copy_validated_file(
                     source_descriptor,
                     destination_descriptor,
                     rel=rel,
@@ -972,12 +1048,36 @@ def create_evidence_snapshot(
             required_directory_mode=0o555,
         )
         final_entries = tuple(final_rows.values())
+        expected_entries = tuple(
+            _revalidate_source_entry(
+                work_descriptor,
+                source_descriptor,
+                parts,
+                info,
+                row,
+            )
+            for row, parts, source_descriptor, info in validated_sources
+        )
+        expected_directories = _manifest_directories(expected_entries)
         if (
-            final_entries != entries
-            or final_directories != evidence_directories
-            or final_directories != _manifest_directories(final_entries)
+            entries != expected_entries
+            or final_entries != expected_entries
+            or evidence_directories != expected_directories
+            or final_directories != expected_directories
         ):
-            raise RuntimeError("evidence changed while snapshot was finalized")
+            raise RuntimeError("evidence does not match finalized rollout outputs")
+        _validate_absolute_directory_identity(
+            prepared.root_path,
+            prepared.root_descriptor,
+        )
+        _validate_absolute_directory_identity(
+            prepared.evidence_path,
+            prepared.evidence_descriptor,
+        )
+        _validate_absolute_directory_identity(
+            prepared.scratch_path,
+            prepared.scratch_descriptor,
+        )
         return EvidenceSnapshot(
             evidence_dir=evidence,
             scratch_dir=scratch,
@@ -987,7 +1087,11 @@ def create_evidence_snapshot(
     except Exception:
         if prepared is not None:
             try:
-                _remove_directory_at(prepared.parent_descriptor, prepared.root_name)
+                _remove_directory_at(
+                    prepared.parent_descriptor,
+                    prepared.root_name,
+                    expected=os.fstat(prepared.root_descriptor),
+                )
             except (FileNotFoundError, ValueError, OSError):
                 pass
         raise

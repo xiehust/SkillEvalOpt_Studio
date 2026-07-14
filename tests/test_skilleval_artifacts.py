@@ -129,6 +129,16 @@ class TestManifest:
         with pytest.raises(ValueError, match="non-regular"):
             build_manifest(str(root))
 
+    def test_rejects_hard_linked_file(self, tmp_path) -> None:
+        root = tmp_path / "work"
+        root.mkdir()
+        output = root / "report.pdf"
+        output.write_bytes(b"%PDF-1.4\n")
+        os.link(output, root / "report-copy.pdf")
+
+        with pytest.raises(ValueError, match="single-link"):
+            build_manifest(str(root))
+
     @pytest.mark.parametrize("name", [".agents", ".claude", ".codex", ".git"])
     def test_reserved_runtime_name_as_regular_file_is_excluded(
         self, tmp_path, name
@@ -577,6 +587,72 @@ class TestEvidenceSnapshot:
             )
         assert linked is True
 
+    def test_rejects_source_name_replaced_after_copy(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        work = tmp_path / "work"
+        work.mkdir()
+        output = work / "report.pdf"
+        payload = b"%PDF-1.4\noriginal"
+        outputs = _outputs_after(work, lambda: output.write_bytes(payload))
+        replaced = tmp_path / "original-report.pdf"
+        real_lock = artifacts_mod._lock_evidence_directories
+        swapped = False
+
+        def racing_lock(evidence_descriptor):
+            nonlocal swapped
+            real_lock(evidence_descriptor)
+            output.rename(replaced)
+            output.write_bytes(payload)
+            swapped = True
+
+        monkeypatch.setattr(
+            artifacts_mod,
+            "_lock_evidence_directories",
+            racing_lock,
+        )
+
+        with pytest.raises(ValueError, match="source|changed"):
+            create_evidence_snapshot(
+                str(work), outputs, str(tmp_path / "judge"), max_bytes=1024
+            )
+        assert swapped is True
+
+    def test_rejects_source_growth_without_writing_past_limit(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        work = tmp_path / "work"
+        work.mkdir()
+        output = work / "report.pdf"
+        payload = b"%PDF"
+        outputs = _outputs_after(work, lambda: output.write_bytes(payload))
+        judge_root = tmp_path / "judge"
+        real_write_all = artifacts_mod._write_all
+        largest_destination = 0
+        grown = False
+
+        def racing_write_all(descriptor, data):
+            nonlocal largest_destination, grown
+            real_write_all(descriptor, data)
+            largest_destination = max(
+                largest_destination,
+                os.fstat(descriptor).st_size,
+            )
+            if not grown:
+                with output.open("ab") as handle:
+                    handle.write(b"-oversized")
+                grown = True
+
+        monkeypatch.setattr(artifacts_mod, "_write_all", racing_write_all)
+
+        with pytest.raises(ValueError, match="grew|changed"):
+            create_evidence_snapshot(
+                str(work), outputs, str(judge_root), max_bytes=len(payload)
+            )
+        assert grown is True
+        assert largest_destination <= len(payload)
+        assert not judge_root.exists()
+
     def test_rejects_symlinked_judge_root_without_touching_target(self, tmp_path) -> None:
         work = tmp_path / "work"
         work.mkdir()
@@ -657,6 +733,75 @@ class TestEvidenceSnapshot:
             )
         assert swapped is True
         assert victim_file.read_text(encoding="utf-8") == "keep"
+
+    def test_rejects_returned_judge_root_replacement_without_deleting_it(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        work = tmp_path / "work"
+        work.mkdir()
+        outputs = _outputs_after(
+            work, lambda: (work / "report.pdf").write_bytes(b"%PDF-1.4\n")
+        )
+        judge_root = tmp_path / "judge"
+        moved_root = tmp_path / "original-judge"
+        replacement_marker = judge_root / "keep.txt"
+        real_lock = artifacts_mod._lock_evidence_directories
+        swapped = False
+
+        def racing_lock(evidence_descriptor):
+            nonlocal swapped
+            real_lock(evidence_descriptor)
+            judge_root.rename(moved_root)
+            (judge_root / "evidence").mkdir(parents=True)
+            (judge_root / "scratch").mkdir()
+            replacement_marker.write_text("keep", encoding="utf-8")
+            swapped = True
+
+        monkeypatch.setattr(
+            artifacts_mod,
+            "_lock_evidence_directories",
+            racing_lock,
+        )
+
+        with pytest.raises(ValueError, match="directory path changed"):
+            create_evidence_snapshot(
+                str(work), outputs, str(judge_root), max_bytes=1024
+            )
+        assert swapped is True
+        assert replacement_marker.read_text(encoding="utf-8") == "keep"
+
+    @pytest.mark.parametrize("component", ["evidence", "scratch"])
+    def test_rejects_returned_child_directory_replacement(
+        self, tmp_path, monkeypatch, component
+    ) -> None:
+        work = tmp_path / "work"
+        work.mkdir()
+        outputs = _outputs_after(
+            work, lambda: (work / "report.pdf").write_bytes(b"%PDF-1.4\n")
+        )
+        judge_root = tmp_path / "judge"
+        real_lock = artifacts_mod._lock_evidence_directories
+        swapped = False
+
+        def racing_lock(evidence_descriptor):
+            nonlocal swapped
+            real_lock(evidence_descriptor)
+            target = judge_root / component
+            target.rename(judge_root / f"original-{component}")
+            target.mkdir()
+            swapped = True
+
+        monkeypatch.setattr(
+            artifacts_mod,
+            "_lock_evidence_directories",
+            racing_lock,
+        )
+
+        with pytest.raises(ValueError, match="directory path changed"):
+            create_evidence_snapshot(
+                str(work), outputs, str(judge_root), max_bytes=1024
+            )
+        assert swapped is True
 
     def test_detects_evidence_content_and_path_mutation(self, tmp_path) -> None:
         work = tmp_path / "work"
