@@ -17,6 +17,7 @@ from .base import (
     DEFAULT_SCRATCH_BYTES,
     DEFAULT_SCRATCH_DEPTH,
     DEFAULT_SCRATCH_ENTRIES,
+    EvaluationError,
     InspectionError,
     MAX_RENDER_PIXELS,
     RenderBudget,
@@ -246,7 +247,11 @@ def inspect_artifact(
         except InspectionError:
             raise
         except Exception as exc:
-            raise InspectionError(
+            # An unexpected exception here is a bug or crash in the
+            # inspector adapter itself, not a signal that the artifact is
+            # corrupt -- classify it as an evaluation error so callers do
+            # not score it as a failing criterion.
+            raise EvaluationError(
                 f"artifact inspection failed: {bounded_diagnostic(exc)}"
             ) from exc
     return validate_json_result(result, budget)
@@ -416,7 +421,11 @@ def extract_artifact(
         except InspectionError:
             raise
         except Exception as exc:
-            raise InspectionError(
+            # Same rationale as inspect_artifact above: an unexpected
+            # exception is a bug or crash, not evidence the artifact is
+            # corrupt, so it is an evaluation error rather than an artifact
+            # failure.
+            raise EvaluationError(
                 f"artifact extraction failed: {bounded_diagnostic(exc)}"
             ) from exc
     return validate_json_result(
@@ -427,6 +436,7 @@ def extract_artifact(
 
 
 __all__ = [
+    "EvaluationError",
     "InspectionError",
     "RenderBudget",
     "ResponseBudget",

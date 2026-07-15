@@ -35,6 +35,7 @@ from .base import (
     DEFAULT_SCRATCH_BYTES,
     DEFAULT_SCRATCH_DEPTH,
     DEFAULT_SCRATCH_ENTRIES,
+    EvaluationError,
     InspectionError,
     RenderBudget,
     ResponseBudget,
@@ -1900,7 +1901,11 @@ def _convert_with_libreoffice(
         for attempt in range(_LIBREOFFICE_MAX_TRANSIENT_ATTEMPTS):
             remaining_timeout = deadline - time.monotonic()
             if remaining_timeout <= 0:
-                raise InspectionError(
+                # A total-timeout is a harness/infrastructure failure (the
+                # conversion subprocess is too slow or stuck), not evidence
+                # the input spreadsheet is corrupt -- classify it as an
+                # evaluation error, not an artifact failure.
+                raise EvaluationError(
                     "LibreOffice conversion exceeded its total timeout"
                 )
             try:

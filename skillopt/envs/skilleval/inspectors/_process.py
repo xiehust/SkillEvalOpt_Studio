@@ -15,6 +15,7 @@ from ._secure_files import current_evidence_fds
 from .base import (
     MAX_COMMAND_OUTPUT_CHARS,
     MAX_COMMAND_TIMEOUT_SECONDS,
+    EvaluationError,
     InspectionError,
     _absolute_path,
     _open_real_directory,
@@ -242,7 +243,7 @@ def safe_run(
             inherited_fds,
         )
     except OSError as exc:
-        raise InspectionError(
+        raise EvaluationError(
             "inspector command could not start: "
             f"{type(exc).__name__}: {bounded_diagnostic(exc)}"
         ) from exc
@@ -287,11 +288,11 @@ def safe_run(
         for reader in readers:
             reader.join(timeout=2)
         if any(reader.is_alive() for reader in readers):
-            raise InspectionError(
+            raise EvaluationError(
                 "inspector command output reader did not finish"
             )
         if reader_errors:
-            raise InspectionError(
+            raise EvaluationError(
                 "inspector command output could not be read: "
                 f"{bounded_diagnostic(reader_errors[0])}"
             )
@@ -303,22 +304,26 @@ def safe_run(
         try:
             status = json.loads(status_data.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise InspectionError(
+            raise EvaluationError(
                 "inspector supervisor returned an invalid status"
             ) from exc
 
         reason = status.get("reason")
         if reason == "timeout":
-            raise InspectionError(
+            raise EvaluationError(
                 f"inspector command timed out after {timeout} seconds"
             )
         if reason == "start":
-            raise InspectionError(
+            raise EvaluationError(
                 "inspector command could not start: "
                 f"{bounded_diagnostic(status.get('detail', ''))}"
             )
         if reason is not None:
-            raise InspectionError(
+            # Every other supervisor-reported reason ("cancelled", "scratch",
+            # "cleanup", "supervisor") describes the process-isolation
+            # sandbox itself failing, not the command's own assessment of
+            # its input -- an evaluation error, not an artifact failure.
+            raise EvaluationError(
                 f"inspector command {reason} failure: "
                 f"{bounded_diagnostic(status.get('detail', ''))}"
             )

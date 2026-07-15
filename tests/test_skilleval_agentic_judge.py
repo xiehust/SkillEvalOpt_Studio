@@ -6,6 +6,7 @@ import math
 
 import pytest
 
+from skillopt.envs.skilleval import verdict as verdict_mod
 from skillopt.envs.skilleval.judge_cache import VerdictCache
 from skillopt.envs.skilleval.verdict import (
     parse_verdict,
@@ -337,6 +338,66 @@ class TestDeterministicXlsxCellAndFormula:
         criteria, broken = run_deterministic_checks(checks, evidence_dir=str(evidence), scratch_dir=str(scratch))
         assert criteria[0]["passed"] is False
         assert broken == frozenset({"missing.xlsx"})
+
+
+class TestEvaluationErrorClassification:
+    """Infrastructure failures (timeouts/crashes/sandbox errors) must not be
+    scored as agent failures -- they must surface distinctly from a
+    genuinely corrupt or missing artifact so the caller can classify the
+    row `evaluation_error` instead of `artifact_failure`.
+    """
+
+    def test_infrastructure_timeout_propagates_uncaught_not_a_failed_criterion(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors import EvaluationError
+
+        evidence, scratch = _roots(tmp_path)
+        (evidence / "report.xls").write_bytes(b"legacy-bytes")
+
+        def _timed_out(*args, **kwargs):
+            raise EvaluationError("LibreOffice conversion exceeded its total timeout")
+
+        monkeypatch.setattr(verdict_mod, "inspect_artifact", _timed_out)
+        checks = [_check("opens", "report.xls", "opens", required=True)]
+
+        with pytest.raises(EvaluationError, match="timeout"):
+            run_deterministic_checks(checks, evidence_dir=str(evidence), scratch_dir=str(scratch))
+
+    def test_infrastructure_crash_propagates_uncaught_even_for_a_required_check(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors import EvaluationError
+
+        evidence, scratch = _roots(tmp_path)
+        (evidence / "memo.docx").write_bytes(b"docx-bytes")
+
+        def _crashed(*args, **kwargs):
+            raise EvaluationError("artifact inspection failed: BrokenPipeError")
+
+        monkeypatch.setattr(verdict_mod, "extract_artifact", _crashed)
+        checks = [_check("contains_text", "memo.docx", "contains_text", spec={"text": "hello"})]
+
+        with pytest.raises(EvaluationError):
+            run_deterministic_checks(checks, evidence_dir=str(evidence), scratch_dir=str(scratch))
+
+    def test_corrupt_artifact_still_yields_artifact_failure_and_broken_path(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from skillopt.envs.skilleval.inspectors import InspectionError
+
+        evidence, scratch = _roots(tmp_path)
+        (evidence / "report.xls").write_bytes(b"legacy-bytes")
+
+        def _corrupt(*args, **kwargs):
+            raise InspectionError("artifact is not a valid legacy spreadsheet")
+
+        monkeypatch.setattr(verdict_mod, "inspect_artifact", _corrupt)
+        checks = [_check("opens", "report.xls", "opens", required=True)]
+
+        criteria, broken = run_deterministic_checks(checks, evidence_dir=str(evidence), scratch_dir=str(scratch))
+        assert criteria[0]["passed"] is False
+        assert broken == frozenset({"report.xls"})
 
 
 class TestNoAgentChecksShortCircuit:

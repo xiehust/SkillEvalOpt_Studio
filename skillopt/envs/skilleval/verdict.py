@@ -29,6 +29,7 @@ import math
 import os
 
 from skillopt.envs.skilleval.inspectors import (
+    EvaluationError,
     InspectionError,
     extract_artifact,
     inspect_artifact,
@@ -340,9 +341,26 @@ def run_deterministic_checks(
     evaluate. A path is never added merely because a value/formula/text
     assertion failed on an artifact that opened successfully.
 
-    Any exception other than ``InspectionError`` (a bug, or an unexpected
-    failure outside the trust contract of the inspector registry) propagates
-    uncaught; callers must not silently swallow it.
+    The inspector registry almost never lets a bare exception escape --
+    ``inspect_artifact``/``extract_artifact`` wrap unexpected crashes too --
+    so exception *type*, not "did something raise", is what carries the
+    artifact-vs-evaluation distinction here:
+
+    - A plain ``InspectionError`` (parse/validation/structure rejection --
+      the artifact is missing, corrupt, or unopenable) is caught and turned
+      into a failing criterion row, with the path added to
+      ``broken_required_paths`` when the check is required. This is scored
+      as an agent/artifact failure (``artifact_failure``).
+    - ``EvaluationError`` -- its subclass raised at infrastructure failure
+      points (subprocess timeouts/crashes in ``safe_run``, sandbox/process-
+      supervisor failures, or an unexpected exception caught by the
+      registry's catch-all wrappers) -- is deliberately NOT caught here. It
+      propagates uncaught so the caller can classify the whole row as an
+      ``evaluation_error`` instead of scoring a harness failure as if the
+      agent under evaluation had produced a bad artifact.
+    - Any other exception (a bug, or a failure outside the trust contract of
+      the inspector registry entirely) also propagates uncaught; callers
+      must not silently swallow it.
     """
     inventory_paths = frozenset(row["path"] for row in inventory_artifacts(evidence_dir, scratch_dir))
     criteria: list[dict] = []
@@ -364,6 +382,11 @@ def run_deterministic_checks(
                 row = _DETERMINISTIC_EVALUATORS[check_type](
                     check, evidence_dir=evidence_dir, scratch_dir=scratch_dir
                 )
+        except EvaluationError:
+            # Infrastructure failure (timeout, crash, sandbox error): not the
+            # agent's fault, so it must not be scored as a failing criterion.
+            # Propagate uncaught -- see the docstring above for the contract.
+            raise
         except InspectionError as exc:
             row = _criterion_row(check, False, str(exc))
             file_level_failure = True

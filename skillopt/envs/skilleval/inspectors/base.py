@@ -47,6 +47,26 @@ class InspectionError(RuntimeError):
     """Raised when an artifact cannot be inspected within the trust contract."""
 
 
+class EvaluationError(InspectionError):
+    """Raised when the inspection *infrastructure* fails, not the artifact.
+
+    A plain ``InspectionError`` means the artifact itself is missing,
+    corrupt, unopenable, or otherwise rejected by parse/validation/structure
+    checks -- the agent under evaluation is responsible for that outcome.
+    ``EvaluationError`` is the narrower subclass raised at infrastructure
+    failure points instead: subprocess timeouts/crashes in ``safe_run``,
+    sandbox/process-supervisor failures, and unexpected exceptions caught by
+    the inspector registry's catch-all wrappers. These are harness failures
+    independent of the artifact's content, so callers (see
+    ``skillopt.envs.skilleval.verdict.run_deterministic_checks``) must not
+    score them as a failing criterion; the exception is left to propagate so
+    the caller can classify the whole row as an evaluation error rather than
+    an artifact failure. Because it subclasses ``InspectionError``, existing
+    ``except InspectionError`` call sites that have not been updated to draw
+    this distinction keep working unchanged.
+    """
+
+
 def _positive_int(value: object, name: str, maximum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise InspectionError(f"{name} budget must be a positive integer")
@@ -387,6 +407,7 @@ __all__ = [
     "DEFAULT_SCRATCH_BYTES",
     "DEFAULT_SCRATCH_DEPTH",
     "DEFAULT_SCRATCH_ENTRIES",
+    "EvaluationError",
     "InspectionError",
     "Inspector",
     "JSONValue",
