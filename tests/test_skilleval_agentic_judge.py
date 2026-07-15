@@ -693,6 +693,45 @@ class TestAgenticJudgeConfigValidation:
             AgenticJudgeConfig(sandbox_command=())
 
 
+class TestPreflightExercisesJudgeArgv:
+    """`preflight` must reject a backend CLI that errors on the judge flag set,
+    not merely one that fails ``--version``."""
+
+    def _fake_claude_exe(self, tmp_path, *, mode: str):
+        version_ok = "if '--version' in sys.argv:\n    print('9.9.9 (fake)')\n    sys.exit(0)\n"
+        if mode == "reject":
+            body = version_ok + "sys.stderr.write(\"error: unknown option '--json-schema'\\n\")\nsys.exit(1)\n"
+        else:
+            body = version_ok + "sys.exit(0)\n"
+        script = tmp_path / f"fake-claude-{mode}"
+        script.write_text("#!/usr/bin/env python3\nimport sys\n" + body, encoding="utf-8")
+        script.chmod(0o755)
+        return script
+
+    def test_preflight_backend_rejects_a_cli_that_errors_on_judge_flags(self, tmp_path, monkeypatch) -> None:
+        from skillopt.envs.skilleval import agentic_judge
+        from skillopt.model import codex_harness
+
+        exe = self._fake_claude_exe(tmp_path, mode="reject")
+        config = {"path": str(exe), "effort": "low"}
+        monkeypatch.setattr(agentic_judge, "get_claude_code_exec_config", lambda: config)
+        monkeypatch.setattr(codex_harness, "get_claude_code_exec_config", lambda: config)
+
+        with pytest.raises(agentic_judge.EvaluationError, match="judge policy flag"):
+            agentic_judge._preflight_backend(agentic_judge.AgenticJudgeConfig(backend="claude_code_exec"))
+
+    def test_preflight_backend_passes_a_cli_that_parses_judge_flags(self, tmp_path, monkeypatch) -> None:
+        from skillopt.envs.skilleval import agentic_judge
+        from skillopt.model import codex_harness
+
+        exe = self._fake_claude_exe(tmp_path, mode="accept")
+        config = {"path": str(exe), "effort": "low"}
+        monkeypatch.setattr(agentic_judge, "get_claude_code_exec_config", lambda: config)
+        monkeypatch.setattr(codex_harness, "get_claude_code_exec_config", lambda: config)
+
+        agentic_judge._preflight_backend(agentic_judge.AgenticJudgeConfig(backend="claude_code_exec"))
+
+
 class TestArtifactMcpCommandDetails:
     def test_elevated_launcher_drops_privileges_and_limits_resources(self, tmp_path) -> None:
         from skillopt.envs.skilleval.agentic_judge import build_artifact_mcp_command

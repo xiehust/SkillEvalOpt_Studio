@@ -230,6 +230,12 @@ class TestJudgeExecPolicyFailClosed:
         assert cmd[cmd.index("--setting-sources") + 1] == ""
         # The rollout / evidence directories are never added.
         assert "--add-dir" not in cmd
+        # Structured output uses the real claude CLI flag `--json-schema`; the
+        # earlier `--schema` does not exist in the CLI and made every judgment
+        # exit non-zero. Asserting the exact flag here breaks on future drift.
+        assert "--schema" not in cmd
+        assert "--json-schema" in cmd
+        assert json.loads(cmd[cmd.index("--json-schema") + 1]) == policy["output_schema"]
         assert response == '{"schema_version": 1}'
 
     def test_codex_judge_cli_is_read_only_with_only_the_mcp(self, tmp_path, monkeypatch) -> None:
@@ -293,6 +299,58 @@ class TestJudgeExecPolicyFailClosed:
             work_dir=str(tmp_path), prompt="p", model="m", timeout=5,
         )
         assert response == "plain"
+
+
+def _fake_claude_exe(tmp_path, *, mode: str):
+    """Write a fake `claude` executable that mimics commander flag handling.
+
+    ``--version`` always succeeds; the judge argv is then handled per ``mode``:
+    ``reject`` errors like the CLI would on an unknown/renamed flag, ``accept``
+    parses cleanly and exits 0, ``hang`` sleeps (simulating a valid argv that
+    reaches the endpoint and blocks) so the flag check times out.
+    """
+    version_ok = "if '--version' in sys.argv:\n    print('9.9.9 (fake)')\n    sys.exit(0)\n"
+    if mode == "reject":
+        body = version_ok + "sys.stderr.write(\"error: unknown option '--json-schema'\\n\")\nsys.exit(1)\n"
+    elif mode == "accept":
+        body = version_ok + "sys.exit(0)\n"
+    elif mode == "hang":
+        body = version_ok + "import time\ntime.sleep(30)\n"
+    else:  # pragma: no cover - test helper guard
+        raise ValueError(mode)
+    script = tmp_path / f"fake-claude-{mode}"
+    script.write_text("#!/usr/bin/env python3\nimport sys\n" + body, encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
+class TestClaudeJudgeFlagPreflight:
+    """The token-free judge-argv flag check catches unknown/renamed CLI flags."""
+
+    def test_rejects_a_cli_that_errors_on_the_judge_flags(self, tmp_path, monkeypatch) -> None:
+        exe = _fake_claude_exe(tmp_path, mode="reject")
+        monkeypatch.setattr(
+            codex_harness, "get_claude_code_exec_config", lambda: {"path": str(exe), "effort": "low"}
+        )
+        policy = _judge_policy(tmp_path, "claude_code_exec")
+        with pytest.raises(RuntimeError, match="judge policy flag"):
+            codex_harness.check_claude_judge_cli_flags(policy=policy, model="m", timeout=10.0)
+
+    def test_accepts_a_cli_that_parses_the_judge_flags(self, tmp_path, monkeypatch) -> None:
+        exe = _fake_claude_exe(tmp_path, mode="accept")
+        monkeypatch.setattr(
+            codex_harness, "get_claude_code_exec_config", lambda: {"path": str(exe), "effort": "low"}
+        )
+        policy = _judge_policy(tmp_path, "claude_code_exec")
+        codex_harness.check_claude_judge_cli_flags(policy=policy, model="m", timeout=10.0)
+
+    def test_treats_a_hang_as_valid_flags(self, tmp_path, monkeypatch) -> None:
+        exe = _fake_claude_exe(tmp_path, mode="hang")
+        monkeypatch.setattr(
+            codex_harness, "get_claude_code_exec_config", lambda: {"path": str(exe), "effort": "low"}
+        )
+        policy = _judge_policy(tmp_path, "claude_code_exec")
+        codex_harness.check_claude_judge_cli_flags(policy=policy, model="m", timeout=0.5)
 
 
 class TestJudgeWorkerProtocol:

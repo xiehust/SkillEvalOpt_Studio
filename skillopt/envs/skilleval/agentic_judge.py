@@ -47,6 +47,7 @@ from skillopt.model.backend_config import (
     get_claude_code_exec_config,
     get_codex_exec_config,
 )
+from skillopt.model.codex_harness import check_claude_judge_cli_flags
 from skillopt.envs.skilleval.verdict import (
     parse_verdict,
     run_deterministic_checks,
@@ -544,6 +545,31 @@ def _preflight_backend(config: AgenticJudgeConfig) -> None:
             "agentic judge preflight: backend executable failed its version query "
             f"({resolved!r}, exit {proc.returncode}): {detail}"
         )
+    if config.backend == "claude_code_exec":
+        _preflight_claude_judge_flags(config)
+
+
+def _preflight_claude_judge_flags(config: AgenticJudgeConfig) -> None:
+    """Exercise the full judge policy argv (not just ``--version``) against the
+    installed claude CLI so a renamed/unknown flag fails fast here, before any
+    rollout/model spend — token-free (unreachable endpoint, short timeout)."""
+    root = tempfile.mkdtemp(prefix="skillopt-judge-flagpolicy-")
+    try:
+        policy = build_backend_policy(
+            config.backend,
+            [sys.executable, "-m", "skillopt.envs.skilleval.artifact_mcp"],
+            root,
+        )
+    finally:
+        _rmtree_quiet(root)
+    try:
+        check_claude_judge_cli_flags(policy=policy, model=config.model)
+    except RuntimeError as exc:
+        raise EvaluationError(
+            "agentic judge preflight: " + str(exc)
+            + " Update the judge exec CLI or its judge flag mapping before running "
+            "with judge_mode=agentic."
+        ) from exc
 
 
 def _declared_check_kinds(items: list[dict] | None) -> dict[str, str]:

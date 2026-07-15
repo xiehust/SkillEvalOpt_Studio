@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import traceback
 from typing import Any
@@ -938,33 +939,34 @@ def _judge_mcp_server(policy: dict) -> tuple[str, list[str]]:
     return str(name), [str(part) for part in command]
 
 
-def _run_claude_code_judge_cli(
-    *,
-    work_dir: str,
-    prompt: str,
-    model: str,
-    timeout: int,
-    policy: dict,
-) -> tuple[str, str]:
-    """Restricted Claude Code judge call: no built-in tools, only the Artifact MCP.
+# Commander (the claude CLI's parser) prints these to stderr and exits non-zero
+# during argument parsing — before any network call — when a flag is unknown or
+# an option value is rejected. They distinguish flag drift from endpoint errors.
+_CLI_FLAG_ERROR_MARKERS = (
+    "unknown option",
+    "unknown command",
+    "unknown or unexpected option",
+    "error: option",
+)
+_CLAUDE_JUDGE_FLAG_CHECK_TIMEOUT = 12.0
 
-    Fail-closed CLI transport used only by the judge. It never adds the rollout
-    or evidence directories, disables all built-in tools (``--tools ""``),
-    permits only the named Artifact MCP tools, loads no user/project settings,
-    and replaces the target-runner system/prompt wrapper with a judge system
-    prompt that never references ``task.md`` or ``skillopt-target``.
+
+def _build_claude_judge_cli_command(
+    *,
+    config: dict,
+    model: str,
+    policy: dict,
+    mcp_config_path: str,
+    system_prompt_path: str,
+    prompt: str,
+) -> list[str]:
+    """Build the restricted-judge argv for the claude CLI.
+
+    Shared by the per-task judge call and the token-free preflight flag check so
+    the two can never drift. Structured output uses ``--json-schema`` — the real
+    claude CLI flag; the earlier ``--schema`` does not exist and made every
+    judgment exit non-zero (``error: unknown option '--schema'``).
     """
-    config = get_claude_code_exec_config()
-    server_name, mcp_command = _judge_mcp_server(policy)
-    mcp_config_path = os.path.join(work_dir, "judge-mcp.json")
-    with open(mcp_config_path, "w", encoding="utf-8") as handle:
-        json.dump(
-            {"mcpServers": {server_name: {"type": "stdio", "command": mcp_command[0], "args": list(mcp_command[1:])}}},
-            handle,
-        )
-    system_prompt_path = os.path.join(work_dir, "judge-system-prompt.txt")
-    with open(system_prompt_path, "w", encoding="utf-8") as handle:
-        handle.write(str(policy.get("system_prompt") or ""))
     allowed_tools = ",".join(str(tool) for tool in policy.get("allowed_tools", []) if str(tool))
     cmd = [
         str(config["path"]),
@@ -992,8 +994,101 @@ def _run_claude_code_judge_cli(
         cmd.extend(["--effort", effort])
     schema = policy.get("output_schema")
     if isinstance(schema, dict):
-        cmd.extend(["--schema", json.dumps(schema)])
+        cmd.extend(["--json-schema", json.dumps(schema)])
     cmd.extend(["--", prompt])
+    return cmd
+
+
+def check_claude_judge_cli_flags(
+    *,
+    policy: dict,
+    model: str = "",
+    timeout: float = _CLAUDE_JUDGE_FLAG_CHECK_TIMEOUT,
+) -> None:
+    """Preflight the full judge argv against the installed claude CLI, token-free.
+
+    The CLI validates every option while parsing arguments, before contacting an
+    endpoint, so a renamed/unknown flag (e.g. the old ``--schema``) exits
+    non-zero immediately with a commander usage error we recognize. Valid flags
+    proceed to the endpoint; we point them at an unreachable local URL with a
+    dummy key and a short timeout, so no tokens are spent and a valid argv simply
+    times out (treated as success). Raises ``RuntimeError`` only when the CLI
+    rejects a judge flag.
+    """
+    config = get_claude_code_exec_config()
+    work_dir = tempfile.mkdtemp(prefix="skillopt-judge-flagcheck-")
+    try:
+        mcp_config_path = os.path.join(work_dir, "judge-mcp.json")
+        with open(mcp_config_path, "w", encoding="utf-8") as handle:
+            json.dump({"mcpServers": {}}, handle)
+        system_prompt_path = os.path.join(work_dir, "judge-system-prompt.txt")
+        with open(system_prompt_path, "w", encoding="utf-8") as handle:
+            handle.write("preflight")
+        cmd = _build_claude_judge_cli_command(
+            config=config,
+            model=model,
+            policy=policy,
+            mcp_config_path=mcp_config_path,
+            system_prompt_path=system_prompt_path,
+            prompt="preflight flag check; do not answer",
+        )
+        # Force the endpoint unreachable so a fully-parsed argv cannot spend
+        # tokens or reach a real API; the short timeout then reads as success.
+        env = {
+            **os.environ,
+            "ANTHROPIC_BASE_URL": "http://127.0.0.1:1",
+            "ANTHROPIC_API_KEY": "skillopt-preflight-unreachable",
+        }
+        try:
+            proc = subprocess.run(
+                cmd, cwd=work_dir, capture_output=True, text=True, timeout=timeout, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return  # argv parsed and reached the (unreachable) endpoint -> flags OK
+        if proc.returncode != 0:
+            combined = f"{proc.stdout or ''}\n{proc.stderr or ''}".lower()
+            if any(marker in combined for marker in _CLI_FLAG_ERROR_MARKERS):
+                detail = (proc.stderr or proc.stdout or "").strip()[:300]
+                raise RuntimeError(f"claude judge CLI rejected a judge policy flag: {detail}")
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def _run_claude_code_judge_cli(
+    *,
+    work_dir: str,
+    prompt: str,
+    model: str,
+    timeout: int,
+    policy: dict,
+) -> tuple[str, str]:
+    """Restricted Claude Code judge call: no built-in tools, only the Artifact MCP.
+
+    Fail-closed CLI transport used only by the judge. It never adds the rollout
+    or evidence directories, disables all built-in tools (``--tools ""``),
+    permits only the named Artifact MCP tools, loads no user/project settings,
+    and replaces the target-runner system/prompt wrapper with a judge system
+    prompt that never references ``task.md`` or ``skillopt-target``.
+    """
+    config = get_claude_code_exec_config()
+    server_name, mcp_command = _judge_mcp_server(policy)
+    mcp_config_path = os.path.join(work_dir, "judge-mcp.json")
+    with open(mcp_config_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"mcpServers": {server_name: {"type": "stdio", "command": mcp_command[0], "args": list(mcp_command[1:])}}},
+            handle,
+        )
+    system_prompt_path = os.path.join(work_dir, "judge-system-prompt.txt")
+    with open(system_prompt_path, "w", encoding="utf-8") as handle:
+        handle.write(str(policy.get("system_prompt") or ""))
+    cmd = _build_claude_judge_cli_command(
+        config=config,
+        model=model,
+        policy=policy,
+        mcp_config_path=mcp_config_path,
+        system_prompt_path=system_prompt_path,
+        prompt=prompt,
+    )
 
     try:
         proc = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True, timeout=timeout)
@@ -1006,7 +1101,12 @@ def _run_claude_code_judge_cli(
     if parsed is not None:
         if parsed.get("is_error"):
             return "", raw
-        return str(parsed.get("result") or "").strip(), raw
+        result = parsed.get("result")
+        # With --json-schema the CLI may surface structured output as an object;
+        # hand parse_verdict a JSON string rather than a Python repr().
+        if isinstance(result, (dict, list)):
+            return json.dumps(result), raw
+        return str(result or "").strip(), raw
     if proc.returncode != 0:
         raise RuntimeError(f"claude judge client exited {proc.returncode}: {(stderr or stdout)[:2000]}")
     return stdout.strip(), raw
