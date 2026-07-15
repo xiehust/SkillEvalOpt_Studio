@@ -192,6 +192,19 @@ def _validate_sandbox_command(sandbox_command: Sequence[str]) -> tuple[str, ...]
 
 
 def _is_elevated_launcher(sandbox_command: Sequence[str]) -> bool:
+    """Whether this module's own ``setpriv`` drop applies to ``sandbox_command``.
+
+    Only ``sudo`` is recognized here; an administrator-provided elevated
+    wrapper (for example ``["/usr/local/bin/bwrap-elevated"]``, which the
+    binding plan invariant explicitly contemplates) is not recognized and
+    gets no automatic ``setpriv`` prefix from this module. Such a wrapper is
+    expected to perform its own internal privilege drop before it execs the
+    MCP server. Either way, "parsers and converters never run as root" is
+    actually enforced by the sandbox startup probe (``_probe_sandbox``),
+    which asserts euid/egid != 0 from *inside* the sandbox regardless of
+    which launcher produced that identity -- so a custom wrapper that fails
+    to drop privileges is caught fail-closed rather than trusted silently.
+    """
     return bool(sandbox_command) and os.path.basename(str(sandbox_command[0])) == "sudo"
 
 
@@ -313,9 +326,24 @@ def _privilege_drop_prefix() -> list[str]:
     Parsers and converters must never run as root; an ``sudo bwrap`` launcher
     enters the namespace as uid 0, so ``setpriv`` restores the original,
     unprivileged identity before the interpreter starts.
+
+    Edge case -- the judge process itself invoked as uid/gid 0: there is then
+    no non-root "invoking identity" to restore, so "drop to the invoking
+    uid/gid" and "parsers and converters never run as root" conflict. The
+    invariant's absolute clause wins: refuse to build the elevated argv at
+    all rather than hand back a no-op drop that leaves the sandbox at uid 0.
+    This is a fail-fast, clearer-error companion to the startup probe's
+    euid/egid check, which would otherwise only catch this once bwrap runs.
     """
     uid = getattr(os, "getuid", lambda: 0)()
     gid = getattr(os, "getgid", lambda: 0)()
+    if uid == 0 or gid == 0:
+        raise EvaluationError(
+            "cannot use an elevated sandbox launcher: the judge process is itself "
+            "running as root (uid/gid 0), so there is no non-root invoking identity "
+            "to drop to, and parsers/converters must never run as root. Run the "
+            "judge as a non-root user, or use the default unprivileged bwrap launcher."
+        )
     return [
         "setpriv",
         f"--reuid={uid}",
@@ -393,6 +421,8 @@ _PROBE_SOURCE = (
     "import os, socket, sys\n"
     "rollout = sys.argv[1] if len(sys.argv) > 1 else ''\n"
     "errors = []\n"
+    "if os.geteuid() == 0 or os.getegid() == 0:\n"
+    "    errors.append('root-identity')\n"
     "try:\n"
     "    fd = open('/evidence/.skillopt_probe', 'w'); fd.close(); errors.append('evidence-writable')\n"
     "except OSError:\n"
@@ -422,9 +452,16 @@ _APPARMOR_HINT = (
 def _probe_sandbox(config: AgenticJudgeConfig, snapshot: EvidenceSnapshot, *, rollout_dir: str) -> None:
     """Run a real boundary probe before trusting the sandbox with evidence.
 
-    Verifies (from inside the sandbox) that evidence cannot be written, scratch
-    can be written, the rollout directory is absent, and network connection
-    attempts fail. Any failure is an infrastructure ``EvaluationError``.
+    Verifies (from inside the sandbox) that the effective identity is not
+    root (euid/egid != 0) -- the load-bearing check here, since it catches
+    ANY elevated launcher whose privilege drop did not happen, including an
+    administrator-provided wrapper this module does not itself recognize as
+    elevated. ``--ro-bind`` keeps evidence unwritable even for root, so
+    without this identity check a misconfigured launcher would pass the
+    probe silently while parsers/converters ran as uid 0. Also verifies that
+    evidence cannot be written, scratch can be written, the rollout directory
+    is absent, and network connection attempts fail. Any failure is an
+    infrastructure ``EvaluationError``.
     """
     inner = [sys.executable, "-c", _PROBE_SOURCE, os.path.abspath(os.fspath(rollout_dir))]
     argv = _build_sandbox_argv(

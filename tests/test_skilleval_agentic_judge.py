@@ -737,6 +737,41 @@ class TestArtifactMcpCommandDetails:
                 sandbox_command="bwrap --unshare-net",
             )
 
+    def test_elevated_launcher_refuses_to_drop_to_root(self, tmp_path, monkeypatch) -> None:
+        # If the judge process itself is invoked as uid/gid 0 there is no
+        # non-root "invoking identity" to restore; the absolute "never run as
+        # root" clause wins and this must fail closed with a clear error
+        # rather than silently building a no-op setpriv drop.
+        from skillopt.envs.skilleval import agentic_judge
+        from skillopt.envs.skilleval.inspectors import EvaluationError
+
+        evidence = tmp_path / "evidence"
+        scratch = tmp_path / "scratch"
+        evidence.mkdir()
+        scratch.mkdir()
+        monkeypatch.setattr(agentic_judge.os, "getuid", lambda: 0)
+        monkeypatch.setattr(agentic_judge.os, "getgid", lambda: 0)
+        with pytest.raises(EvaluationError, match="root"):
+            agentic_judge.build_artifact_mcp_command(
+                evidence_dir=str(evidence), scratch_dir=str(scratch), sandbox_command=("sudo", "-n", "bwrap"),
+            )
+
+    def test_non_elevated_launcher_unaffected_by_root_invoker_guard(self, tmp_path, monkeypatch) -> None:
+        # The root-invoker guard only applies to the elevated (setpriv-drop)
+        # path; the default unprivileged bwrap launcher is untouched.
+        from skillopt.envs.skilleval import agentic_judge
+
+        evidence = tmp_path / "evidence"
+        scratch = tmp_path / "scratch"
+        evidence.mkdir()
+        scratch.mkdir()
+        monkeypatch.setattr(agentic_judge.os, "getuid", lambda: 0)
+        monkeypatch.setattr(agentic_judge.os, "getgid", lambda: 0)
+        plain = agentic_judge.build_artifact_mcp_command(
+            evidence_dir=str(evidence), scratch_dir=str(scratch), sandbox_command=("bwrap",),
+        )
+        assert "setpriv" not in plain
+
 
 class TestSandboxProbe:
     def _snapshot(self, tmp_path):
@@ -776,6 +811,60 @@ class TestSandboxProbe:
             agentic_judge._probe_sandbox(
                 agentic_judge.AgenticJudgeConfig(), self._snapshot(tmp_path), rollout_dir=str(tmp_path),
             )
+
+    def test_probe_fails_when_fake_launcher_reports_root_identity(self, tmp_path, monkeypatch) -> None:
+        # This is the load-bearing check for the finding: ANY elevated
+        # launcher whose privilege drop did not happen (including a custom
+        # wrapper this module never recognizes as "elevated") must be caught
+        # here, because --ro-bind alone keeps evidence unwritable even for
+        # root and would otherwise let the probe pass silently.
+        import subprocess
+
+        from skillopt.envs.skilleval import agentic_judge
+        from skillopt.envs.skilleval.inspectors import EvaluationError
+
+        def fake_run(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 3, stdout="SKILLOPT_PROBE_FAIL:root-identity", stderr="")
+
+        monkeypatch.setattr(agentic_judge.subprocess, "run", fake_run)
+        with pytest.raises(EvaluationError, match="boundary probe"):
+            agentic_judge._probe_sandbox(
+                agentic_judge.AgenticJudgeConfig(), self._snapshot(tmp_path), rollout_dir=str(tmp_path),
+            )
+
+    def test_probe_source_flags_a_faked_root_identity(self, tmp_path) -> None:
+        # Actually executes the real _PROBE_SOURCE (no bwrap needed) with
+        # os.geteuid/os.getegid monkeypatched to 0 from inside that child
+        # interpreter, proving the embedded check itself -- not just the
+        # host-side string matching -- flags a root identity.
+        import subprocess
+        import sys
+
+        from skillopt.envs.skilleval.agentic_judge import _PROBE_SOURCE
+
+        faked_root = "import os\nos.geteuid = lambda: 0\nos.getegid = lambda: 0\n" + _PROBE_SOURCE
+        proc = subprocess.run(
+            [sys.executable, "-c", faked_root, str(tmp_path / "rollout")],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert proc.returncode == 3
+        assert "root-identity" in proc.stdout
+
+    def test_probe_source_does_not_flag_root_identity_when_unprivileged(self, tmp_path) -> None:
+        # Sanity check the other direction: running the real _PROBE_SOURCE
+        # under this test process's actual (non-root) identity never emits
+        # the root-identity token, even though it still fails overall here
+        # because /evidence and /scratch are not bwrap-mounted.
+        import subprocess
+        import sys
+
+        from skillopt.envs.skilleval.agentic_judge import _PROBE_SOURCE
+
+        proc = subprocess.run(
+            [sys.executable, "-c", _PROBE_SOURCE, str(tmp_path / "rollout")],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert "root-identity" not in (proc.stdout or "")
 
 
 class TestAgenticJudgeOrchestration:
@@ -835,6 +924,46 @@ class TestAgenticJudgeOrchestration:
         )
         assert result["judge_status"] == "evaluation_error"
         assert result["score_valid"] is False
+
+    def test_root_identity_probe_result_maps_to_evaluation_error(self, tmp_path, monkeypatch) -> None:
+        # End-to-end: a fake sandbox launcher whose probe reports a root
+        # identity (e.g. an elevated wrapper that never dropped privileges)
+        # must surface through the real, unmocked _probe_sandbox into the
+        # same evaluation_error / score_valid=False classification as any
+        # other infrastructure failure -- this is the fail-closed path the
+        # finding requires.
+        import subprocess
+
+        from skillopt.envs.skilleval import agentic_judge
+        from skillopt.envs.skilleval.artifacts import build_manifest, diff_manifests
+
+        work = tmp_path / "work"
+        work.mkdir()
+        before = build_manifest(str(work))
+        (work / "report.pdf").write_bytes(b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n")
+        artifacts = diff_manifests(before, build_manifest(str(work)))
+        assert artifacts  # a created output exists, so the probe must run
+
+        def fake_run(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 3, stdout="SKILLOPT_PROBE_FAIL:root-identity", stderr="")
+
+        monkeypatch.setattr(agentic_judge.subprocess, "run", fake_run)
+        item = {
+            "id": "t", "question": "q", "rubric": "r",
+            "artifact_checks": [
+                {"id": "opens", "path": "report.pdf", "type": "opens", "required": True, "weight": 1.0, "spec": {}}
+            ],
+        }
+        result = agentic_judge.run_agentic_judge(
+            item=item,
+            rollout_result={"work_dir": str(work), "artifacts": artifacts},
+            state_hash="s",
+            out_root=str(tmp_path / "out"),
+            config=agentic_judge.AgenticJudgeConfig(),
+        )
+        assert result["judge_status"] == "evaluation_error"
+        assert result["score_valid"] is False
+        assert "root-identity" in result["judge_error"]
 
     def test_second_format_failure_is_evaluation_error(self, tmp_path, monkeypatch) -> None:
         from skillopt.envs.skilleval import agentic_judge
