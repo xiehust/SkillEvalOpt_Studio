@@ -1729,6 +1729,26 @@ class TestJudgeBackendToolIsolation:
         assert not marker.exists()
         assert response == '{"schema_version": 1}'
 
+    def test_claude_judge_error_envelope_surfaces_its_own_message(self, tmp_path, monkeypatch) -> None:
+        # An is_error result ("Not logged in", "API Error: ...") must raise with
+        # the envelope's message, not return an empty verdict whose later parse
+        # failure ("does not decode to a JSON object") hides the real cause.
+        from skillopt.model import codex_harness
+
+        def fake_run(cmd, **kwargs):
+            envelope = json.dumps({
+                "type": "result", "subtype": "success", "is_error": True,
+                "result": "Not logged in · Please run /login",
+            })
+            return subprocess.CompletedProcess(cmd, 0, stdout=envelope, stderr="")
+
+        monkeypatch.setattr(codex_harness.subprocess, "run", fake_run)
+        policy = build_backend_policy("claude_code_exec", self._MCP_COMMAND, str(tmp_path))
+        with pytest.raises(RuntimeError, match="Not logged in"):
+            codex_harness.run_claude_code_exec(
+                work_dir=str(tmp_path), prompt="judge", model="m", timeout=5, policy=policy,
+            )
+
     def test_codex_judge_cannot_execute_a_shell_marker(self, tmp_path, monkeypatch) -> None:
         from skillopt.model import codex_harness
 

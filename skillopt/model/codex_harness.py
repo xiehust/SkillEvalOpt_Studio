@@ -1165,7 +1165,12 @@ def _run_claude_code_judge_cli(
     parsed = _parse_claude_cli_json(stdout)
     if parsed is not None:
         if parsed.get("is_error"):
-            return "", raw
+            # Surface the envelope's own message ("Not logged in · Please run
+            # /login", "API Error: ...") instead of returning an empty verdict:
+            # the judge has no retry loop, and an empty string would only fail
+            # verdict parsing later with a message that hides the real cause.
+            detail = str(parsed.get("result") or "").strip() or (stderr or stdout).strip()
+            raise RuntimeError(f"claude judge client reported an error: {detail[:500]}")
         result = parsed.get("result")
         # With --json-schema the CLI may surface structured output as an object;
         # hand parse_verdict a JSON string rather than a Python repr().

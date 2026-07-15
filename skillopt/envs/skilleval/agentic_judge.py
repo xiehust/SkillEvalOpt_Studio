@@ -384,6 +384,11 @@ def _sandbox_flags(evidence_dir: str, scratch_dir: str, *, elevated: bool) -> li
         "--ro-bind-try", "/etc/ld.so.cache", "/etc/ld.so.cache",
         "--ro-bind-try", "/etc/ld.so.conf", "/etc/ld.so.conf",
         "--ro-bind-try", "/etc/ld.so.conf.d", "/etc/ld.so.conf.d",
+        # Ubuntu's LibreOffice reads /etc/libreoffice (sofficerc etc.); without
+        # it the UNO bootstrap aborts with a RuntimeException, so in-sandbox
+        # office rendering fails on every Ubuntu host. -try keeps hosts
+        # without LibreOffice unaffected.
+        "--ro-bind-try", "/etc/libreoffice", "/etc/libreoffice",
         "--ro-bind-try", "/etc/mime.types", "/etc/mime.types",
         "--ro-bind-try", "/etc/magic", "/etc/magic",
         "--ro-bind-try", "/etc/magic.mgc", "/etc/magic.mgc",
