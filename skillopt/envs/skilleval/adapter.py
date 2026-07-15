@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 
 from skillopt.datasets.base import BatchSpec
 from skillopt.envs.base import EnvAdapter
@@ -51,7 +52,7 @@ class SkillEvalAdapter(EnvAdapter):
         judge_timeout: int = 300,
         judge_effort: str = "low",
         judge_cache: bool = True,
-        judge_sandbox_command: tuple[str, ...] | list[str] = ("bwrap",),
+        judge_sandbox_command: tuple[str, ...] | list[str] | str = "bwrap",
         judge_max_evidence_bytes: int = 536_870_912,
         judge_max_scratch_bytes: int = 1_073_741_824,
         judge_max_render_pixels: int = 500_000_000,
@@ -87,6 +88,15 @@ class SkillEvalAdapter(EnvAdapter):
         # should_use_agentic and this adapter are its intended consumers.
         if judge_mode not in JUDGE_MODES:
             raise ValueError(f"judge_mode must be one of {sorted(JUDGE_MODES)}: {judge_mode!r}")
+        # A bare string (e.g. from YAML ``judge_sandbox_command: bwrap`` or
+        # ``sudo -n bwrap``) is shlex-split once into a trusted argv vector;
+        # AgenticJudgeConfig then rejects an empty vector and never passes it
+        # through a shell. An already-structured list/tuple is kept as-is.
+        sandbox_command = (
+            shlex.split(judge_sandbox_command)
+            if isinstance(judge_sandbox_command, str)
+            else judge_sandbox_command
+        )
         self.judge_config = AgenticJudgeConfig(
             mode=judge_mode,
             backend=judge_backend,
@@ -94,7 +104,7 @@ class SkillEvalAdapter(EnvAdapter):
             timeout=judge_timeout,
             effort=judge_effort,
             cache=judge_cache,
-            sandbox_command=judge_sandbox_command,
+            sandbox_command=sandbox_command,
             max_evidence_bytes=judge_max_evidence_bytes,
             max_scratch_bytes=judge_max_scratch_bytes,
             max_render_pixels=judge_max_render_pixels,

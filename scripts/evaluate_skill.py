@@ -20,8 +20,10 @@ to ``claude_code_exec`` and the judge uses the optimizer backend.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import shlex
 import sys
 
 import yaml
@@ -31,8 +33,15 @@ _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+from skillopt.envs.skilleval.contracts import JUDGE_MODES
 from skillopt.envs.skilleval.dataloader import load_tasks
-from skillopt.envs.skilleval.evaluator import artifacts_listing, judge, merge_scores  # noqa: F401 — merge_scores re-exported for tests/importers
+from skillopt.envs.skilleval.evaluator import (  # noqa: F401 — merge_scores re-exported for tests/importers
+    AgenticJudgeConfig,
+    artifacts_listing,
+    evaluate_rollouts,
+    judge,
+    merge_scores,
+)
 from skillopt.envs.skilleval.plugin import (
     _collect_skill as _collect_skill_source,
     aggregate_results,
@@ -43,6 +52,7 @@ from skillopt.envs.skilleval.plugin import (
 from skillopt.envs.skilleval.rollout import run_batch
 from skillopt.model import (
     configure_claude_code_exec,
+    configure_codex_exec,
     set_optimizer_backend,
     set_optimizer_deployment,
     set_target_backend,
@@ -74,6 +84,21 @@ def parse_args() -> argparse.Namespace:
                    help="Judge model override")
     p.add_argument("--claude_code_exec_path", type=str, default="claude")
     p.add_argument("--claude_code_exec_effort", type=str, default="medium")
+    # ── Agentic binary judge (independent of the target backend/model) ──────
+    p.add_argument("--judge_mode", type=str, default="auto",
+                   help="auto | agentic | chat (routes binary-artifact tasks to the agentic judge)")
+    p.add_argument("--judge_exec_backend", type=str, default="claude_code_exec",
+                   help="Judge exec backend: claude_code_exec or codex_exec")
+    p.add_argument("--judge_exec_model", type=str, default="",
+                   help="Judge exec model override (blank = backend default)")
+    p.add_argument("--judge_exec_timeout", type=int, default=300)
+    p.add_argument("--judge_exec_effort", type=str, default="low")
+    p.add_argument("--judge_cache", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--judge_sandbox_command", default="bwrap",
+                   help="Trusted sandbox launcher argv (shlex-split; never run through a shell)")
+    p.add_argument("--judge_max_evidence_bytes", type=int, default=536_870_912)
+    p.add_argument("--judge_max_scratch_bytes", type=int, default=1_073_741_824)
+    p.add_argument("--judge_max_render_pixels", type=int, default=500_000_000)
     return p.parse_args()
 
 
@@ -99,11 +124,26 @@ def _mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
+def _is_invalid(result: dict) -> bool:
+    """A row whose score is infrastructure-invalid (score_valid explicitly False)."""
+    return result.get("score_valid") is False
+
+
 def build_report(results: list[dict]) -> str:
-    """Render the human-readable evaluation report (pure function)."""
+    """Render the human-readable evaluation report (pure function).
+
+    Invalid rows (``score_valid is False`` -- sandbox/probe/inspector/worker
+    infrastructure failures) are excluded from the hard/soft denominators and
+    listed separately, never counted as legitimate zero scores. Agentic rows
+    additionally surface their criterion evidence and coverage. Legacy text
+    tasks (no ``score_valid``/``judge_status``) keep every prior field and
+    heading unchanged.
+    """
     total = len(results)
-    pass_rate = _mean([float(r.get("hard", 0)) for r in results])
-    soft_mean = _mean([float(r.get("soft", 0.0)) for r in results])
+    scored = [r for r in results if not _is_invalid(r)]
+    invalid = [r for r in results if _is_invalid(r)]
+    pass_rate = _mean([float(r.get("hard", 0)) for r in scored])
+    soft_mean = _mean([float(r.get("soft", 0.0)) for r in scored])
     total_duration = sum(float(r.get("duration_s", 0.0)) for r in results)
 
     lines = [
@@ -112,12 +152,14 @@ def build_report(results: list[dict]) -> str:
         "## Summary",
         "",
         f"- Tasks: {total}",
+        f"- Scored tasks: {len(scored)}",
+        f"- Invalid evaluations: {len(invalid)}",
         f"- Pass rate (hard): {pass_rate:.1%}",
         f"- Soft score mean: {soft_mean:.3f}",
         "",
     ]
 
-    # Per-task_type breakdown
+    # Per-task_type breakdown (means over scored rows only)
     by_type: dict[str, list[dict]] = {}
     for r in results:
         by_type.setdefault(str(r.get("task_type", "default")), []).append(r)
@@ -127,10 +169,11 @@ def build_report(results: list[dict]) -> str:
                   "|---|---|---|---|"]
         for task_type in sorted(by_type):
             group = by_type[task_type]
+            group_scored = [r for r in group if not _is_invalid(r)]
             lines.append(
                 f"| {task_type} | {len(group)} "
-                f"| {_mean([float(r.get('hard', 0)) for r in group]):.1%} "
-                f"| {_mean([float(r.get('soft', 0.0)) for r in group]):.3f} |"
+                f"| {_mean([float(r.get('hard', 0)) for r in group_scored]):.1%} "
+                f"| {_mean([float(r.get('soft', 0.0)) for r in group_scored]):.3f} |"
             )
         lines.append("")
 
@@ -142,12 +185,44 @@ def build_report(results: list[dict]) -> str:
         reason = str(r.get("judge_reason", "")).replace("|", "\\|").replace("\n", " ")
         if len(reason) > 80:
             reason = reason[:77] + "..."
-        mark = "✓" if r.get("hard") else "✗"
+        mark = "invalid" if _is_invalid(r) else ("✓" if r.get("hard") else "✗")
         lines.append(
             f"| {r.get('id')} | {mark} | {float(r.get('soft', 0.0)):.2f} "
             f"| {reason} | {float(r.get('duration_s', 0.0)):.1f} |"
         )
     lines.append("")
+
+    # Agentic judge evidence: per-criterion evidence + inspection coverage
+    agentic = [
+        r for r in results
+        if r.get("judge_mode") == "agentic" or r.get("judge_criteria") or r.get("judge_coverage")
+    ]
+    if agentic:
+        lines += ["## Agentic judge evidence", ""]
+        for r in agentic:
+            lines.append(f"### `{r.get('id')}`")
+            criteria = r.get("judge_criteria") or []
+            if criteria:
+                lines += ["", "| criterion | passed | score | evidence |", "|---|---|---|---|"]
+                for c in criteria:
+                    evidence = "; ".join(
+                        f"{e.get('path', '')}@{e.get('locator', '')}"
+                        for e in (c.get("evidence") or [])
+                    ) or "(none)"
+                    evidence = evidence.replace("|", "\\|")
+                    passed = "✓" if c.get("passed") else "✗"
+                    lines.append(
+                        f"| {c.get('id')} | {passed} | {float(c.get('score', 0.0)):.2f} | {evidence} |"
+                    )
+            coverage = r.get("judge_coverage") or {}
+            if coverage:
+                lines += [
+                    "",
+                    f"- Coverage artifacts: {', '.join(coverage.get('artifacts', []) or []) or '(none)'}",
+                    f"- Units inspected: {', '.join(coverage.get('units_inspected', []) or []) or '(none)'}",
+                    f"- Units omitted: {', '.join(coverage.get('units_omitted', []) or []) or '(none)'}",
+                ]
+            lines.append("")
 
     # Cost
     lines += ["## Cost", "",
@@ -156,9 +231,9 @@ def build_report(results: list[dict]) -> str:
               "- Token usage: n/a (not parsed in minimal version)",
               ""]
 
-    # Failures
-    errored = [r for r in results if r.get("error")]
-    judge_errored = [r for r in results if r.get("judge_error")]
+    # Failures (scored rows only). Invalid rows are reported separately below.
+    errored = [r for r in results if r.get("error") and not _is_invalid(r)]
+    judge_errored = [r for r in results if r.get("judge_error") and not _is_invalid(r)]
     lines += ["## Failures", ""]
     if not errored and not judge_errored:
         lines.append("none")
@@ -169,6 +244,15 @@ def build_report(results: list[dict]) -> str:
         lines.append("### Judge errors (scored 0, verdict unavailable)")
         lines += [f"- `{r['id']}`: {r['judge_error']}" for r in judge_errored]
     lines.append("")
+
+    # Invalid evaluations (excluded from scoring; the gate must not score them).
+    if invalid:
+        lines += ["## Invalid evaluations", ""]
+        for r in invalid:
+            status = r.get("judge_status", "evaluation_error")
+            detail = str(r.get("judge_error") or r.get("error") or "").replace("\n", " ")
+            lines.append(f"- `{r.get('id')}`: {status} — {detail}")
+        lines.append("")
 
     return "\n".join(lines)
 
@@ -184,10 +268,54 @@ def _configure_backends(args: argparse.Namespace) -> None:
         set_optimizer_deployment(args.optimizer_model)
     else:
         set_optimizer_deployment(default_model_for_backend(args.optimizer_backend))
+    # Configure both exec backends: the target rollout and the agentic judge may
+    # use different exec backends, and the judge backend/model are independent of
+    # the target backend/model. (The judge worker re-pins its own CLI transport
+    # and effort per call; here we just make each backend's globals available.)
     configure_claude_code_exec(
         path=args.claude_code_exec_path,
         effort=args.claude_code_exec_effort,
     )
+    configure_codex_exec(use_sdk="cli")
+
+
+def _build_judge_config(args: argparse.Namespace) -> AgenticJudgeConfig:
+    """Build the independent agentic-judge config from CLI flags (fail fast).
+
+    Invariant: the trusted sandbox launcher is a real argv vector -- shlex-split
+    exactly once here, rejected if empty, and never passed through a shell.
+    """
+    if args.judge_mode not in JUDGE_MODES:
+        sys.exit(f"error: --judge_mode must be one of {sorted(JUDGE_MODES)}: {args.judge_mode!r}")
+    sandbox_command = shlex.split(args.judge_sandbox_command)
+    if not sandbox_command:
+        sys.exit("error: --judge_sandbox_command must not be an empty sandbox launcher")
+    try:
+        return AgenticJudgeConfig(
+            mode=args.judge_mode,
+            backend=args.judge_exec_backend,
+            model=args.judge_exec_model,
+            timeout=args.judge_exec_timeout,
+            effort=args.judge_exec_effort,
+            cache=args.judge_cache,
+            sandbox_command=tuple(sandbox_command),
+            max_evidence_bytes=args.judge_max_evidence_bytes,
+            max_scratch_bytes=args.judge_max_scratch_bytes,
+            max_render_pixels=args.judge_max_render_pixels,
+        )
+    except ValueError as exc:
+        sys.exit(f"error: invalid judge configuration: {exc}")
+
+
+def _runtime_state_hash(runtime_skills: list[dict]) -> str:
+    """Deterministic cache-scoping hash of the ordered (name, content) skills."""
+    digest = hashlib.sha256()
+    for skill in runtime_skills:
+        digest.update(str(skill["name"]).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(skill["content"]).encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()[:16]
 
 
 def main() -> None:
@@ -206,6 +334,7 @@ def main() -> None:
     except (ValueError, OSError) as exc:
         sys.exit(f"error: invalid tasks file: {exc}")
 
+    judge_config = _build_judge_config(args)
     _configure_backends(args)
     os.makedirs(args.out_root, exist_ok=True)
 
@@ -224,7 +353,14 @@ def main() -> None:
     )
 
     print(f"[skilleval] judging {len(rollout_results)} responses")
-    results = merge_scores(items, rollout_results, judge)
+    results = evaluate_rollouts(
+        items,
+        rollout_results,
+        state_hash=_runtime_state_hash(runtime_skills),
+        out_root=args.out_root,
+        judge_config=judge_config,
+        chat_judge=judge,
+    )
     for item, result in zip(items, results):
         result["target_skills"] = list(item.get("target_skills") or [])
         result["task_type"] = item.get("task_type", "default")

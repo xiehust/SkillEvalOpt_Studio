@@ -42,3 +42,18 @@ env:
   workers: 3
   timeout: 900
   limit: 0
+  # Agentic binary judge (routing + restricted sandbox client). These flatten
+  # onto the SkillEvalAdapter constructor (train.py::get_adapter) and become the
+  # AgenticJudgeConfig; auto routes binary-artifact tasks to the agentic judge,
+  # text tasks stay on the chat judge. judge_sandbox_command is a trusted argv
+  # (a bare string is shlex-split, never run through a shell).
+  judge_mode: auto
+  judge_backend: claude_code_exec
+  judge_model: ""
+  judge_timeout: 300
+  judge_effort: low
+  judge_cache: true
+  judge_sandbox_command: bwrap
+  judge_max_evidence_bytes: 536870912
+  judge_max_scratch_bytes: 1073741824
+  judge_max_render_pixels: 500000000

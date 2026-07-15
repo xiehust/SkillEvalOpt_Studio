@@ -872,6 +872,180 @@ class TestBuildReport:
         assert "# Skill Evaluation Report" in captured.out
 
 
+class TestBuildReportInvalidAware:
+    """Invalid (score_valid=False) rows are excluded from pass/soft denominators
+    and listed separately; agentic rows show criterion evidence and coverage."""
+
+    def test_invalid_evaluations_excluded_from_pass_rate(self) -> None:
+        report = evaluate_skill.build_report([
+            {"id": "valid", "hard": 1, "soft": 1.0, "score_valid": True,
+             "judge_status": "valid_pass", "judge_reason": "ok", "duration_s": 1},
+            {"id": "infra", "hard": 0, "soft": 0.0, "score_valid": False,
+             "judge_status": "evaluation_error", "judge_error": "timeout", "duration_s": 2},
+        ])
+        assert "Scored tasks: 1" in report
+        assert "Invalid evaluations: 1" in report
+        assert "100.0%" in report
+
+    def test_invalid_row_listed_separately_from_scored_failures(self) -> None:
+        report = evaluate_skill.build_report([
+            {"id": "infra", "hard": 0, "soft": 0.0, "score_valid": False,
+             "judge_status": "evaluation_error", "judge_error": "sandbox probe failed",
+             "duration_s": 1},
+        ])
+        assert "## Invalid evaluations" in report
+        assert "`infra`" in report
+        assert "sandbox probe failed" in report
+
+    def test_agentic_criteria_and_coverage_are_rendered(self) -> None:
+        report = evaluate_skill.build_report([
+            {"id": "t1", "hard": 1, "soft": 1.0, "score_valid": True,
+             "judge_mode": "agentic", "judge_status": "valid_pass", "judge_reason": "ok",
+             "duration_s": 1,
+             "judge_criteria": [
+                 {"id": "visual", "passed": True, "score": 1.0, "reason": "clear",
+                  "evidence": [{"path": "report.pdf", "locator": "page=1", "source": "render"}]},
+             ],
+             "judge_coverage": {"artifacts": ["report.pdf"],
+                                "units_inspected": ["report.pdf:page=1"],
+                                "units_omitted": []}},
+        ])
+        assert "visual" in report
+        assert "report.pdf" in report
+        assert "page=1" in report
+
+    def test_legacy_text_report_fields_and_headings_retained(self) -> None:
+        # No score_valid / judge_status keys: behaves as the pre-agentic report.
+        report = evaluate_skill.build_report([
+            _result("t1", 1, 0.9, judge_reason="meets rubric"),
+            _result("t2", 0, 0.2, judge_reason="missing totals"),
+        ])
+        assert "# Skill Evaluation Report" in report
+        assert "- Tasks: 2" in report
+        assert "- Pass rate (hard): 50.0%" in report
+        assert "## By task type" in report
+        assert "## Tasks" in report
+        assert "## Cost" in report
+        assert "## Failures\n\nnone" in report
+
+
+_JUDGE_CLI_DEFAULTS = dict(
+    judge_mode="auto",
+    judge_exec_backend="claude_code_exec",
+    judge_exec_model="",
+    judge_exec_timeout=300,
+    judge_exec_effort="low",
+    judge_cache=True,
+    judge_sandbox_command="bwrap",
+    judge_max_evidence_bytes=536_870_912,
+    judge_max_scratch_bytes=1_073_741_824,
+    judge_max_render_pixels=500_000_000,
+)
+
+
+class TestJudgeExecCli:
+    """The standalone CLI's judge-exec flags must reach evaluate_rollouts as a
+    fully-populated, independent AgenticJudgeConfig."""
+
+    def test_judge_exec_flags_reach_evaluate_rollouts(self, tmp_path, monkeypatch) -> None:
+        skill = tmp_path / "alpha"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("---\nname: alpha\n---\n# alpha\n", encoding="utf-8")
+        tasks = _write_tasks(tmp_path, [_valid_item()])
+        out_root = tmp_path / "out"
+        argv = [
+            "evaluate_skill.py",
+            "--skill", str(skill),
+            "--tasks", tasks,
+            "--out_root", str(out_root),
+            "--judge_mode", "auto",
+            "--judge_exec_backend", "codex_exec",
+            "--judge_exec_model", "gpt-5.5-codex",
+            "--judge_exec_timeout", "240",
+            "--judge_exec_effort", "low",
+            "--judge_sandbox_command", "sudo -n bwrap",
+            "--no-judge_cache",
+            "--workers", "1",
+        ]
+        monkeypatch.setattr(sys, "argv", argv)
+        monkeypatch.setattr(evaluate_skill, "_configure_backends", lambda _args: None)
+        monkeypatch.setattr(
+            evaluate_skill, "run_batch",
+            lambda items, *a, **k: [{"id": items[0]["id"], "response": "ok",
+                                     "duration_s": 0.1, "work_dir": "/nx", "artifacts": []}],
+        )
+        captured = {}
+
+        def fake_eval(items, rollouts, *, state_hash, out_root, judge_config, chat_judge=None):
+            captured["judge_config"] = judge_config
+            captured["state_hash"] = state_hash
+            return [_result(items[0]["id"], 1, 1.0, score_valid=True, judge_status="valid_pass")]
+
+        monkeypatch.setattr(evaluate_skill, "evaluate_rollouts", fake_eval)
+
+        evaluate_skill.main()
+
+        cfg = captured["judge_config"]
+        assert cfg.mode == "auto"
+        assert cfg.backend == "codex_exec"
+        assert cfg.model == "gpt-5.5-codex"
+        assert cfg.timeout == 240
+        assert cfg.effort == "low"
+        assert cfg.cache is False
+        assert cfg.sandbox_command == ("sudo", "-n", "bwrap")
+        assert isinstance(captured["state_hash"], str) and captured["state_hash"]
+
+    def test_empty_sandbox_command_is_rejected(self, tmp_path, monkeypatch) -> None:
+        skill = tmp_path / "alpha"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("---\nname: alpha\n---\n# alpha\n", encoding="utf-8")
+        tasks = _write_tasks(tmp_path, [_valid_item()])
+        argv = [
+            "evaluate_skill.py",
+            "--skill", str(skill),
+            "--tasks", tasks,
+            "--out_root", str(tmp_path / "out"),
+            "--judge_sandbox_command", "   ",
+        ]
+        monkeypatch.setattr(sys, "argv", argv)
+        monkeypatch.setattr(evaluate_skill, "_configure_backends", lambda _args: None)
+        with pytest.raises(SystemExit, match="sandbox"):
+            evaluate_skill.main()
+
+
+class TestSkillEvalConfigJudgeDefaults:
+    """The YAML judge_* defaults must flatten onto adapter kwargs and reach the
+    AgenticJudgeConfig unchanged (no skillopt/config.py mapping needed)."""
+
+    def test_yaml_defaults_map_to_judge_config(self) -> None:
+        import inspect as _inspect
+
+        from skillopt.config import flatten_config, load_config
+
+        cfg_path = os.path.join(
+            os.path.dirname(__file__), "..", "configs", "skilleval", "default.yaml"
+        )
+        flat = flatten_config(load_config(cfg_path))
+        assert flat["judge_mode"] == "auto"
+        assert flat["judge_backend"] == "claude_code_exec"
+        assert flat["judge_model"] == ""
+        assert flat["judge_timeout"] == 300
+        assert flat["judge_effort"] == "low"
+        assert flat["judge_cache"] is True
+        assert flat["judge_max_evidence_bytes"] == 536_870_912
+        assert flat["judge_max_scratch_bytes"] == 1_073_741_824
+        assert flat["judge_max_render_pixels"] == 500_000_000
+
+        accepted = set(_inspect.signature(SkillEvalAdapter.__init__).parameters) - {"self"}
+        adapter = SkillEvalAdapter(**{k: v for k, v in flat.items() if k in accepted})
+        assert adapter.judge_config.mode == "auto"
+        assert adapter.judge_config.backend == "claude_code_exec"
+        assert adapter.judge_config.timeout == 300
+        assert adapter.judge_config.effort == "low"
+        assert adapter.judge_config.sandbox_command == ("bwrap",)
+        assert adapter.judge_config.max_evidence_bytes == 536_870_912
+
+
 class TestPluginAggregation:
     def test_attributes_multi_target_and_weakest_skill(self) -> None:
         results = [
@@ -1343,6 +1517,7 @@ class TestEvaluateSkillCli:
             workers=1,
             timeout=60,
             model="",
+            **_JUDGE_CLI_DEFAULTS,
         )
         monkeypatch.setattr(evaluate_skill, "parse_args", lambda: args)
         monkeypatch.setattr(evaluate_skill, "_configure_backends", lambda _args: None)
@@ -1354,15 +1529,14 @@ class TestEvaluateSkillCli:
                 output=output,
                 kwargs=kwargs,
             )
-            return [{"id": items[0]["id"], "response": "ok", "duration_s": 0.1}]
+            return [{"id": items[0]["id"], "response": "ok", "duration_s": 0.1,
+                     "work_dir": "/nx", "artifacts": []}]
 
         monkeypatch.setattr(evaluate_skill, "run_batch", fake_run_batch)
         monkeypatch.setattr(
             evaluate_skill,
-            "merge_scores",
-            lambda items, rollouts, judge_fn: [
-                _result(items[0]["id"], 1, 1.0)
-            ],
+            "evaluate_rollouts",
+            lambda items, rollouts, **kwargs: [_result(items[0]["id"], 1, 1.0)],
         )
 
         evaluate_skill.main()
@@ -1397,21 +1571,21 @@ class TestEvaluateSkillCli:
             workers=1,
             timeout=60,
             model="",
+            **_JUDGE_CLI_DEFAULTS,
         )
         monkeypatch.setattr(evaluate_skill, "parse_args", lambda: args)
         monkeypatch.setattr(evaluate_skill, "_configure_backends", lambda _args: None)
 
         def fake_run_batch(items, skill_content, output, **kwargs):
             seen["runtime_skills"] = kwargs["runtime_skills"]
-            return [{"id": items[0]["id"], "response": "ok", "duration_s": 0.1}]
+            return [{"id": items[0]["id"], "response": "ok", "duration_s": 0.1,
+                     "work_dir": "/nx", "artifacts": []}]
 
         monkeypatch.setattr(evaluate_skill, "run_batch", fake_run_batch)
         monkeypatch.setattr(
             evaluate_skill,
-            "merge_scores",
-            lambda items, rollouts, judge_fn: [
-                _result(items[0]["id"], 1, 0.9)
-            ],
+            "evaluate_rollouts",
+            lambda items, rollouts, **kwargs: [_result(items[0]["id"], 1, 0.9)],
         )
 
         evaluate_skill.main()

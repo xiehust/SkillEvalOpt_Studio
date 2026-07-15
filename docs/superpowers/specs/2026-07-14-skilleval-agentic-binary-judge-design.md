@@ -214,6 +214,16 @@ mounted read-only, scratch mounted writable, and `--unshare-net`. It exposes
 only schema-validated artifact operations; no shell or arbitrary path tool is
 available to the model.
 
+Two network planes are deliberately distinct here. The judge **model client**
+(the `claude`/`codex` process the worker drives) keeps exactly one outbound
+connection: the model-API control plane it needs to talk to Claude or Codex —
+"networkless" never means the judge cannot call its own model. Everything on the
+**artifact/tool side** — the Artifact MCP server and every inspector, converter,
+and renderer it drives — runs under `--unshare-net` with no network at all, so
+no artifact byte can trigger a request and no tool result can be exfiltrated.
+Only the model-API control plane is reachable; artifact inspection can never
+open a socket.
+
 Claude runs with all built-in tools disabled and only the named Artifact MCP
 tools enabled. Codex runs with `sandbox=read-only`, `approval_policy=never`,
 web search disabled, user config/rules ignored, and only the required Artifact
