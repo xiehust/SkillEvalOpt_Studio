@@ -241,6 +241,30 @@ class TestDeterministicContainsText:
         assert by_id["found"]["passed"] is True
         assert by_id["not_found"]["passed"] is False
 
+    def test_finds_and_fails_to_find_cell_text_in_a_real_xlsx(self, tmp_path) -> None:
+        from openpyxl import Workbook
+
+        evidence, scratch = _roots(tmp_path)
+        book = Workbook()
+        sheet = book.active
+        sheet.title = "Summary"
+        # 130 content cells so the target on row 130 lands on cell page 2
+        # (page size is 128); a no-selector extract never emits any cell.
+        for row in range(1, 130):
+            sheet.cell(row=row, column=1, value=f"filler-{row}")
+        sheet.cell(row=130, column=1, value="NEEDLE_ON_PAGE_TWO")
+        book.save(evidence / "report.xlsx")
+        book.close()
+
+        checks = [
+            _check("found", "report.xlsx", "contains_text", spec={"text": "NEEDLE_ON_PAGE_TWO"}),
+            _check("missing", "report.xlsx", "contains_text", spec={"text": "NOT_IN_THE_WORKBOOK"}),
+        ]
+        criteria, _broken = run_deterministic_checks(checks, evidence_dir=str(evidence), scratch_dir=str(scratch))
+        by_id = {row["id"]: row for row in criteria}
+        assert by_id["found"]["passed"] is True
+        assert by_id["missing"]["passed"] is False
+
 
 class TestDeterministicSlideCount:
     def test_matches_exactly_and_reports_mismatch(self, tmp_path) -> None:

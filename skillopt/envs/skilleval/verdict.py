@@ -254,13 +254,68 @@ def _evaluate_opens(check: dict, *, evidence_dir: str, scratch_dir: str) -> dict
     return _criterion_row(check, True, "artifact opened successfully")
 
 
+_SPREADSHEET_SUFFIXES = frozenset({".xlsx", ".xls"})
+
+
 def _evaluate_contains_text(check: dict, *, evidence_dir: str, scratch_dir: str) -> dict:
     expected = check["spec"]["text"]
     result = extract_artifact(check["path"], evidence_dir=evidence_dir, scratch_dir=scratch_dir)
     haystack = "\n".join(_collect_strings(result))
     if expected in haystack:
         return _criterion_row(check, True, "expected text found in extracted content")
+    # A no-selector spreadsheet extract maps every sheet to page=None and emits
+    # no cell content, so the haystack above is sheet names + metadata only.
+    # Page through the cells explicitly before concluding the text is absent.
+    if os.path.splitext(check["path"])[1].lower() in _SPREADSHEET_SUFFIXES and _spreadsheet_contains_text(
+        check["path"], expected, evidence_dir=evidence_dir, scratch_dir=scratch_dir
+    ):
+        return _criterion_row(check, True, "expected text found in spreadsheet cells")
     return _criterion_row(check, False, f"expected text not found: {expected!r}")
+
+
+def _spreadsheet_contains_text(
+    path: str, expected: str, *, evidence_dir: str, scratch_dir: str
+) -> bool:
+    """Page a spreadsheet's cell content within the inspector's own budgets.
+
+    The default (no-selector) extract never emits cells (every sheet maps to
+    ``page=None``), so a cell-only match is silently missed. The compact index
+    reports each sheet's cell total, letting us walk ``sheet:<name>:page:<n>``
+    selectors until the text appears or the pages are exhausted -- each extract
+    is bounded by the inspector's per-page cap and the sheet totals bound the
+    number of pages. Stops early on the first match. Does not change the
+    inspector's default ``page=None`` semantics, which other callers rely on.
+    """
+    index = inspect_artifact(path, evidence_dir=evidence_dir, scratch_dir=scratch_dir)
+    sheets = index.get("sheets") if isinstance(index, dict) else None
+    if not isinstance(sheets, list):
+        return False
+    for sheet in sheets:
+        if not isinstance(sheet, dict) or sheet.get("type") != "worksheet":
+            continue
+        name = sheet.get("name")
+        cell_page = sheet.get("cell_page")
+        # The selector grammar addresses sheets as 'sheet:<name>[:page:<n>]', so
+        # a ':' in the name is unaddressable (Excel disallows it in names anyway).
+        if not isinstance(name, str) or ":" in name or not isinstance(cell_page, dict):
+            continue
+        total = cell_page.get("total")
+        page_size = cell_page.get("page_size")
+        if not isinstance(total, int) or isinstance(total, bool) or total <= 0:
+            continue
+        if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size <= 0:
+            page_size = total
+        page_count = (total + page_size - 1) // page_size
+        for page in range(1, page_count + 1):
+            detail = extract_artifact(
+                path,
+                evidence_dir=evidence_dir,
+                scratch_dir=scratch_dir,
+                selectors=[f"sheet:{name}:page:{page}"],
+            )
+            if expected in "\n".join(_collect_strings(detail)):
+                return True
+    return False
 
 
 def _evaluate_xlsx_cell_or_formula(check: dict, *, evidence_dir: str) -> dict:
