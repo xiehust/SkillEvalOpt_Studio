@@ -134,7 +134,7 @@ class PluginTrainer:
         self._prepared = True
 
     def _aggregate(self, results: list[dict]) -> dict:
-        return aggregate_results(results, list(self.initial_state.names))
+        return aggregate_results(results, list(self.initial_state.names), require_valid=True)
 
     def _rollout(
         self,

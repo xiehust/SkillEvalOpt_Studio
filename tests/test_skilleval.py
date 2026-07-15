@@ -879,14 +879,45 @@ class TestPluginAggregation:
             _result("t2", 0, 0.4, task_type="integration", target_skills=["alpha", "beta"]),
         ]
         summary = evaluate_skill.aggregate_results(results, ["alpha", "beta"])
-        assert summary["overall"] == {"count": 2, "hard": 0.5, "soft": 0.7}
+        assert summary["overall"] == {
+            "count": 2, "hard": 0.5, "soft": 0.7, "scored_count": 2, "invalid_count": 0,
+        }
         assert summary["by_skill"]["alpha"]["count"] == 2
-        assert summary["by_skill"]["beta"] == {"count": 1, "hard": 0.0, "soft": 0.4}
+        assert summary["by_skill"]["beta"] == {
+            "count": 1, "hard": 0.0, "soft": 0.4, "scored_count": 1, "invalid_count": 0,
+        }
         assert summary["routing"]["count"] == 1
         assert summary["integration"]["count"] == 1
         assert summary["weakest_skill"]["name"] == "beta"
         assert summary["mode"] == "plugin"
         assert summary["skill_names"] == ["alpha", "beta"]
+
+    def test_metrics_report_scored_and_invalid_counts_and_exclude_invalid_from_mean(self) -> None:
+        results = [
+            _result("t1", 1, 1.0, target_skills=["alpha"]),
+            _result("t2", 0, 0.0, target_skills=["alpha"], score_valid=False),
+        ]
+        summary = evaluate_skill.aggregate_results(results, ["alpha"])
+        overall = summary["overall"]
+        assert overall["count"] == 2
+        assert overall["scored_count"] == 1
+        assert overall["invalid_count"] == 1
+        # the invalid row must not silently pull down the aggregate hard/soft mean
+        assert overall["hard"] == 1.0
+        assert overall["soft"] == 1.0
+
+    def test_require_valid_raises_on_any_invalid_row(self) -> None:
+        results = [
+            _result("t1", 1, 1.0, target_skills=["alpha"]),
+            _result("t2", 0, 0.0, target_skills=["alpha"], score_valid=False),
+        ]
+        with pytest.raises(ValueError, match="score_valid"):
+            evaluate_skill.aggregate_results(results, ["alpha"], require_valid=True)
+
+    def test_require_valid_defaults_false_and_does_not_raise(self) -> None:
+        results = [_result("t1", 0, 0.0, target_skills=["alpha"], score_valid=False)]
+        summary = evaluate_skill.aggregate_results(results, ["alpha"])
+        assert summary["overall"]["invalid_count"] == 1
 
     def test_normalize_rejects_unknown_target(self) -> None:
         items = [_valid_item(target_skills=["unknown"])]
@@ -971,6 +1002,179 @@ class TestMergeScores:
         assert merged[0]["duration_s"] == 3.5
         assert merged[0]["response"] == "answer"
         assert merged[0]["soft"] == 0.8
+
+
+class TestShouldUseAgentic:
+    """Unit coverage of the mode-resolution formula, independent of I/O."""
+
+    def test_explicit_chat_wins_over_binary_artifact(self) -> None:
+        item = {"judge_mode": "chat", "_judge_mode_explicit": True, "artifact_checks": []}
+        result = {"artifacts": [{"path": "a.xlsx", "mime": "", "change": "created"}]}
+        assert evaluator.should_use_agentic(item, result, evaluator.AgenticJudgeConfig()) is False
+
+    def test_explicit_agentic_wins_over_text_only(self) -> None:
+        item = {"judge_mode": "agentic", "_judge_mode_explicit": True, "artifact_checks": []}
+        result = {"artifacts": [{"path": "a.txt", "mime": "text/plain", "change": "created"}]}
+        assert evaluator.should_use_agentic(item, result, None) is True
+
+    def test_non_explicit_task_field_is_ignored_in_favor_of_environment_default(self) -> None:
+        # The task's own judge_mode="chat" was never explicitly set by the task
+        # author (no _judge_mode_explicit) so the environment default (agentic)
+        # governs instead.
+        item = {"judge_mode": "chat", "artifact_checks": []}
+        result = {"artifacts": [{"path": "a.xlsx", "mime": "", "change": "created"}]}
+        config = evaluator.AgenticJudgeConfig(mode="agentic")
+        assert evaluator.should_use_agentic(item, result, config) is True
+
+    def test_auto_routes_on_supported_detected_kind(self) -> None:
+        item = {"judge_mode": "auto", "artifact_checks": []}
+        result = {"artifacts": [{"path": "report.xlsx", "mime": "application/zip", "change": "created"}]}
+        assert evaluator.should_use_agentic(item, result, evaluator.AgenticJudgeConfig()) is True
+
+    def test_auto_routes_on_structured_check_naming_supported_binary_path(self) -> None:
+        item = {"judge_mode": "auto", "artifact_checks": [{"path": "report.docx"}]}
+        result = {"artifacts": []}
+        assert evaluator.should_use_agentic(item, result, evaluator.AgenticJudgeConfig()) is True
+
+    def test_unknown_binary_format_does_not_route(self) -> None:
+        item = {"judge_mode": "auto", "artifact_checks": []}
+        result = {"artifacts": [{"path": "archive.zip", "mime": "application/zip", "change": "created"}]}
+        assert evaluator.should_use_agentic(item, result, evaluator.AgenticJudgeConfig()) is False
+
+    def test_deleted_artifact_does_not_route(self) -> None:
+        item = {"judge_mode": "auto", "artifact_checks": []}
+        result = {"artifacts": [{"path": "report.xlsx", "mime": "", "change": "deleted"}]}
+        assert evaluator.should_use_agentic(item, result, evaluator.AgenticJudgeConfig()) is False
+
+    def test_auto_with_no_judge_config_defaults_to_auto_routing(self) -> None:
+        item = {"judge_mode": "auto", "artifact_checks": []}
+        result = {"artifacts": [{"path": "report.pdf", "mime": "", "change": "created"}]}
+        assert evaluator.should_use_agentic(item, result, None) is True
+
+
+class TestEvaluateRollouts:
+    def test_auto_mode_routes_binary_artifact_to_agentic_judge(self, tmp_path, monkeypatch) -> None:
+        called = []
+        monkeypatch.setattr(
+            evaluator,
+            "run_agentic_judge",
+            lambda **kwargs: called.append(kwargs) or {
+                "id": "t1", "hard": 1, "soft": 1.0, "judge_reason": "ok",
+                "judge_mode": "agentic", "judge_status": "valid_pass",
+                "score_valid": True,
+            },
+        )
+        results = evaluator.evaluate_rollouts(
+            [{"id": "t1", "question": "q", "rubric": "r",
+              "judge_mode": "auto", "artifact_checks": []}],
+            [{"id": "t1", "response": "done", "work_dir": str(tmp_path),
+              "artifacts": [{"path": "report.xlsx", "mime": "application/zip",
+                             "change": "created"}]}],
+            state_hash="state",
+            out_root=str(tmp_path / "out"),
+            judge_config=evaluator.AgenticJudgeConfig(),
+        )
+        assert results[0]["judge_mode"] == "agentic"
+        assert len(called) == 1
+
+    def test_auto_mode_keeps_text_on_chat_judge(self, tmp_path) -> None:
+        results = evaluator.evaluate_rollouts(
+            [{"id": "t1", "question": "q", "rubric": "r",
+              "judge_mode": "auto", "artifact_checks": []}],
+            [{"id": "t1", "response": "done", "work_dir": str(tmp_path),
+              "artifacts": [{"path": "answer.txt", "mime": "text/plain",
+                             "change": "created"}]}],
+            state_hash="state",
+            out_root=str(tmp_path / "out"),
+            judge_config=None,
+            chat_judge=lambda item, response, listing: {
+                "id": item["id"], "hard": 1, "soft": 1.0,
+                "judge_reason": "ok", "score_valid": True,
+            },
+        )
+        assert results[0]["hard"] == 1
+
+    def test_rollout_error_short_circuits_judging(self, tmp_path, monkeypatch) -> None:
+        def _fail_if_called(**kwargs):
+            raise AssertionError("agentic judge must not run for an errored rollout")
+
+        def _chat_fail_if_called(item, response, listing):
+            raise AssertionError("chat judge must not run for an errored rollout")
+
+        monkeypatch.setattr(evaluator, "run_agentic_judge", _fail_if_called)
+        results = evaluator.evaluate_rollouts(
+            [{"id": "t1", "question": "q", "rubric": "r",
+              "judge_mode": "auto", "artifact_checks": []}],
+            [{"id": "t1", "response": "", "error": "boom", "work_dir": str(tmp_path), "artifacts": []}],
+            state_hash="state",
+            out_root=str(tmp_path / "out"),
+            judge_config=evaluator.AgenticJudgeConfig(),
+            chat_judge=_chat_fail_if_called,
+        )
+        assert results[0]["hard"] == 0
+        assert results[0]["soft"] == 0.0
+        assert results[0]["judge_status"] == "artifact_failure"
+        assert results[0]["score_valid"] is True
+        assert results[0]["error"] == "boom"
+
+    def test_missing_judge_config_returns_invalid_result_when_agentic_needed(self, tmp_path) -> None:
+        results = evaluator.evaluate_rollouts(
+            [{"id": "t1", "question": "q", "rubric": "r", "judge_mode": "agentic",
+              "_judge_mode_explicit": True, "artifact_checks": []}],
+            [{"id": "t1", "response": "done", "work_dir": str(tmp_path), "artifacts": []}],
+            state_hash="state",
+            out_root=str(tmp_path / "out"),
+            judge_config=None,
+        )
+        assert results[0]["score_valid"] is False
+        assert results[0]["judge_status"] == "evaluation_error"
+        assert "not configured" in results[0]["judge_error"]
+
+    def test_chat_judge_exception_returns_evaluation_error_not_legacy_zero(self, tmp_path) -> None:
+        def _boom(item, response, listing):
+            raise RuntimeError("optimizer unavailable")
+
+        results = evaluator.evaluate_rollouts(
+            [{"id": "t1", "question": "q", "rubric": "r", "judge_mode": "chat",
+              "_judge_mode_explicit": True, "artifact_checks": []}],
+            [{"id": "t1", "response": "done", "work_dir": str(tmp_path), "artifacts": []}],
+            state_hash="state",
+            out_root=str(tmp_path / "out"),
+            judge_config=None,
+            chat_judge=_boom,
+        )
+        assert results[0]["hard"] == 0
+        assert results[0]["score_valid"] is False
+        assert results[0]["judge_status"] == "evaluation_error"
+        assert "judge_error" in results[0]
+
+    def test_chat_judge_parse_failure_returns_evaluation_error(self, tmp_path) -> None:
+        def _unparseable(item, response, listing):
+            return {"id": item["id"], "hard": 0, "soft": 0.0, "judge_reason": "",
+                     "judge_error": "unparseable judge reply"}
+
+        results = evaluator.evaluate_rollouts(
+            [{"id": "t1", "question": "q", "rubric": "r", "judge_mode": "chat",
+              "_judge_mode_explicit": True, "artifact_checks": []}],
+            [{"id": "t1", "response": "done", "work_dir": str(tmp_path), "artifacts": []}],
+            state_hash="state",
+            out_root=str(tmp_path / "out"),
+            judge_config=None,
+            chat_judge=_unparseable,
+        )
+        assert results[0]["score_valid"] is False
+        assert results[0]["judge_status"] == "evaluation_error"
+
+    def test_length_mismatch_raises(self, tmp_path) -> None:
+        with pytest.raises(ValueError, match="length mismatch"):
+            evaluator.evaluate_rollouts(
+                [{"id": "t1", "question": "q", "rubric": "r",
+                  "judge_mode": "auto", "artifact_checks": []}],
+                [],
+                state_hash="state",
+                out_root=str(tmp_path / "out"),
+                judge_config=None,
+            )
 
 
 class TestCollectSkill:
@@ -1393,6 +1597,61 @@ class TestSkillEvalAdapter:
             assert "Judge verdict" in conv[2]["content"]
         assert results[1]["fail_reason"]
         assert results[0]["task_description"] == items[0]["question"]
+
+    def test_persisted_trajectory_has_criteria_and_coverage_not_artifact_text(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        a = self._adapter(tmp_path)
+        items = a.build_train_env(batch_size=2, seed=1)
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        raw_document_text = "RAW EXTRACTED DOCUMENT TEXT: quarterly revenue $42,000"
+        (work_dir / "report.txt").write_text(raw_document_text, encoding="utf-8")
+
+        def fake_run_batch(batch_items, skill, out_dir, **kw):
+            return [
+                {"id": batch_items[0]["id"], "task_type": "default",
+                 "response": "answer A", "duration_s": 1.0, "work_dir": str(work_dir),
+                 "artifacts": []},
+                {"id": batch_items[1]["id"], "task_type": "default",
+                 "response": "", "error": "boom", "duration_s": 0.1, "work_dir": str(work_dir)},
+            ]
+
+        def fake_evaluate_rollouts(items, rollout_results, **kwargs):
+            merged = []
+            for _item, result in zip(items, rollout_results):
+                result = dict(result)
+                if not result.get("error"):
+                    result.update({
+                        "hard": 1, "soft": 1.0, "judge_reason": "criteria satisfied",
+                        "judge_status": "valid_pass",
+                        "judge_criteria": [
+                            {"id": "criterion_1", "passed": True, "score": 1.0,
+                             "reason": "matched", "evidence": []},
+                        ],
+                        "judge_coverage": {
+                            "artifacts": ["report.txt"],
+                            "units_inspected": ["sheet1"],
+                            "units_omitted": [],
+                        },
+                        "score_valid": True,
+                    })
+                merged.append(result)
+            return merged
+
+        monkeypatch.setattr(adapter_mod, "run_batch", fake_run_batch)
+        monkeypatch.setattr(adapter_mod, "evaluate_rollouts", fake_evaluate_rollouts)
+
+        out_dir = str(tmp_path / "rollout2")
+        a.rollout(items, "# skill", out_dir)
+
+        conv = json.loads(
+            (tmp_path / "rollout2" / "predictions" / items[0]["id"] / "conversation.json").read_text()
+        )
+        note = conv[2]["content"]
+        assert "criterion_1" in note
+        assert "units_inspected" in note
+        assert raw_document_text not in note
 
     def test_reference_text_exposes_rubric(self, tmp_path) -> None:
         a = self._adapter(tmp_path)

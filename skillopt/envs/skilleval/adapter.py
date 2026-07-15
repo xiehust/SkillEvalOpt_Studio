@@ -15,11 +15,13 @@ import os
 from skillopt.datasets.base import BatchSpec
 from skillopt.envs.base import EnvAdapter
 from skillopt.envs.skilleval.bundle import SKILL_MD, normalize_rel_path, split_bundle
+from skillopt.envs.skilleval.contracts import JUDGE_MODES
 from skillopt.envs.skilleval.dataloader import SkillEvalDataLoader
-from skillopt.envs.skilleval.evaluator import artifacts_listing, judge, merge_scores
-from skillopt.envs.skilleval.plugin import PluginState
+from skillopt.envs.skilleval.evaluator import AgenticJudgeConfig, evaluate_rollouts, judge
+from skillopt.envs.skilleval.plugin import PluginState, plugin_hash
 from skillopt.envs.skilleval.rollout import collect_support_files, run_batch
 from skillopt.model import azure_openai as _llm
+from skillopt.utils.scoring import skill_hash
 
 
 class SkillEvalAdapter(EnvAdapter):
@@ -43,6 +45,16 @@ class SkillEvalAdapter(EnvAdapter):
         limit: int = 0,
         skill_dir: str = "",
         trainable_files: list[str] | str | None = None,
+        judge_mode: str = "auto",
+        judge_backend: str = "claude_code_exec",
+        judge_model: str = "",
+        judge_timeout: int = 300,
+        judge_effort: str = "low",
+        judge_cache: bool = True,
+        judge_sandbox_command: tuple[str, ...] | list[str] = ("bwrap",),
+        judge_max_evidence_bytes: int = 536_870_912,
+        judge_max_scratch_bytes: int = 1_073_741_824,
+        judge_max_render_pixels: int = 500_000_000,
     ) -> None:
         # For a multi-file skill only the trainable state evolves; supporting
         # files (scripts/, references/, ...) are frozen and copied into every
@@ -70,6 +82,23 @@ class SkillEvalAdapter(EnvAdapter):
         self.failure_only = failure_only
         self.minibatch_size = minibatch_size
         self.edit_budget = edit_budget
+        # The agentic judge's mode is validated here -- AgenticJudgeConfig
+        # itself deliberately leaves it unvalidated/unused; evaluator's
+        # should_use_agentic and this adapter are its intended consumers.
+        if judge_mode not in JUDGE_MODES:
+            raise ValueError(f"judge_mode must be one of {sorted(JUDGE_MODES)}: {judge_mode!r}")
+        self.judge_config = AgenticJudgeConfig(
+            mode=judge_mode,
+            backend=judge_backend,
+            model=judge_model,
+            timeout=judge_timeout,
+            effort=judge_effort,
+            cache=judge_cache,
+            sandbox_command=judge_sandbox_command,
+            max_evidence_bytes=judge_max_evidence_bytes,
+            max_scratch_bytes=judge_max_scratch_bytes,
+            max_render_pixels=judge_max_render_pixels,
+        )
         self.dataloader = SkillEvalDataLoader(
             split_dir=split_dir,
             data_path=data_path,
@@ -118,7 +147,14 @@ class SkillEvalAdapter(EnvAdapter):
             skill_files=self.skill_files,
             skill_docs=skill_docs,
         )
-        results = merge_scores(items, rollout_results, judge)
+        results = evaluate_rollouts(
+            items,
+            rollout_results,
+            state_hash=skill_hash(skill_content),
+            out_root=out_dir,
+            judge_config=self.judge_config,
+            chat_judge=judge,
+        )
         self._persist_trajectories(items, results, out_dir)
         return results
 
@@ -142,7 +178,14 @@ class SkillEvalAdapter(EnvAdapter):
             model=_llm.TARGET_DEPLOYMENT,
             runtime_skills=runtime_skills,
         )
-        results = merge_scores(items, rollout_results, judge)
+        results = evaluate_rollouts(
+            items,
+            rollout_results,
+            state_hash=plugin_hash(plugin_state),
+            out_root=out_dir,
+            judge_config=self.judge_config,
+            chat_judge=judge,
+        )
         for item, result in zip(items, results):
             result["target_skills"] = list(item.get("target_skills") or [])
             result["task_type"] = item.get("task_type", "default")
@@ -199,11 +242,14 @@ class SkillEvalAdapter(EnvAdapter):
         """
         for item, result in zip(items, results):
             task_id = str(result["id"])
-            listing = artifacts_listing(result.get("work_dir", ""))
+            criteria = result.get("judge_criteria") or []
+            coverage = result.get("judge_coverage") or {}
             verdict_note = (
+                f"Judge status: {result.get('judge_status', 'unknown')}\n"
                 f"Judge verdict: hard={result.get('hard')} soft={result.get('soft')}\n"
                 f"Judge reason: {result.get('judge_reason', '')}\n"
-                f"Workspace artifacts:\n{listing or '(none)'}"
+                f"Criteria: {json.dumps(criteria, ensure_ascii=False)}\n"
+                f"Coverage: {json.dumps(coverage, ensure_ascii=False)}"
             )
             if result.get("error"):
                 verdict_note += f"\nRollout error: {result['error']}"

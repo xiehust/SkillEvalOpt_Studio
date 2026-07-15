@@ -197,15 +197,41 @@ def _mean(values: list[float]) -> float:
 
 
 def _metrics(results: list[dict]) -> dict:
+    # Rows with score_valid=False are infrastructure/evaluation failures, not
+    # legitimate zero scores -- they must never silently pull down hard/soft
+    # aggregates or training signal (see evaluator.evaluate_rollouts). They
+    # are still counted so callers can see them via scored_count/invalid_count.
+    scored = [result for result in results if result.get("score_valid") is not False]
     return {
         "count": len(results),
-        "hard": _mean([float(result.get("hard", 0)) for result in results]),
-        "soft": _mean([float(result.get("soft", 0.0)) for result in results]),
+        "hard": _mean([float(result.get("hard", 0)) for result in scored]),
+        "soft": _mean([float(result.get("soft", 0.0)) for result in scored]),
+        "scored_count": len(scored),
+        "invalid_count": len(results) - len(scored),
     }
 
 
-def aggregate_results(results: list[dict], skill_names: list[str]) -> dict:
-    """Aggregate complete-Plugin results with deterministic group ordering."""
+def aggregate_results(
+    results: list[dict],
+    skill_names: list[str],
+    *,
+    require_valid: bool = False,
+) -> dict:
+    """Aggregate complete-Plugin results with deterministic group ordering.
+
+    ``require_valid=True`` raises if any result has ``score_valid is False``
+    (an infrastructure/evaluation failure) rather than silently averaging
+    over it -- training must never proceed on corrupted or invalid judge
+    signal.
+    """
+    if require_valid:
+        invalid_ids = [
+            str(result.get("id", "")) for result in results if result.get("score_valid") is False
+        ]
+        if invalid_ids:
+            raise ValueError(
+                f"aggregate_results: {len(invalid_ids)} result(s) have score_valid=False: {invalid_ids}"
+            )
     by_skill = {
         name: _metrics(
             [result for result in results if name in result.get("target_skills", [])]

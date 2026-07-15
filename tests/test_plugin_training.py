@@ -391,6 +391,53 @@ class TestPluginTrainer:
         with pytest.raises(ValueError, match="max_skills_per_candidate"):
             PluginTrainer(cfg, adapter, state).preflight()
 
+    def test_train_raises_when_rollout_produces_an_invalid_scored_row(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """``_aggregate`` passes require_valid=True: a rollout row with
+        score_valid=False (an infrastructure/evaluation failure, e.g. a task
+        that needed the agentic judge but had none configured) must abort
+        training rather than silently averaging over corrupted signal.
+        """
+        state = collect_plugin_state(
+            [
+                str(_make_skill(tmp_path, "alpha")),
+                str(_make_skill(tmp_path, "beta")),
+            ],
+        )
+        split = _write_split(
+            tmp_path,
+            [_task("train-a", ["alpha"])],
+            [_task("val-a", ["alpha"]), _task("val-b", ["beta"])],
+            [_task("test-a", ["alpha"]), _task("test-b", ["beta"])],
+        )
+        cfg = _trainer_cfg(tmp_path, split, eval_test=False)
+        adapter = SkillEvalAdapter(split_dir=str(split), split_mode="split_dir", workers=1)
+
+        def fake_rollout(items, plugin_state, out_dir, **kwargs):
+            del plugin_state, out_dir, kwargs
+            results = []
+            for item in items:
+                targets = list(item.get("target_skills") or [])
+                row = {
+                    "id": item["id"],
+                    "hard": 0,
+                    "soft": 0.0,
+                    "task_type": item.get("task_type", "default"),
+                    "target_skills": targets,
+                }
+                if item["id"] == "val-b":
+                    row["score_valid"] = False
+                results.append(row)
+            return results
+
+        monkeypatch.setattr(adapter, "rollout_plugin", fake_rollout)
+        trainer = PluginTrainer(cfg, adapter, state)
+        trainer.preflight()
+
+        with pytest.raises(ValueError, match="score_valid=False"):
+            trainer.train()
+
     def test_ratio_split_expands_validation_for_trainable_coverage(
         self,
         tmp_path,
