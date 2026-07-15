@@ -478,6 +478,34 @@ untrusted artifact text or unvalidated judge output.
    remain numeric and new fields are additive. SkillOpt's own aggregation paths
    must honor `score_valid`; third-party consumers should do the same.
 
+## Deployment Requirements
+
+The agentic judge runs the Artifact MCP server and format parsers inside a
+minimal Bubblewrap sandbox under the system interpreter (`/usr/bin/python3`)
+with `PYTHONNOUSERSITE=1`. This is deliberate: the sandbox must not import
+arbitrary packages from the invoking user's home. Consequently:
+
+1. **Dependency provisioning.** `skillopt` and its binary-parser dependencies
+   (`mcp`, `openpyxl`, `Pillow`, `python-docx`, `python-pptx`) must be
+   importable by the sandbox interpreter — i.e. installed into a virtualenv or
+   system `site-packages`, not via `pip install --user`. The sandbox mounts
+   `/usr` wholesale plus, for a non-`/usr` prefix, the interpreter's `sys.prefix`
+   and `site.getsitepackages()` directories at identical paths; it does not
+   mount the per-user site (`~/.local/...`). A `--user`-only install fails the
+   in-sandbox MCP startup with `ModuleNotFoundError`, which the eager preflight
+   surfaces before any rollout spend.
+2. **Elevated launcher on AppArmor hosts.** Where unprivileged user namespaces
+   are blocked (e.g. Ubuntu 24.04 with AppArmor), configure
+   `judge_sandbox_command: "sudo -n bwrap"` (or an equivalent reviewed elevated
+   wrapper). Under an elevated launcher the sandbox omits the `--unshare-user`
+   namespace (bwrap already holds root capabilities; a fresh user namespace
+   would lose `CAP_DAC_OVERRIDE` over the invoking user's files) and explicitly
+   creates bind-mountpoint ancestor directories traversable (`0555`) so the
+   post-`setpriv` unprivileged identity can reach the read-only package and
+   `/etc` runtime files. Privilege isolation on this path is enforced by the
+   `setpriv` drop and the in-sandbox non-root startup probe, not by the user
+   namespace.
+
 ## Testing Strategy
 
 ### Unit Tests
