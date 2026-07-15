@@ -1,12 +1,29 @@
 # Backend Development Guidelines
 
-> Best practices for backend development in this project.
+Project-specific contracts for the SkillOpt research framework, SkillOpt-Sleep,
+and SkillOpt Studio backend.
 
 ---
 
-## Overview
+## Pre-Development Checklist
 
-This directory contains guidelines for backend development. Fill in each file with your project's specific conventions.
+Always read:
+
+- [Directory Structure](./directory-structure.md)
+- [Quality Guidelines](./quality-guidelines.md)
+
+Then read the guides that match the change:
+
+- Persistence, checkpoints, job records, or artifacts:
+  [Persistence And Artifact Storage](./database-guidelines.md)
+- Validation, API responses, worker failures, or per-task failures:
+  [Error Handling](./error-handling.md)
+- CLI progress, server logs, diagnostics, or secret redaction:
+  [Logging And Observability](./logging-guidelines.md)
+- Multi-Skill evaluation:
+  [SkillEval Plugin Evaluation](./skilleval-plugin-evaluation.md)
+- Multi-Skill training:
+  [SkillEval Plugin Training](./skilleval-plugin-training.md)
 
 ---
 
@@ -14,27 +31,14 @@ This directory contains guidelines for backend development. Fill in each file wi
 
 | Guide | Description | Status |
 |-------|-------------|--------|
-| [Directory Structure](./directory-structure.md) | Module organization and file layout | To fill |
-| [Database Guidelines](./database-guidelines.md) | ORM patterns, queries, migrations | To fill |
-| [Error Handling](./error-handling.md) | Error types, handling strategies | To fill |
-| [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
-| [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
+| [Directory Structure](./directory-structure.md) | Package ownership, module placement, and naming | Active |
+| [Persistence And Artifact Storage](./database-guidelines.md) | Filesystem-backed state, serialization, compatibility, and path safety | Active |
+| [Error Handling](./error-handling.md) | Fail-fast validation, per-task isolation, job failures, and API mapping | Active |
+| [Quality Guidelines](./quality-guidelines.md) | Architecture invariants, testing, verification, and forbidden patterns | Active |
+| [Logging And Observability](./logging-guidelines.md) | CLI progress, server logging, artifacts, and secret redaction | Active |
 | [SkillEval Plugin Evaluation](./skilleval-plugin-evaluation.md) | Multi-Skill runtime, Studio payload, validation, and metrics | Active |
 | [SkillEval Plugin Training](./skilleval-plugin-training.md) | Directed multi-Skill updates, complete-Plugin gate, resume, and Studio contracts | Active |
 
----
-
-## How to Fill These Guidelines
-
-For each guideline file:
-
-1. Document your project's **actual conventions** (not ideals)
-2. Include **code examples** from your codebase
-3. List **forbidden patterns** and why
-4. Add **common mistakes** your team has made
-
-The goal is to help AI assistants and new team members understand how YOUR project works.
-
----
-
-**Language**: All documentation should be written in **English**.
+All specification documents are written in English and should describe current
+repository behavior. Update them when a code change deliberately changes one
+of these contracts.
