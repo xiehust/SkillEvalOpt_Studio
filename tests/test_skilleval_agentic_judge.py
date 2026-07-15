@@ -848,6 +848,76 @@ class TestArtifactMcpCommandDetails:
         mcp_index = elevated.index("skillopt.envs.skilleval.artifact_mcp")
         assert setpriv_index < mcp_index  # privileges dropped before Python
 
+    def test_user_namespace_flag_tracks_launcher_elevation(self, tmp_path) -> None:
+        # Critical sandbox fix: --unshare-user-try must be CONDITIONAL on the
+        # same predicate that gates the setpriv privilege-drop prefix, so the
+        # two move together (one source of truth for "is this launcher
+        # elevated"). Under an elevated launcher (real root) a fresh user
+        # namespace loses CAP_DAC_OVERRIDE and cannot bind-mount the skillopt
+        # package owned by the invoking uid, so it must be omitted; every other
+        # isolation control (--unshare-net + setpriv drop) stays.
+        from skillopt.envs.skilleval.agentic_judge import (
+            _is_elevated_launcher,
+            build_artifact_mcp_command,
+        )
+
+        evidence = tmp_path / "evidence"
+        scratch = tmp_path / "scratch"
+        evidence.mkdir()
+        scratch.mkdir()
+
+        # (a) Elevated launcher: no --unshare-user-try, but net isolation and
+        #     the setpriv --reuid/--regid --clear-groups drop both remain.
+        assert _is_elevated_launcher(("sudo", "-n", "bwrap")) is True
+        elevated = build_artifact_mcp_command(
+            evidence_dir=str(evidence), scratch_dir=str(scratch), sandbox_command=("sudo", "-n", "bwrap"),
+        )
+        assert "--unshare-user-try" not in elevated
+        assert "--unshare-net" in elevated
+        assert "setpriv" in elevated
+        setpriv_index = elevated.index("setpriv")
+        assert any(part.startswith("--reuid=") for part in elevated[setpriv_index:setpriv_index + 4])
+        assert any(part.startswith("--regid=") for part in elevated[setpriv_index:setpriv_index + 4])
+        assert "--clear-groups" in elevated[setpriv_index:setpriv_index + 4]
+
+        # (b) Unprivileged default launcher: userns flag stays, no setpriv.
+        assert _is_elevated_launcher(("bwrap",)) is False
+        plain = build_artifact_mcp_command(
+            evidence_dir=str(evidence), scratch_dir=str(scratch), sandbox_command=("bwrap",),
+        )
+        assert "--unshare-user-try" in plain
+        assert "--unshare-net" in plain
+        assert "setpriv" not in plain
+
+        # The two decisions move together off the single elevation predicate:
+        # userns present <=> not elevated <=> no setpriv prefix.
+        assert ("--unshare-user-try" in plain) == (not _is_elevated_launcher(("bwrap",)))
+        assert ("--unshare-user-try" in elevated) == (not _is_elevated_launcher(("sudo", "-n", "bwrap")))
+
+    def test_custom_non_sudo_wrapper_is_not_treated_as_elevated(self, tmp_path) -> None:
+        # (c) The elevation predicate recognizes ONLY sudo. A custom wrapper
+        #     (e.g. /usr/local/bin/bwrap-elevated) is deliberately NOT treated
+        #     as elevated by this module -- it is expected to drop privileges
+        #     itself, and the in-sandbox startup probe is the backstop. Because
+        #     the predicate does not recognize it as elevated, it keeps the
+        #     unprivileged shape (userns present, no setpriv), same as (b).
+        from skillopt.envs.skilleval.agentic_judge import (
+            _is_elevated_launcher,
+            build_artifact_mcp_command,
+        )
+
+        evidence = tmp_path / "evidence"
+        scratch = tmp_path / "scratch"
+        evidence.mkdir()
+        scratch.mkdir()
+        wrapper = ("/usr/local/bin/bwrap-elevated",)
+        assert _is_elevated_launcher(wrapper) is False
+        command = build_artifact_mcp_command(
+            evidence_dir=str(evidence), scratch_dir=str(scratch), sandbox_command=wrapper,
+        )
+        assert "--unshare-user-try" in command
+        assert "setpriv" not in command
+
     def test_rejects_shell_string_launcher(self, tmp_path) -> None:
         from skillopt.envs.skilleval.agentic_judge import build_artifact_mcp_command
 

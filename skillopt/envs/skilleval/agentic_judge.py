@@ -253,10 +253,26 @@ def _python_runtime_binds() -> list[str]:
     return flags
 
 
-def _sandbox_flags(evidence_dir: str, scratch_dir: str) -> list[str]:
+def _sandbox_flags(evidence_dir: str, scratch_dir: str, *, elevated: bool) -> list[str]:
+    # ``--unshare-user-try`` is CONDITIONAL on launcher elevation, gated by the
+    # same predicate (``_is_elevated_launcher``) that gates the setpriv drop, so
+    # there is one source of truth for "is this launcher elevated".
+    #
+    # Unprivileged default launcher (``bwrap``): the user namespace is what lets
+    # bwrap operate without root at all, so it MUST stay.
+    #
+    # Elevated launcher (e.g. ``sudo -n bwrap``, needed where AppArmor blocks
+    # unprivileged user namespaces): bwrap runs with root's real capabilities.
+    # A fresh user namespace here would LOSE ``CAP_DAC_OVERRIDE`` over files
+    # owned by the invoking uid, so bwrap could not bind-mount its own skillopt
+    # package under a mode-750 home. It is omitted; the other ``--unshare-*``
+    # namespaces stay, network is still isolated, and the setpriv prefix (plus
+    # the in-sandbox startup probe) still drops to a non-root identity afterward.
+    user_ns_flags = [] if elevated else ["--unshare-user-try"]
     return [
-        # Namespaces: no network, isolated pid/ipc/uts/cgroup, private user ns.
-        "--unshare-user-try",
+        # Namespaces: no network, isolated pid/ipc/uts/cgroup, private user ns
+        # (the last only for the unprivileged launcher; see above).
+        *user_ns_flags,
         "--unshare-ipc",
         "--unshare-pid",
         "--unshare-uts",
@@ -376,9 +392,14 @@ def _build_sandbox_argv(
         raise ValueError(f"evidence directory does not exist: {evidence_dir!r}")
     if not os.path.isdir(os.path.realpath(scratch)):
         raise ValueError(f"scratch directory does not exist: {scratch_dir!r}")
+    # Single source of truth for "is this launcher elevated": it both drops the
+    # ``--unshare-user-try`` flag (an elevated bwrap runs as real root and a
+    # fresh userns would strip CAP_DAC_OVERRIDE over the invoker's files) and
+    # adds the setpriv privilege-drop prefix afterward.
+    elevated = _is_elevated_launcher(command)
     argv: list[str] = list(command)
-    argv.extend(_sandbox_flags(evidence, scratch))
-    if _is_elevated_launcher(command):
+    argv.extend(_sandbox_flags(evidence, scratch, elevated=elevated))
+    if elevated:
         argv.extend(_privilege_drop_prefix())
     argv.extend(_resource_limit_prefix(timeout=timeout, max_scratch_bytes=max_scratch_bytes))
     argv.extend(str(part) for part in inner_command)
