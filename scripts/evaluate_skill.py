@@ -96,8 +96,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--judge_exec_timeout", type=int, default=300)
     p.add_argument("--judge_exec_effort", type=str, default="low")
     p.add_argument("--judge_cache", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--judge_sandbox_command", default="bwrap",
-                   help="Trusted sandbox launcher argv (shlex-split; never run through a shell)")
+    # SKILLOPT_JUDGE_SANDBOX lets a deployment (e.g. SkillOpt Studio, whose
+    # eval runner passes no judge flags) pick the launcher via .env — needed on
+    # AppArmor hosts where unprivileged bwrap is blocked and the launcher must
+    # be an elevated "sudo -n bwrap". An explicit flag still wins over the env.
+    p.add_argument("--judge_sandbox_command",
+                   default=os.environ.get("SKILLOPT_JUDGE_SANDBOX", "bwrap"),
+                   help="Trusted sandbox launcher argv (shlex-split; never run through a shell; "
+                        "default from $SKILLOPT_JUDGE_SANDBOX when set)")
     p.add_argument("--judge_max_evidence_bytes", type=int, default=536_870_912)
     p.add_argument("--judge_max_scratch_bytes", type=int, default=1_073_741_824)
     p.add_argument("--judge_max_render_pixels", type=int, default=500_000_000)

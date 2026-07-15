@@ -1031,6 +1031,47 @@ class TestJudgeExecCli:
         assert cfg.sandbox_command == ("sudo", "-n", "bwrap")
         assert isinstance(captured["state_hash"], str) and captured["state_hash"]
 
+    def test_sandbox_command_env_fallback_and_flag_precedence(self, tmp_path, monkeypatch) -> None:
+        # Deployments whose callers pass no judge flags (e.g. SkillOpt Studio's
+        # eval runner) pick the launcher via $SKILLOPT_JUDGE_SANDBOX; an
+        # explicit --judge_sandbox_command still wins over the env variable.
+        skill = tmp_path / "alpha"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("---\nname: alpha\n---\n# alpha\n", encoding="utf-8")
+        tasks = _write_tasks(tmp_path, [_valid_item()])
+        monkeypatch.setattr(evaluate_skill, "_configure_backends", lambda _args: None)
+        monkeypatch.setattr(
+            evaluate_skill, "run_batch",
+            lambda items, *a, **k: [{"id": items[0]["id"], "response": "ok",
+                                     "duration_s": 0.1, "work_dir": "/nx", "artifacts": []}],
+        )
+        captured = {}
+
+        def fake_eval(items, rollouts, *, state_hash, out_root, judge_config, chat_judge=None):
+            captured["judge_config"] = judge_config
+            return [_result(items[0]["id"], 1, 1.0, score_valid=True, judge_status="valid_pass")]
+
+        monkeypatch.setattr(evaluate_skill, "evaluate_rollouts", fake_eval)
+        base_argv = [
+            "evaluate_skill.py",
+            "--skill", str(skill),
+            "--tasks", tasks,
+            "--workers", "1",
+        ]
+
+        monkeypatch.setenv("SKILLOPT_JUDGE_SANDBOX", "sudo -n bwrap")
+        monkeypatch.setattr(sys, "argv", base_argv + ["--out_root", str(tmp_path / "out-env")])
+        evaluate_skill.main()
+        assert captured["judge_config"].sandbox_command == ("sudo", "-n", "bwrap")
+
+        monkeypatch.setattr(
+            sys, "argv",
+            base_argv + ["--out_root", str(tmp_path / "out-flag"),
+                         "--judge_sandbox_command", "bwrap"],
+        )
+        evaluate_skill.main()
+        assert captured["judge_config"].sandbox_command == ("bwrap",)
+
     def test_empty_sandbox_command_is_rejected(self, tmp_path, monkeypatch) -> None:
         skill = tmp_path / "alpha"
         skill.mkdir()
