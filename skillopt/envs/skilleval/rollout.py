@@ -10,12 +10,19 @@ rollout adds no retry of its own (the exec harness owns retries).
 """
 from __future__ import annotations
 
+import errno
 import os
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from typing import TypedDict
 
+from skillopt.envs.skilleval.artifacts import (
+    ArtifactCollectionError,
+    ArtifactValidationError,
+    build_manifest,
+    diff_manifests,
+)
 from skillopt.model.backend_config import get_target_backend
 from skillopt.model.codex_harness import (
     extract_exec_failure,
@@ -50,6 +57,31 @@ class RuntimeSkill(TypedDict):
     name: str
     content: str
     files: list[tuple[str, str]]
+
+
+def _has_permission_denied_cause(exc: BaseException) -> bool:
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, OSError) and current.errno in {errno.EACCES, errno.EPERM}:
+            return True
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return False
+
+
+def _record_target_artifact_failure(result: dict, exc: BaseException) -> None:
+    result["artifact_error"] = f"{type(exc).__name__}: {exc}"
+    result["artifact_failure"] = True
+    result["artifact_error_type"] = "target_validation"
+    if not result.get("error"):
+        result["error"] = result["artifact_error"]
 
 
 def collect_support_files(skill_dir: str) -> list[tuple[str, str]]:
@@ -97,6 +129,8 @@ def _rollout_one(
         "response": "",
         "duration_s": 0.0,
         "work_dir": work_dir,
+        "artifacts": [],
+        "score_valid": True,
     }
     start = time.time()
     try:
@@ -125,38 +159,66 @@ def _rollout_one(
                 if runtime_skills else None
             ),
         )
-        # Artifact-producing tasks are the norm in skill evaluation: allow file
-        # edits (the default exec prompt injects "Do not modify files.") and
-        # extend the read-only default tool set accordingly. codex_exec gets
-        # the same freedom through its workspace-write sandbox default.
-        backend = "codex_exec" if get_target_backend() == "codex_exec" else "claude_code_exec"
-        if backend == "codex_exec":
-            response, raw = run_codex_exec(
-                work_dir=work_dir,
-                prompt=PLUGIN_GUIDE_PROMPT if runtime_skills else GUIDE_PROMPT,
-                model=model,
-                timeout=timeout,
-            )
-        else:
-            response, raw = run_claude_code_exec(
-                work_dir=work_dir,
-                prompt=PLUGIN_GUIDE_PROMPT if runtime_skills else GUIDE_PROMPT,
-                model=model,
-                timeout=timeout,
-                allowed_tools="Read,Bash,Write,Edit,Glob,Grep",
-                allow_file_edits=True,
-            )
-        result["response"] = response
-        usage = extract_exec_usage(raw)
-        if usage is not None:
-            result["usage"] = usage
-        if not response.strip():
-            detail = extract_exec_failure(raw)
-            result["error"] = (
-                f"{backend} failed to produce a final response: {detail}"
-                if detail
-                else f"{backend} returned an empty response after all attempts"
-            )
+        before = build_manifest(work_dir)
+        try:
+            # Artifact-producing tasks are the norm in skill evaluation: allow
+            # file edits (the default exec prompt injects "Do not modify
+            # files.") and extend the read-only default tool set accordingly.
+            # codex_exec gets the same freedom through its workspace-write
+            # sandbox default.
+            backend = "codex_exec" if get_target_backend() == "codex_exec" else "claude_code_exec"
+            if backend == "codex_exec":
+                response, raw = run_codex_exec(
+                    work_dir=work_dir,
+                    prompt=PLUGIN_GUIDE_PROMPT if runtime_skills else GUIDE_PROMPT,
+                    model=model,
+                    timeout=timeout,
+                )
+            else:
+                response, raw = run_claude_code_exec(
+                    work_dir=work_dir,
+                    prompt=PLUGIN_GUIDE_PROMPT if runtime_skills else GUIDE_PROMPT,
+                    model=model,
+                    timeout=timeout,
+                    allowed_tools="Read,Bash,Write,Edit,Glob,Grep",
+                    allow_file_edits=True,
+                )
+            result["response"] = response
+            usage = extract_exec_usage(raw)
+            if usage is not None:
+                result["usage"] = usage
+            if not response.strip():
+                detail = extract_exec_failure(raw)
+                result["error"] = (
+                    f"{backend} failed to produce a final response: {detail}"
+                    if detail
+                    else f"{backend} returned an empty response after all attempts"
+                )
+        except Exception as exc:  # noqa: BLE001 — isolate target failures
+            result["error"] = f"{type(exc).__name__}: {exc}"
+            result["error_traceback"] = traceback.format_exc(limit=5)
+        finally:
+            try:
+                after = build_manifest(work_dir)
+                result["artifacts"] = diff_manifests(before, after)
+            except ArtifactValidationError as exc:
+                _record_target_artifact_failure(result, exc)
+            except ArtifactCollectionError as exc:
+                if _has_permission_denied_cause(exc):
+                    validation_error = ArtifactValidationError(str(exc))
+                    _record_target_artifact_failure(result, validation_error)
+                else:
+                    result["artifact_collection_error"] = f"{type(exc).__name__}: {exc}"
+                    result["artifact_collection_error_type"] = "infrastructure"
+                    result["score_valid"] = False
+            except Exception as exc:  # noqa: BLE001 — unexpected collection failure
+                result["artifact_collection_error"] = f"{type(exc).__name__}: {exc}"
+                result["artifact_collection_error_type"] = "infrastructure"
+                result["score_valid"] = False
+    except (ArtifactCollectionError, ArtifactValidationError) as exc:
+        result["artifact_collection_error"] = f"{type(exc).__name__}: {exc}"
+        result["artifact_collection_error_type"] = "infrastructure"
+        result["score_valid"] = False
     except Exception as exc:  # noqa: BLE001 — isolate task failures
         result["error"] = f"{type(exc).__name__}: {exc}"
         result["error_traceback"] = traceback.format_exc(limit=5)
@@ -209,6 +271,15 @@ def run_batch(
         ]
         results = [future.result() for future in futures]
 
-    failed = sum(1 for r in results if r.get("error"))
-    print(f"  [skilleval] rollout finished: {len(results) - failed} ok, {failed} errored")
+    invalid = sum(1 for result in results if result.get("score_valid") is False)
+    failed = sum(
+        1
+        for result in results
+        if result.get("error") and result.get("score_valid") is not False
+    )
+    ok = len(results) - failed - invalid
+    print(
+        f"  [skilleval] rollout finished: "
+        f"{ok} ok, {failed} errored, {invalid} invalid"
+    )
     return results

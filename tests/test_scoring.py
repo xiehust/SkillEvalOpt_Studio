@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from skillopt.utils.scoring import compute_score, skill_hash
+from skillopt.utils.scoring import compute_score, skill_hash, InvalidEvaluationError
 
 
 class _ResultObject:
@@ -12,6 +12,15 @@ class _ResultObject:
     def __init__(self, hard: float, soft: float) -> None:
         self.hard = hard
         self.soft = soft
+
+
+class _ResultObjectWithScoreValid:
+    """Result object with hard/soft/score_valid attrs."""
+
+    def __init__(self, hard: float, soft: float, score_valid: bool = True) -> None:
+        self.hard = hard
+        self.soft = soft
+        self.score_valid = score_valid
 
 
 class TestComputeScore:
@@ -70,6 +79,45 @@ class TestComputeScore:
         hard, soft = compute_score(results)
         assert hard == 0.5
         assert soft == 0.5
+
+    def test_rejects_invalid_evaluation_rows(self) -> None:
+        """Rows with score_valid=False raise InvalidEvaluationError."""
+        results = [
+            {"id": "ok", "hard": 1, "soft": 1.0, "score_valid": True},
+            {"id": "infra", "hard": 0, "soft": 0.0, "score_valid": False,
+             "judge_error": "worker timeout"},
+        ]
+        with pytest.raises(InvalidEvaluationError, match="infra"):
+            compute_score(results)
+
+    def test_backward_compat_rows_without_score_valid(self) -> None:
+        """Rows without score_valid field are treated as valid (backward compat)."""
+        results = [
+            {"id": "ok1", "hard": 1, "soft": 1.0},
+            {"id": "ok2", "hard": 0, "soft": 0.5},
+        ]
+        hard, soft = compute_score(results)
+        assert hard == 0.5
+        assert soft == 0.75
+
+    def test_rows_with_score_valid_true_pass(self) -> None:
+        """Rows with score_valid=True score normally."""
+        results = [
+            {"id": "ok1", "hard": 1, "soft": 1.0, "score_valid": True},
+            {"id": "ok2", "hard": 0, "soft": 0.5, "score_valid": True},
+        ]
+        hard, soft = compute_score(results)
+        assert hard == 0.5
+        assert soft == 0.75
+
+    def test_rejects_invalid_dataclass_rows(self) -> None:
+        """Dataclass rows with score_valid=False raise InvalidEvaluationError."""
+        results = [
+            _ResultObjectWithScoreValid(1.0, 1.0, score_valid=True),
+            _ResultObjectWithScoreValid(0.0, 0.0, score_valid=False),
+        ]
+        with pytest.raises(InvalidEvaluationError):
+            compute_score(results)
 
 
 class TestSkillHash:

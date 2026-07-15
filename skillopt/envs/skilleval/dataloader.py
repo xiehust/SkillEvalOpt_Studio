@@ -23,6 +23,7 @@ from skillopt.datasets.base import (
     _compute_weighted_counts,
     _load_json_or_jsonl,
 )
+from skillopt.envs.skilleval.contracts import normalize_judge_contract
 from skillopt.envs.skilleval.coverage import plan_disjoint_plugin_coverage
 from skillopt.envs.skilleval.plugin import normalize_plugin_tasks
 
@@ -117,6 +118,13 @@ def _normalize_items(raw_items: list, source: str) -> list[dict]:
         normalized = dict(item)
         normalized["files"] = _validate_files(index, item)
         normalized["task_type"] = raw_task_type or _DEFAULT_TASK_TYPE
+        judge_mode, artifact_checks, mode_explicit = normalize_judge_contract(
+            index,
+            item,
+        )
+        normalized["judge_mode"] = judge_mode
+        normalized["_judge_mode_explicit"] = mode_explicit
+        normalized["artifact_checks"] = artifact_checks
         tasks.append(normalized)
     return tasks
 
@@ -197,6 +205,16 @@ class SkillEvalDataLoader(SplitDataLoader):
     def load_raw_items(self, data_path: str) -> list[dict]:
         items = _normalize_items(_load_json_or_jsonl(data_path), data_path)
         return self._normalize_plugin_metadata(items)
+
+    def write_split_items(self, split_path: str, items: list[dict]) -> None:
+        serialized_items: list[dict] = []
+        for item in items:
+            serialized = dict(item)
+            mode_explicit = serialized.pop("_judge_mode_explicit")
+            if not mode_explicit:
+                serialized.pop("judge_mode", None)
+            serialized_items.append(serialized)
+        super().write_split_items(split_path, serialized_items)
 
     def load_split_items(self, split_path: str) -> list[dict]:
         items = super().load_split_items(split_path)

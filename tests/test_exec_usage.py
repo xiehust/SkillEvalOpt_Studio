@@ -217,3 +217,224 @@ class TestJudgeUsageField:
         result = evaluator.judge({"id": "t1", "question": "q", "rubric": "r"}, "resp")
         assert result["hard"] == 1
         assert result["judge_usage"] == {"input": 0, "output": 0}
+
+
+_ARTIFACT_TOOLS = ("artifact_inventory", "artifact_inspect", "artifact_render", "artifact_extract")
+_BUILTIN_TOOLS = ("Read", "Bash", "Edit", "Write", "WebSearch", "WebFetch")
+
+
+def _judge_policy(tmp_path, backend: str):
+    """A judge policy built through the real agentic_judge helpers."""
+    from skillopt.envs.skilleval.agentic_judge import build_backend_policy
+
+    mcp_command = [
+        "/usr/bin/bwrap",
+        "--unshare-net",
+        "python3",
+        "-m",
+        "skillopt.envs.skilleval.artifact_mcp",
+    ]
+    return build_backend_policy(backend, mcp_command, str(tmp_path))
+
+
+class TestJudgeExecPolicyFailClosed:
+    """The per-call judge policy must be fail-closed and expose only the MCP."""
+
+    def test_claude_judge_cli_announces_only_artifact_mcp_tools(self, tmp_path, monkeypatch) -> None:
+        captured: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["kwargs"] = kwargs
+            return subprocess.CompletedProcess(cmd, 0, stdout=_cli_json('{"schema_version": 1}'), stderr="")
+
+        monkeypatch.setattr(codex_harness.subprocess, "run", fake_run)
+        policy = _judge_policy(tmp_path, "claude_code_exec")
+        response, _raw = codex_harness.run_claude_code_exec(
+            work_dir=str(tmp_path), prompt="judge please", model="m", timeout=5, policy=policy,
+        )
+        cmd = captured["cmd"]
+        # No built-in tools are enabled and only the Artifact MCP tools are allowed.
+        assert cmd[cmd.index("--tools") + 1] == ""
+        allowed = cmd[cmd.index("--allowedTools") + 1]
+        assert allowed == ",".join(f"mcp__artifactctl__{name}" for name in _ARTIFACT_TOOLS)
+        for builtin in _BUILTIN_TOOLS:
+            assert builtin not in allowed
+        assert "--strict-mcp-config" in cmd
+        assert cmd[cmd.index("--setting-sources") + 1] == ""
+        # The rollout / evidence directories are never added.
+        assert "--add-dir" not in cmd
+        # Structured output uses the real claude CLI flag `--json-schema`; the
+        # earlier `--schema` does not exist in the CLI and made every judgment
+        # exit non-zero. Asserting the exact flag here breaks on future drift.
+        assert "--schema" not in cmd
+        assert "--json-schema" in cmd
+        assert json.loads(cmd[cmd.index("--json-schema") + 1]) == policy["output_schema"]
+        assert response == '{"schema_version": 1}'
+
+    def test_codex_judge_cli_is_read_only_with_only_the_mcp(self, tmp_path, monkeypatch) -> None:
+        captured: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["kwargs"] = kwargs
+            index = cmd.index("--output-last-message")
+            with open(cmd[index + 1], "w", encoding="utf-8") as handle:
+                handle.write('{"schema_version": 1}')
+            return subprocess.CompletedProcess(cmd, 0, stdout="tokens used\n42\n", stderr="")
+
+        monkeypatch.setattr(codex_harness.subprocess, "run", fake_run)
+        policy = _judge_policy(tmp_path, "codex_exec")
+        response, _raw = codex_harness.run_codex_exec(
+            work_dir=str(tmp_path), prompt="judge please", model="m", timeout=5, policy=policy,
+        )
+        cmd = captured["cmd"]
+        assert cmd[cmd.index("--sandbox") + 1] == "read-only"
+        assert 'approval_policy="never"' in cmd
+        assert "--ephemeral" in cmd
+        assert "project_doc_max_bytes=0" in cmd
+        assert "tools.web_search=false" in cmd
+        assert any(part.startswith("mcp_servers.artifactctl.command=") for part in cmd)
+        assert any(part.startswith("mcp_servers.artifactctl.args=") for part in cmd)
+        # No built-in shell / web tool is announced anywhere in the command.
+        for builtin in _BUILTIN_TOOLS:
+            assert not any(builtin in part for part in cmd)
+        # User config is ignored via an isolated CODEX_HOME.
+        assert captured["kwargs"]["env"]["CODEX_HOME"].endswith(".codex_home")
+        assert response == '{"schema_version": 1}'
+
+    def test_non_judge_policy_is_rejected_fail_closed(self, tmp_path) -> None:
+        with pytest.raises(ValueError):
+            codex_harness.run_claude_code_exec(
+                work_dir=str(tmp_path), prompt="p", model="m", timeout=5, policy={"judge": False},
+            )
+        with pytest.raises(ValueError):
+            codex_harness.run_codex_exec(
+                work_dir=str(tmp_path), prompt="p", model="m", timeout=5, policy={},
+            )
+
+    def test_judge_policy_requires_exactly_one_required_mcp(self, tmp_path) -> None:
+        policy = dict(_judge_policy(tmp_path, "claude_code_exec"))
+        policy["mcp_servers"] = {}
+        with pytest.raises(RuntimeError):
+            codex_harness.run_claude_code_exec(
+                work_dir=str(tmp_path), prompt="p", model="m", timeout=5, policy=policy,
+            )
+
+    def test_default_target_runner_ignores_policy_kw_when_absent(self, monkeypatch, tmp_path) -> None:
+        # Passing no policy keeps the existing CLI path byte-for-byte.
+        def fake_run(cmd, **kwargs):
+            assert "--strict-mcp-config" not in cmd
+            assert "--sandbox" not in cmd or cmd[cmd.index("--sandbox") + 1] != "read-only"
+            return subprocess.CompletedProcess(cmd, 0, stdout=_cli_json("plain"), stderr="")
+
+        monkeypatch.setattr(codex_harness.subprocess, "run", fake_run)
+        response, _raw = codex_harness._run_claude_code_cli_exec(
+            work_dir=str(tmp_path), prompt="p", model="m", timeout=5,
+        )
+        assert response == "plain"
+
+
+def _fake_claude_exe(tmp_path, *, mode: str):
+    """Write a fake `claude` executable that mimics commander flag handling.
+
+    ``--version`` always succeeds; the judge argv is then handled per ``mode``:
+    ``reject`` errors like the CLI would on an unknown/renamed flag, ``accept``
+    parses cleanly and exits 0, ``hang`` sleeps (simulating a valid argv that
+    reaches the endpoint and blocks) so the flag check times out.
+    """
+    version_ok = "if '--version' in sys.argv:\n    print('9.9.9 (fake)')\n    sys.exit(0)\n"
+    if mode == "reject":
+        body = version_ok + "sys.stderr.write(\"error: unknown option '--json-schema'\\n\")\nsys.exit(1)\n"
+    elif mode == "accept":
+        body = version_ok + "sys.exit(0)\n"
+    elif mode == "hang":
+        body = version_ok + "import time\ntime.sleep(30)\n"
+    else:  # pragma: no cover - test helper guard
+        raise ValueError(mode)
+    script = tmp_path / f"fake-claude-{mode}"
+    script.write_text("#!/usr/bin/env python3\nimport sys\n" + body, encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
+class TestClaudeJudgeFlagPreflight:
+    """The token-free judge-argv flag check catches unknown/renamed CLI flags."""
+
+    def test_rejects_a_cli_that_errors_on_the_judge_flags(self, tmp_path, monkeypatch) -> None:
+        exe = _fake_claude_exe(tmp_path, mode="reject")
+        monkeypatch.setattr(
+            codex_harness, "get_claude_code_exec_config", lambda: {"path": str(exe), "effort": "low"}
+        )
+        policy = _judge_policy(tmp_path, "claude_code_exec")
+        with pytest.raises(RuntimeError, match="judge policy flag"):
+            codex_harness.check_claude_judge_cli_flags(policy=policy, model="m", timeout=10.0)
+
+    def test_accepts_a_cli_that_parses_the_judge_flags(self, tmp_path, monkeypatch) -> None:
+        exe = _fake_claude_exe(tmp_path, mode="accept")
+        monkeypatch.setattr(
+            codex_harness, "get_claude_code_exec_config", lambda: {"path": str(exe), "effort": "low"}
+        )
+        policy = _judge_policy(tmp_path, "claude_code_exec")
+        codex_harness.check_claude_judge_cli_flags(policy=policy, model="m", timeout=10.0)
+
+    def test_treats_a_hang_as_valid_flags(self, tmp_path, monkeypatch) -> None:
+        exe = _fake_claude_exe(tmp_path, mode="hang")
+        monkeypatch.setattr(
+            codex_harness, "get_claude_code_exec_config", lambda: {"path": str(exe), "effort": "low"}
+        )
+        policy = _judge_policy(tmp_path, "claude_code_exec")
+        codex_harness.check_claude_judge_cli_flags(policy=policy, model="m", timeout=0.5)
+
+
+class TestJudgeWorkerProtocol:
+    """judge_worker.run_worker_request drives the runner with the judge policy."""
+
+    def test_worker_invokes_runner_with_policy_and_returns_usage(self, tmp_path, monkeypatch) -> None:
+        from skillopt.envs.skilleval import judge_worker
+
+        captured: dict = {}
+        raw = json.dumps({
+            "type": "result",
+            "usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 50,
+            },
+        })
+
+        def fake_runner(**kwargs):
+            captured.update(kwargs)
+            return "VERDICT-JSON", raw
+
+        monkeypatch.setattr(judge_worker, "run_claude_code_exec", fake_runner)
+        monkeypatch.setattr(judge_worker, "configure_claude_code_exec", lambda **kwargs: None)
+        policy = {"judge": True, "mcp_servers": {"artifactctl": {"required": True, "command": ["x"]}}}
+        request = {
+            "backend": "claude_code_exec",
+            "model": "m",
+            "effort": "low",
+            "timeout": 30,
+            "judge_client_dir": str(tmp_path),
+            "prompt": "judge please",
+            "backend_policy": policy,
+        }
+        out = judge_worker.run_worker_request(request)
+        assert out["response"] == "VERDICT-JSON"
+        assert out["usage"] == {"input": 100, "output": 50}
+        assert captured["policy"] is policy
+        assert captured["work_dir"] == str(tmp_path)
+        assert captured["images"] == [] and captured["data_dirs"] == []
+
+    def test_worker_rejects_request_without_judge_policy(self, tmp_path) -> None:
+        from skillopt.envs.skilleval import judge_worker
+
+        with pytest.raises(ValueError):
+            judge_worker.run_worker_request({
+                "backend": "claude_code_exec",
+                "timeout": 5,
+                "judge_client_dir": str(tmp_path),
+                "prompt": "p",
+                "backend_policy": {"judge": False},
+            })

@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import traceback
 from typing import Any
@@ -980,6 +981,276 @@ def _run_claude_code_cli_exec(
     return response, raw
 
 
+# ---------------------------------------------------------------------------
+# Restricted judge transport (per-call policy; never weakens to SDK/CLI defaults)
+# ---------------------------------------------------------------------------
+
+
+def _is_judge_policy(policy: Any) -> bool:
+    return isinstance(policy, dict) and policy.get("judge") is True
+
+
+def _judge_mcp_server(policy: dict) -> tuple[str, list[str]]:
+    """Return the single required Artifact MCP ``(name, command)`` or fail closed."""
+    servers = policy.get("mcp_servers")
+    if not isinstance(servers, dict) or len(servers) != 1:
+        raise RuntimeError("judge policy must define exactly one required Artifact MCP server")
+    name, spec = next(iter(servers.items()))
+    if not isinstance(spec, dict) or spec.get("required") is not True:
+        raise RuntimeError("judge Artifact MCP server must be marked required")
+    command = spec.get("command")
+    if not isinstance(command, list) or not command or any(not isinstance(part, str) for part in command):
+        raise RuntimeError("judge Artifact MCP server command must be a non-empty string argv")
+    return str(name), [str(part) for part in command]
+
+
+# Commander (the claude CLI's parser) prints these to stderr and exits non-zero
+# during argument parsing — before any network call — when a flag is unknown or
+# an option value is rejected. They distinguish flag drift from endpoint errors.
+_CLI_FLAG_ERROR_MARKERS = (
+    "unknown option",
+    "unknown command",
+    "unknown or unexpected option",
+    "error: option",
+)
+_CLAUDE_JUDGE_FLAG_CHECK_TIMEOUT = 12.0
+
+
+def _build_claude_judge_cli_command(
+    *,
+    config: dict,
+    model: str,
+    policy: dict,
+    mcp_config_path: str,
+    system_prompt_path: str,
+    prompt: str,
+) -> list[str]:
+    """Build the restricted-judge argv for the claude CLI.
+
+    Shared by the per-task judge call and the token-free preflight flag check so
+    the two can never drift. Structured output uses ``--json-schema`` — the real
+    claude CLI flag; the earlier ``--schema`` does not exist and made every
+    judgment exit non-zero (``error: unknown option '--schema'``).
+    """
+    allowed_tools = ",".join(str(tool) for tool in policy.get("allowed_tools", []) if str(tool))
+    cmd = [
+        str(config["path"]),
+        "-p",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "bypassPermissions",
+        "--tools",
+        "",
+        "--allowedTools",
+        allowed_tools,
+        "--mcp-config",
+        mcp_config_path,
+        "--strict-mcp-config",
+        "--setting-sources",
+        "",
+        "--append-system-prompt-file",
+        system_prompt_path,
+    ]
+    if model:
+        cmd.extend(["--model", model])
+    effort = _claude_effort(config.get("effort"))
+    if effort:
+        cmd.extend(["--effort", effort])
+    schema = policy.get("output_schema")
+    if isinstance(schema, dict):
+        cmd.extend(["--json-schema", json.dumps(schema)])
+    cmd.extend(["--", prompt])
+    return cmd
+
+
+def check_claude_judge_cli_flags(
+    *,
+    policy: dict,
+    model: str = "",
+    timeout: float = _CLAUDE_JUDGE_FLAG_CHECK_TIMEOUT,
+) -> None:
+    """Preflight the full judge argv against the installed claude CLI, token-free.
+
+    The CLI validates every option while parsing arguments, before contacting an
+    endpoint, so a renamed/unknown flag (e.g. the old ``--schema``) exits
+    non-zero immediately with a commander usage error we recognize. Valid flags
+    proceed to the endpoint; we point them at an unreachable local URL with a
+    dummy key and a short timeout, so no tokens are spent and a valid argv simply
+    times out (treated as success). Raises ``RuntimeError`` only when the CLI
+    rejects a judge flag.
+    """
+    config = get_claude_code_exec_config()
+    work_dir = tempfile.mkdtemp(prefix="skillopt-judge-flagcheck-")
+    try:
+        mcp_config_path = os.path.join(work_dir, "judge-mcp.json")
+        with open(mcp_config_path, "w", encoding="utf-8") as handle:
+            json.dump({"mcpServers": {}}, handle)
+        system_prompt_path = os.path.join(work_dir, "judge-system-prompt.txt")
+        with open(system_prompt_path, "w", encoding="utf-8") as handle:
+            handle.write("preflight")
+        cmd = _build_claude_judge_cli_command(
+            config=config,
+            model=model,
+            policy=policy,
+            mcp_config_path=mcp_config_path,
+            system_prompt_path=system_prompt_path,
+            prompt="preflight flag check; do not answer",
+        )
+        # Force the endpoint unreachable so a fully-parsed argv cannot spend
+        # tokens or reach a real API; the short timeout then reads as success.
+        env = {
+            **os.environ,
+            "ANTHROPIC_BASE_URL": "http://127.0.0.1:1",
+            "ANTHROPIC_API_KEY": "skillopt-preflight-unreachable",
+        }
+        try:
+            proc = subprocess.run(
+                cmd, cwd=work_dir, capture_output=True, text=True, timeout=timeout, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return  # argv parsed and reached the (unreachable) endpoint -> flags OK
+        if proc.returncode != 0:
+            combined = f"{proc.stdout or ''}\n{proc.stderr or ''}".lower()
+            if any(marker in combined for marker in _CLI_FLAG_ERROR_MARKERS):
+                detail = (proc.stderr or proc.stdout or "").strip()[:300]
+                raise RuntimeError(f"claude judge CLI rejected a judge policy flag: {detail}")
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def _run_claude_code_judge_cli(
+    *,
+    work_dir: str,
+    prompt: str,
+    model: str,
+    timeout: int,
+    policy: dict,
+) -> tuple[str, str]:
+    """Restricted Claude Code judge call: no built-in tools, only the Artifact MCP.
+
+    Fail-closed CLI transport used only by the judge. It never adds the rollout
+    or evidence directories, disables all built-in tools (``--tools ""``),
+    permits only the named Artifact MCP tools, loads no user/project settings,
+    and replaces the target-runner system/prompt wrapper with a judge system
+    prompt that never references ``task.md`` or ``skillopt-target``.
+    """
+    config = get_claude_code_exec_config()
+    server_name, mcp_command = _judge_mcp_server(policy)
+    mcp_config_path = os.path.join(work_dir, "judge-mcp.json")
+    with open(mcp_config_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {"mcpServers": {server_name: {"type": "stdio", "command": mcp_command[0], "args": list(mcp_command[1:])}}},
+            handle,
+        )
+    system_prompt_path = os.path.join(work_dir, "judge-system-prompt.txt")
+    with open(system_prompt_path, "w", encoding="utf-8") as handle:
+        handle.write(str(policy.get("system_prompt") or ""))
+    cmd = _build_claude_judge_cli_command(
+        config=config,
+        model=model,
+        policy=policy,
+        mcp_config_path=mcp_config_path,
+        system_prompt_path=system_prompt_path,
+        prompt=prompt,
+    )
+
+    try:
+        proc = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"claude judge client timed out after {timeout}s") from exc
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    raw = stdout if not stderr else (f"{stdout}\n[stderr]\n{stderr}" if stdout else stderr)
+    parsed = _parse_claude_cli_json(stdout)
+    if parsed is not None:
+        if parsed.get("is_error"):
+            return "", raw
+        result = parsed.get("result")
+        # With --json-schema the CLI may surface structured output as an object;
+        # hand parse_verdict a JSON string rather than a Python repr().
+        if isinstance(result, (dict, list)):
+            return json.dumps(result), raw
+        return str(result or "").strip(), raw
+    if proc.returncode != 0:
+        raise RuntimeError(f"claude judge client exited {proc.returncode}: {(stderr or stdout)[:2000]}")
+    return stdout.strip(), raw
+
+
+def _run_codex_judge_cli(
+    *,
+    work_dir: str,
+    prompt: str,
+    model: str,
+    timeout: int,
+    policy: dict,
+) -> tuple[str, str]:
+    """Restricted Codex judge call: read-only, no approvals/network, only the MCP.
+
+    Fail-closed CLI transport used only by the judge: ``--sandbox read-only``,
+    ``approval_policy="never"``, web search disabled, AGENTS.md/rules disabled
+    (``project_doc_max_bytes=0``), user config ignored (isolated ``CODEX_HOME``),
+    a fresh ``--ephemeral`` session, one required Artifact MCP server, and the
+    strict verdict output schema.
+    """
+    config = get_codex_exec_config()
+    server_name, mcp_command = _judge_mcp_server(policy)
+    last_message_path = os.path.join(work_dir, "codex_last_message.txt")
+    schema_path = os.path.join(work_dir, "verdict-schema.json")
+    schema = policy.get("output_schema")
+    if isinstance(schema, dict):
+        with open(schema_path, "w", encoding="utf-8") as handle:
+            json.dump(schema, handle)
+    codex_home = os.path.join(work_dir, ".codex_home")
+    os.makedirs(codex_home, exist_ok=True)
+    cmd = [
+        str(config["path"]),
+        "exec",
+        "--skip-git-repo-check",
+        "--color",
+        "never",
+        "-C",
+        work_dir,
+        "--ephemeral",
+        "--sandbox",
+        "read-only",
+        "-c",
+        'approval_policy="never"',
+        "-c",
+        "project_doc_max_bytes=0",
+        "-c",
+        "tools.web_search=false",
+        "-c",
+        f"mcp_servers.{server_name}.command={json.dumps(mcp_command[0])}",
+        "-c",
+        f"mcp_servers.{server_name}.args={json.dumps(list(mcp_command[1:]))}",
+    ]
+    reasoning_effort = str(config.get("reasoning_effort", "")).strip()
+    if reasoning_effort and reasoning_effort != "none":
+        cmd.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
+    if model:
+        cmd.extend(["-m", model])
+    if isinstance(schema, dict):
+        cmd.extend(["--output-schema", schema_path])
+    cmd.extend(["--output-last-message", last_message_path, prompt])
+
+    env = {**os.environ, "CODEX_HOME": codex_home}
+    try:
+        proc = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"codex judge client timed out after {timeout}s") from exc
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    raw = stdout if not stderr else (f"{stdout}\n[stderr]\n{stderr}" if stdout else stderr)
+    last_message = ""
+    if os.path.exists(last_message_path):
+        with open(last_message_path, encoding="utf-8") as handle:
+            last_message = handle.read()
+    if proc.returncode != 0:
+        raise RuntimeError(f"codex judge client exited {proc.returncode}: {(stderr or stdout)[:2000]}")
+    return last_message, raw
+
+
 def run_claude_code_exec(
     *,
     work_dir: str,
@@ -991,7 +1262,18 @@ def run_claude_code_exec(
     allowed_tools: list[str] | str | None = None,
     permission_mode: str | None = None,
     allow_file_edits: bool = False,
+    policy: dict | None = None,
 ) -> tuple[str, str]:
+    if policy is not None:
+        if not _is_judge_policy(policy):
+            raise ValueError("policy must be a judge backend policy dict")
+        return _run_claude_code_judge_cli(
+            work_dir=work_dir,
+            prompt=prompt,
+            model=model,
+            timeout=timeout,
+            policy=policy,
+        )
     config = get_claude_code_exec_config()
     mode = _sdk_mode(config.get("use_sdk"))
     retries = int(config.get("empty_response_retries", 0) or 0)
@@ -1215,7 +1497,18 @@ def run_codex_exec(
     data_dirs: list[str] | None = None,
     sandbox: str | None = None,
     full_auto: bool | None = None,
+    policy: dict | None = None,
 ) -> tuple[str, str]:
+    if policy is not None:
+        if not _is_judge_policy(policy):
+            raise ValueError("policy must be a judge backend policy dict")
+        return _run_codex_judge_cli(
+            work_dir=work_dir,
+            prompt=prompt,
+            model=model,
+            timeout=timeout,
+            policy=policy,
+        )
     config = get_codex_exec_config()
     mode = _sdk_mode(config.get("use_sdk"))
     retries = int(config.get("empty_response_retries", 0) or 0)

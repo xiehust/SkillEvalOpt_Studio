@@ -214,6 +214,16 @@ mounted read-only, scratch mounted writable, and `--unshare-net`. It exposes
 only schema-validated artifact operations; no shell or arbitrary path tool is
 available to the model.
 
+Two network planes are deliberately distinct here. The judge **model client**
+(the `claude`/`codex` process the worker drives) keeps exactly one outbound
+connection: the model-API control plane it needs to talk to Claude or Codex —
+"networkless" never means the judge cannot call its own model. Everything on the
+**artifact/tool side** — the Artifact MCP server and every inspector, converter,
+and renderer it drives — runs under `--unshare-net` with no network at all, so
+no artifact byte can trigger a request and no tool result can be exfiltrated.
+Only the model-API control plane is reachable; artifact inspection can never
+open a socket.
+
 Claude runs with all built-in tools disabled and only the named Artifact MCP
 tools enabled. Codex runs with `sandbox=read-only`, `approval_policy=never`,
 web search disabled, user config/rules ignored, and only the required Artifact
@@ -467,6 +477,34 @@ untrusted artifact text or unvalidated judge output.
 6. Existing result consumers remain compatible because the current core fields
    remain numeric and new fields are additive. SkillOpt's own aggregation paths
    must honor `score_valid`; third-party consumers should do the same.
+
+## Deployment Requirements
+
+The agentic judge runs the Artifact MCP server and format parsers inside a
+minimal Bubblewrap sandbox under the system interpreter (`/usr/bin/python3`)
+with `PYTHONNOUSERSITE=1`. This is deliberate: the sandbox must not import
+arbitrary packages from the invoking user's home. Consequently:
+
+1. **Dependency provisioning.** `skillopt` and its binary-parser dependencies
+   (`mcp`, `openpyxl`, `Pillow`, `python-docx`, `python-pptx`) must be
+   importable by the sandbox interpreter — i.e. installed into a virtualenv or
+   system `site-packages`, not via `pip install --user`. The sandbox mounts
+   `/usr` wholesale plus, for a non-`/usr` prefix, the interpreter's `sys.prefix`
+   and `site.getsitepackages()` directories at identical paths; it does not
+   mount the per-user site (`~/.local/...`). A `--user`-only install fails the
+   in-sandbox MCP startup with `ModuleNotFoundError`, which the eager preflight
+   surfaces before any rollout spend.
+2. **Elevated launcher on AppArmor hosts.** Where unprivileged user namespaces
+   are blocked (e.g. Ubuntu 24.04 with AppArmor), configure
+   `judge_sandbox_command: "sudo -n bwrap"` (or an equivalent reviewed elevated
+   wrapper). Under an elevated launcher the sandbox omits the `--unshare-user`
+   namespace (bwrap already holds root capabilities; a fresh user namespace
+   would lose `CAP_DAC_OVERRIDE` over the invoking user's files) and explicitly
+   creates bind-mountpoint ancestor directories traversable (`0555`) so the
+   post-`setpriv` unprivileged identity can reach the read-only package and
+   `/etc` runtime files. Privilege isolation on this path is enforced by the
+   `setpriv` drop and the in-sandbox non-root startup probe, not by the user
+   namespace.
 
 ## Testing Strategy
 
