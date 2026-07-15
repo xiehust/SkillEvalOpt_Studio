@@ -47,6 +47,14 @@ _PPT_MAIN_CONTENT_TYPE = (
     "application/vnd.openxmlformats-officedocument."
     "presentationml.presentation.main+xml"
 )
+_WORD_HEADER_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument."
+    "wordprocessingml.header+xml"
+)
+_WORD_FOOTER_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument."
+    "wordprocessingml.footer+xml"
+)
 _OFFICE_DOCUMENT_RELATIONSHIP = (
     "http://schemas.openxmlformats.org/officeDocument/2006/"
     "relationships/officeDocument"
@@ -103,6 +111,8 @@ _CUSTOM_XML_NAMESPACE = (
 )
 _XML_SIGNATURE_NAMESPACE = "http://www.w3.org/2000/09/xmldsig#"
 _INK_NAMESPACE = "http://www.w3.org/2003/InkML"
+_HEADER_RELATIONSHIP = f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/header"
+_FOOTER_RELATIONSHIP = f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/footer"
 _SLIDE_RELATIONSHIP = f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/slide"
 _SLIDE_LAYOUT_RELATIONSHIP = (
     f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/slideLayout"
@@ -116,6 +126,32 @@ _VIDEO_RELATIONSHIP = f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/video"
 _CHART_RELATIONSHIP = f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/chart"
 _MEDIA_RELATIONSHIP = (
     "http://schemas.microsoft.com/office/2007/relationships/media"
+)
+_SLIDE_MASTER_RELATIONSHIP = (
+    f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/slideMaster"
+)
+_NOTES_MASTER_RELATIONSHIP = (
+    f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/notesMaster"
+)
+_HANDOUT_MASTER_RELATIONSHIP = (
+    f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/handoutMaster"
+)
+_PRES_PROPS_RELATIONSHIP = f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/presProps"
+_VIEW_PROPS_RELATIONSHIP = f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/viewProps"
+_TABLE_STYLES_RELATIONSHIP = (
+    f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/tableStyles"
+)
+_THEME_RELATIONSHIP = f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/theme"
+_THEME_OVERRIDE_RELATIONSHIP = (
+    f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/themeOverride"
+)
+_COMMENTS_RELATIONSHIP = f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/comments"
+_COMMENT_AUTHORS_RELATIONSHIP = (
+    f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/commentAuthors"
+)
+_TAGS_RELATIONSHIP = f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/tags"
+_CHART_USER_SHAPES_RELATIONSHIP = (
+    f"{_OFFICE_RELATIONSHIPS_NAMESPACE}/chartUserShapes"
 )
 _SLIDE_CONTENT_TYPE = (
     "application/vnd.openxmlformats-officedocument."
@@ -243,6 +279,64 @@ _PPT_RELATIONSHIP_TARGET_ROOTS = {
         f"{{{_XML_SIGNATURE_NAMESPACE}}}Signature"
     ),
     "application/inkml+xml": f"{{{_INK_NAMESPACE}}}ink",
+}
+_WORD_RELATIONSHIP_TARGET_ROOTS = {
+    _HEADER_RELATIONSHIP: (
+        _WORD_HEADER_CONTENT_TYPE,
+        f"{{{_WORD_NAMESPACE}}}hdr",
+    ),
+    _FOOTER_RELATIONSHIP: (
+        _WORD_FOOTER_CONTENT_TYPE,
+        f"{{{_WORD_NAMESPACE}}}ftr",
+    ),
+}
+_PPT_RELATIONSHIP_TYPE_CONTENT_TYPES = {
+    _SLIDE_MASTER_RELATIONSHIP: (
+        "application/vnd.openxmlformats-officedocument."
+        "presentationml.slideMaster+xml"
+    ),
+    _NOTES_MASTER_RELATIONSHIP: (
+        "application/vnd.openxmlformats-officedocument."
+        "presentationml.notesMaster+xml"
+    ),
+    _HANDOUT_MASTER_RELATIONSHIP: (
+        "application/vnd.openxmlformats-officedocument."
+        "presentationml.handoutMaster+xml"
+    ),
+    _PRES_PROPS_RELATIONSHIP: (
+        "application/vnd.openxmlformats-officedocument."
+        "presentationml.presProps+xml"
+    ),
+    _VIEW_PROPS_RELATIONSHIP: (
+        "application/vnd.openxmlformats-officedocument."
+        "presentationml.viewProps+xml"
+    ),
+    _TABLE_STYLES_RELATIONSHIP: (
+        "application/vnd.openxmlformats-officedocument."
+        "presentationml.tableStyles+xml"
+    ),
+    _THEME_RELATIONSHIP: (
+        "application/vnd.openxmlformats-officedocument.theme+xml"
+    ),
+    _THEME_OVERRIDE_RELATIONSHIP: (
+        "application/vnd.openxmlformats-officedocument.themeOverride+xml"
+    ),
+    _COMMENTS_RELATIONSHIP: (
+        "application/vnd.openxmlformats-officedocument."
+        "presentationml.comments+xml"
+    ),
+    _COMMENT_AUTHORS_RELATIONSHIP: (
+        "application/vnd.openxmlformats-officedocument."
+        "presentationml.commentAuthors+xml"
+    ),
+    _TAGS_RELATIONSHIP: (
+        "application/vnd.openxmlformats-officedocument."
+        "presentationml.tags+xml"
+    ),
+    _CHART_USER_SHAPES_RELATIONSHIP: (
+        "application/vnd.openxmlformats-officedocument."
+        "drawingml.chartshapes+xml"
+    ),
 }
 _RELATIONSHIPS_CONTENT_TYPE = (
     "application/vnd.openxmlformats-package.relationships+xml"
@@ -620,6 +714,17 @@ def _validate_ppt_relationship_target_roots(
                 "OOXML PowerPoint relationship target is invalid"
             )
         content_type = part_content_types.get(target)
+        expected_content_type = _PPT_RELATIONSHIP_TYPE_CONTENT_TYPES.get(
+            relationship["type"]
+        )
+        if (
+            expected_content_type is not None
+            and content_type != expected_content_type
+        ):
+            raise InspectionError(
+                "OOXML PowerPoint relationship type does not match its "
+                "target content type"
+            )
         expected_root = _PPT_RELATIONSHIP_TARGET_ROOTS.get(
             content_type or ""
         )
@@ -646,6 +751,43 @@ def _validate_ppt_relationship_target_roots(
     return root_tags
 
 
+def _validate_word_relationship_targets(
+    archive: zipfile.ZipFile,
+    members: dict[str, zipfile.ZipInfo],
+    part_content_types: dict[str, str],
+    relationships: list[dict],
+) -> None:
+    for relationship in relationships:
+        binding = _WORD_RELATIONSHIP_TARGET_ROOTS.get(relationship["type"])
+        if binding is None:
+            continue
+        expected_content_type, expected_root = binding
+        target = relationship.get("_normalized_target")
+        content_type = (
+            part_content_types.get(target)
+            if isinstance(target, str)
+            else None
+        )
+        if (
+            relationship["external"]
+            or not isinstance(target, str)
+            or content_type != expected_content_type
+        ):
+            raise InspectionError(
+                "OOXML Word relationship target content type is invalid"
+            )
+        root = ooxml._parse_graph_xml(
+            archive,
+            members,
+            target,
+            "Word relationship target",
+        )
+        if root.tag != expected_root:
+            raise InspectionError(
+                "OOXML Word relationship target root is invalid"
+            )
+
+
 def _validate_main_part_graph(
     archive: zipfile.ZipFile,
     members: dict[str, zipfile.ZipInfo],
@@ -670,6 +812,12 @@ def _validate_main_part_graph(
             raise InspectionError(
                 "OOXML Word document body must appear exactly once"
             )
+        _validate_word_relationship_targets(
+            archive,
+            members,
+            part_content_types,
+            relationships,
+        )
         return
 
     presentation_tag = f"{{{_PRESENTATION_NAMESPACE}}}presentation"

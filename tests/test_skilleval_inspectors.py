@@ -2788,6 +2788,95 @@ class TestOfficeInspector:
                 scratch_dir=str(scratch),
             )
 
+    @pytest.mark.parametrize(
+        ("member", "old_root", "new_root"),
+        [
+            ("word/header1.xml", b"w:hdr", b"w:notHdr"),
+            ("word/footer1.xml", b"w:ftr", b"w:notFtr"),
+        ],
+    )
+    def test_docx_preflight_rejects_invalid_relationship_target_root(
+        self, tmp_path, monkeypatch, member, old_root, new_root
+    ) -> None:
+        from docx import Document
+        from skillopt.envs.skilleval.inspectors import office
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "invalid-related-root.docx"
+        document = Document()
+        document.add_paragraph("Body")
+        document.sections[0].header.paragraphs[0].text = "Header"
+        document.sections[0].footer.paragraphs[0].text = "Footer"
+        document.save(path)
+        self._rewrite_member(
+            path,
+            member,
+            lambda payload: payload.replace(
+                b"<" + old_root,
+                b"<" + new_root,
+                1,
+            ).replace(
+                b"</" + old_root + b">",
+                b"</" + new_root + b">",
+                1,
+            ),
+        )
+        parser_calls = []
+
+        def forbidden_parser(*args, **kwargs):
+            parser_calls.append((args, kwargs))
+            raise AssertionError("python-docx must not see invalid OOXML")
+
+        monkeypatch.setattr(office, "Document", forbidden_parser)
+        with pytest.raises(
+            InspectionError,
+            match="relationship target root",
+        ):
+            inspect_artifact(
+                path.name,
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+        assert parser_calls == []
+
+    def test_pptx_preflight_rejects_relationship_type_content_type_mismatch(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from pptx import Presentation
+        from skillopt.envs.skilleval.inspectors import office
+
+        evidence, scratch = _roots(tmp_path)
+        path = evidence / "mislabeled-slide-master.pptx"
+        presentation = Presentation()
+        presentation.slides.add_slide(presentation.slide_layouts[1])
+        presentation.save(path)
+        self._rewrite_member(
+            path,
+            "ppt/_rels/presentation.xml.rels",
+            lambda payload: payload.replace(
+                b"/relationships/theme",
+                b"/relationships/slideMaster",
+                1,
+            ),
+        )
+        parser_calls = []
+
+        def forbidden_parser(*args, **kwargs):
+            parser_calls.append((args, kwargs))
+            raise AssertionError("python-pptx must not see invalid OOXML")
+
+        monkeypatch.setattr(office, "Presentation", forbidden_parser)
+        with pytest.raises(
+            InspectionError,
+            match="relationship type",
+        ):
+            inspect_artifact(
+                path.name,
+                evidence_dir=str(evidence),
+                scratch_dir=str(scratch),
+            )
+        assert parser_calls == []
+
     def test_docx_resource_limit_rejects_before_python_docx(
         self, tmp_path, monkeypatch
     ) -> None:
