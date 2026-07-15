@@ -818,7 +818,157 @@ class TestPreflightExercisesJudgeArgv:
         agentic_judge._preflight_backend(agentic_judge.AgenticJudgeConfig(backend="claude_code_exec"))
 
 
+# bwrap mount options that materialize a destination path, and how many
+# arguments each consumes (the destination is always the last consumed arg).
+_BWRAP_MOUNT_ARG_COUNTS = {
+    "--ro-bind": 2,
+    "--ro-bind-try": 2,
+    "--bind": 2,
+    "--bind-try": 2,
+    "--proc": 1,
+    "--dev": 1,
+    "--tmpfs": 1,
+}
+
+
+def _perms_dir_triples(command: list[str]) -> list[tuple[str, str, int]]:
+    """Every ``--perms MODE --dir PATH`` ancestor-creation quad in an argv.
+
+    Returns ``(mode, path, index_of_--perms)`` tuples in argv order.
+    """
+    out: list[tuple[str, str, int]] = []
+    i = 0
+    while i + 3 < len(command):
+        if command[i] == "--perms" and command[i + 2] == "--dir":
+            out.append((command[i + 1], command[i + 3], i))
+            i += 4
+            continue
+        i += 1
+    return out
+
+
+def _bind_destinations_with_index(command: list[str]) -> list[tuple[str, int]]:
+    """Every real bind/mount destination and the index of its option token.
+
+    Skips the ``--perms MODE`` / ``--dir PATH`` ancestor-creation tokens so only
+    genuine mount destinations are returned.
+    """
+    out: list[tuple[str, int]] = []
+    i = 0
+    n = len(command)
+    while i < n:
+        opt = command[i]
+        if opt == "--perms":
+            i += 2
+            continue
+        if opt == "--dir":
+            i += 2
+            continue
+        nargs = _BWRAP_MOUNT_ARG_COUNTS.get(opt)
+        if nargs is None:
+            i += 1
+            continue
+        out.append((command[i + nargs], i))
+        i += nargs + 1
+    return out
+
+
+def _is_strict_ancestor(ancestor: str, path: str) -> bool:
+    return path != ancestor and path.startswith(ancestor.rstrip("/") + "/")
+
+
 class TestArtifactMcpCommandDetails:
+    def test_elevated_launcher_creates_traversable_mountpoint_ancestors(self, tmp_path) -> None:
+        # Critical sandbox fix: under an ELEVATED launcher bwrap runs as root and
+        # auto-creates the intermediate parent dirs of every nested bind
+        # destination as root:root 0700, which the post-setpriv unprivileged uid
+        # cannot traverse (breaking `import skillopt` under /opt and /etc/* runtime
+        # files). The fix explicitly pre-creates those ancestor dirs 0555 so they
+        # stay world-traversable. Applies ONLY when elevated.
+        from skillopt.envs.skilleval.agentic_judge import build_artifact_mcp_command
+
+        evidence = tmp_path / "evidence"
+        scratch = tmp_path / "scratch"
+        evidence.mkdir()
+        scratch.mkdir()
+        elevated = build_artifact_mcp_command(
+            evidence_dir=str(evidence), scratch_dir=str(scratch), sandbox_command=("sudo", "-n", "bwrap"),
+        )
+        quads = [elevated[i:i + 4] for i in range(len(elevated) - 3)]
+        for ancestor in ("/opt", "/opt/skillopt", "/etc"):
+            assert ["--perms", "0555", "--dir", ancestor] in quads
+
+        def _dir_index(ancestor: str) -> int:
+            for i in range(len(elevated) - 3):
+                if elevated[i:i + 4] == ["--perms", "0555", "--dir", ancestor]:
+                    return i
+            raise AssertionError(f"no --perms 0555 --dir {ancestor} in argv")
+
+        # /opt and /opt/skillopt precede the skillopt package bind under them.
+        pkg_bind = elevated.index("/opt/skillopt/skillopt")
+        assert _dir_index("/opt") < pkg_bind
+        assert _dir_index("/opt/skillopt") < pkg_bind
+        # Root-to-leaf: /opt is created before its child /opt/skillopt.
+        assert _dir_index("/opt") < _dir_index("/opt/skillopt")
+        # /etc precedes the first /etc/* bind.
+        etc_bind = min(i for i, tok in enumerate(elevated) if tok.startswith("/etc/"))
+        assert _dir_index("/etc") < etc_bind
+
+        # No bogus dirs: every created ancestor is a strict ancestor of some real
+        # bind destination and is never itself a (leaf) mount destination.
+        binds = _bind_destinations_with_index(elevated)
+        bind_dests = {dest for dest, _ in binds}
+        triples = _perms_dir_triples(elevated)
+        assert triples
+        for mode, ancestor, _idx in triples:
+            assert mode == "0555"
+            assert ancestor != "/"
+            assert ancestor not in bind_dests, f"{ancestor} is a mount destination, not an ancestor dir"
+            assert any(_is_strict_ancestor(ancestor, dest) for dest, _ in binds), f"{ancestor} is a bogus ancestor"
+
+    def test_unprivileged_launcher_has_no_ancestor_dir_tokens(self, tmp_path) -> None:
+        # (b) The unprivileged path must be byte-identical to before the fix: bwrap
+        # runs as the invoking user, so auto-created mountpoint dirs are already
+        # user-owned and traversable. No --perms/--dir ancestor creation is added.
+        from skillopt.envs.skilleval.agentic_judge import build_artifact_mcp_command
+
+        evidence = tmp_path / "evidence"
+        scratch = tmp_path / "scratch"
+        evidence.mkdir()
+        scratch.mkdir()
+        plain = build_artifact_mcp_command(
+            evidence_dir=str(evidence), scratch_dir=str(scratch), sandbox_command=("bwrap",),
+        )
+        assert "--perms" not in plain
+        assert "--dir" not in plain
+
+    def test_elevated_ancestor_dirs_precede_every_bind_under_them(self, tmp_path) -> None:
+        # (c) Ordering invariant: for EVERY real bind destination, all of its
+        # created ancestor --dir tokens appear earlier in the argv, and the
+        # ancestor dirs are themselves emitted root-to-leaf so bwrap never
+        # auto-creates a parent 0700 before its child --dir runs.
+        from skillopt.envs.skilleval.agentic_judge import build_artifact_mcp_command
+
+        evidence = tmp_path / "evidence"
+        scratch = tmp_path / "scratch"
+        evidence.mkdir()
+        scratch.mkdir()
+        elevated = build_artifact_mcp_command(
+            evidence_dir=str(evidence), scratch_dir=str(scratch), sandbox_command=("sudo", "-n", "bwrap"),
+        )
+        triples = _perms_dir_triples(elevated)
+        dir_index = {ancestor: idx for _mode, ancestor, idx in triples}
+        binds = _bind_destinations_with_index(elevated)
+        for dest, bind_idx in binds:
+            for ancestor, anc_idx in dir_index.items():
+                if _is_strict_ancestor(ancestor, dest):
+                    assert anc_idx < bind_idx, f"--dir {ancestor} must precede bind of {dest}"
+        # Ancestor dirs emitted shortest-first (parent before child).
+        for parent, p_idx in dir_index.items():
+            for child, c_idx in dir_index.items():
+                if _is_strict_ancestor(parent, child):
+                    assert p_idx < c_idx, f"--dir {parent} must precede --dir {child}"
+
     def test_elevated_launcher_drops_privileges_and_limits_resources(self, tmp_path) -> None:
         from skillopt.envs.skilleval.agentic_judge import build_artifact_mcp_command
 

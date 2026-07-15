@@ -253,6 +253,81 @@ def _python_runtime_binds() -> list[str]:
     return flags
 
 
+# bwrap mount options that materialize a destination path inside the sandbox,
+# mapped to the number of arguments each consumes; the destination is always the
+# last of those arguments (``--OPT SRC DEST`` -> 2, ``--OPT DEST`` -> 1). Used to
+# recover mount destinations from the assembled flag list so their intermediate
+# ancestor directories can be pre-created (see ``_ancestor_dir_flags``).
+_BWRAP_MOUNT_ARG_COUNTS = {
+    "--ro-bind": 2,
+    "--ro-bind-try": 2,
+    "--bind": 2,
+    "--bind-try": 2,
+    "--proc": 1,
+    "--dev": 1,
+    "--tmpfs": 1,
+}
+
+
+def _mount_destinations(mount_flags: list[str]) -> list[str]:
+    """Recover every mount destination path from an assembled bwrap flag list.
+
+    ``mount_flags`` must contain only mount operations (no ``--setenv``/namespace
+    tokens); an unrecognized or truncated option raises so a future mount kind
+    added without updating :data:`_BWRAP_MOUNT_ARG_COUNTS` fails loudly here (and
+    only on the elevated path) rather than silently dropping an ancestor.
+    """
+    destinations: list[str] = []
+    i = 0
+    n = len(mount_flags)
+    while i < n:
+        option = mount_flags[i]
+        nargs = _BWRAP_MOUNT_ARG_COUNTS.get(option)
+        if nargs is None:
+            raise ValueError(f"unrecognized bwrap mount option while computing sandbox ancestors: {option!r}")
+        if i + nargs >= n:
+            raise ValueError(f"truncated bwrap mount option {option!r} while computing sandbox ancestors")
+        destinations.append(mount_flags[i + nargs])
+        i += nargs + 1
+    return destinations
+
+
+def _ancestor_dir_flags(mount_flags: list[str]) -> list[str]:
+    """``--perms 0555 --dir <ancestor>`` for each intermediate mountpoint parent.
+
+    Under an ELEVATED launcher bwrap runs as root and AUTO-CREATES the
+    intermediate parent directories of every nested bind destination as
+    ``root:root`` mode ``0700``; after the ``setpriv`` drop the unprivileged uid
+    can no longer traverse them, so ``import skillopt`` (under ``/opt``) and the
+    ``/etc/*`` runtime files become unreachable. Explicitly creating each
+    ancestor ``0555`` (root-owned, world traverse+read, no write -- nothing
+    writes to a mountpoint) keeps them traversable; because bwrap only
+    auto-creates a directory it has not already been told to create, the explicit
+    ``--dir`` wins.
+
+    Ancestors are every proper-prefix directory of a mount destination, excluding
+    ``/`` (bwrap creates it ``0755``, already traversable) and any path that is
+    itself an explicit mount destination (a bind materializes its own mountpoint;
+    a file destination like ``/etc/passwd`` must never be turned into a dir).
+    They are emitted shortest-first (root-to-leaf) so a parent is created ``0555``
+    before its child ``--dir`` runs -- otherwise bwrap would auto-create the
+    still-missing parent ``0700``.
+    """
+    destinations = _mount_destinations(mount_flags)
+    dest_set = set(destinations)
+    ancestors: set[str] = set()
+    for dest in destinations:
+        parent = os.path.dirname(dest)
+        while parent and parent != "/":
+            if parent not in dest_set:
+                ancestors.add(parent)
+            parent = os.path.dirname(parent)
+    flags: list[str] = []
+    for ancestor in sorted(ancestors, key=lambda path: (path.count("/"), path)):
+        flags.extend(["--perms", "0555", "--dir", ancestor])
+    return flags
+
+
 def _sandbox_flags(evidence_dir: str, scratch_dir: str, *, elevated: bool) -> list[str]:
     # ``--unshare-user-try`` is CONDITIONAL on launcher elevation, gated by the
     # same predicate (``_is_elevated_launcher``) that gates the setpriv drop, so
@@ -269,7 +344,7 @@ def _sandbox_flags(evidence_dir: str, scratch_dir: str, *, elevated: bool) -> li
     # namespaces stay, network is still isolated, and the setpriv prefix (plus
     # the in-sandbox startup probe) still drops to a non-root identity afterward.
     user_ns_flags = [] if elevated else ["--unshare-user-try"]
-    return [
+    env_flags = [
         # Namespaces: no network, isolated pid/ipc/uts/cgroup, private user ns
         # (the last only for the unprivileged launcher; see above).
         *user_ns_flags,
@@ -290,6 +365,8 @@ def _sandbox_flags(evidence_dir: str, scratch_dir: str, *, elevated: bool) -> li
         "--setenv", "PYTHONPATH", _SKILLOPT_MOUNT_PARENT,
         "--setenv", "PYTHONNOUSERSITE", "1",
         "--setenv", "PYTHONDONTWRITEBYTECODE", "1",
+    ]
+    mount_flags = [
         # Pseudo-filesystems and a private tmp.
         "--proc", "/proc",
         "--dev", "/dev",
@@ -320,6 +397,13 @@ def _sandbox_flags(evidence_dir: str, scratch_dir: str, *, elevated: bool) -> li
         "--ro-bind", evidence_dir, _EVIDENCE_MOUNT,
         "--bind", scratch_dir, _SCRATCH_MOUNT,
     ]
+    # Under an elevated (root) launcher, pre-create the intermediate mountpoint
+    # ancestor dirs 0555 BEFORE the binds so the post-setpriv uid can traverse
+    # them. Unprivileged bwrap runs as the invoking user and its auto-created
+    # dirs are already user-owned, so this block is omitted and the argv stays
+    # byte-identical to before this fix (env_flags + [] + mount_flags).
+    ancestor_flags = _ancestor_dir_flags(mount_flags) if elevated else []
+    return env_flags + ancestor_flags + mount_flags
 
 
 def _resource_limit_prefix(*, timeout: int, max_scratch_bytes: int) -> list[str]:
