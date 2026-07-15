@@ -1421,3 +1421,110 @@ class TestSandboxNetworkAndPathIsolation:
         )
         assert result["score_valid"] is True
         assert str(work) not in json.dumps(captured["request"], ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Task 11 fix: eager startup preflight for explicit `agentic` mode
+# ---------------------------------------------------------------------------
+
+from skillopt.envs.skilleval.inspectors import EvaluationError  # noqa: E402
+
+
+class TestPreflightAgenticJudge:
+    """preflight_agentic_judge fails closed BEFORE any rollout/model spend:
+    backend executable + version query, sandbox usability (reusing
+    _probe_sandbox and its AppArmor hint), Artifact MCP initialization, and
+    LibreOffice/Poppler availability for formats declared by artifact_checks."""
+
+    @staticmethod
+    def _fake_cli(tmp_path, exit_code: int = 0) -> str:
+        script = tmp_path / "fake-judge-cli"
+        script.write_text(f"#!/bin/sh\necho fake-cli 1.2.3\nexit {exit_code}\n", encoding="utf-8")
+        script.chmod(0o755)
+        return str(script)
+
+    def _healthy_backend(self, tmp_path, monkeypatch) -> None:
+        path = self._fake_cli(tmp_path)
+        monkeypatch.setattr(_aj, "get_claude_code_exec_config", lambda: {"path": path})
+
+    def test_missing_backend_executable_fails_before_any_probe(self, tmp_path, monkeypatch) -> None:
+        probes: list = []
+        monkeypatch.setattr(
+            _aj, "get_claude_code_exec_config",
+            lambda: {"path": str(tmp_path / "nonexistent-claude-cli")},
+        )
+        monkeypatch.setattr(_aj, "_probe_sandbox", lambda *a, **k: probes.append(a))
+        with pytest.raises(EvaluationError, match="executable not found"):
+            _aj.preflight_agentic_judge(_aj.AgenticJudgeConfig(mode="agentic"))
+        assert probes == []
+
+    def test_backend_version_query_failure_fails_closed(self, tmp_path, monkeypatch) -> None:
+        path = self._fake_cli(tmp_path, exit_code=3)
+        monkeypatch.setattr(_aj, "get_claude_code_exec_config", lambda: {"path": path})
+        with pytest.raises(EvaluationError, match="version"):
+            _aj.preflight_agentic_judge(_aj.AgenticJudgeConfig(mode="agentic"))
+
+    def test_codex_backend_checks_the_codex_executable(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(
+            _aj, "get_codex_exec_config",
+            lambda: {"path": str(tmp_path / "nonexistent-codex-cli")},
+        )
+        with pytest.raises(EvaluationError, match="nonexistent-codex-cli"):
+            _aj.preflight_agentic_judge(
+                _aj.AgenticJudgeConfig(mode="agentic", backend="codex_exec")
+            )
+
+    def test_healthy_preflight_reuses_probe_and_inits_mcp(self, tmp_path, monkeypatch) -> None:
+        self._healthy_backend(tmp_path, monkeypatch)
+        probes: list = []
+        inits: list = []
+        monkeypatch.setattr(
+            _aj, "_probe_sandbox",
+            lambda config, snapshot, *, rollout_dir: probes.append((snapshot, rollout_dir)),
+        )
+        monkeypatch.setattr(
+            _aj, "_preflight_mcp_init",
+            lambda config, snapshot: inits.append(snapshot),
+        )
+        _aj.preflight_agentic_judge(_aj.AgenticJudgeConfig(mode="agentic"), items=[])
+        assert len(probes) == 1
+        assert len(inits) == 1
+        snapshot, rollout_dir = probes[0]
+        # probed against an ephemeral evidence/scratch pair, never a rollout
+        assert not os.path.exists(rollout_dir)
+        assert snapshot.evidence_dir != snapshot.scratch_dir
+
+    def test_missing_poppler_for_declared_pdf_checks(self, tmp_path, monkeypatch) -> None:
+        self._healthy_backend(tmp_path, monkeypatch)
+        real_which = shutil.which
+        monkeypatch.setattr(
+            _aj.shutil, "which",
+            lambda name: None if name in ("pdfinfo", "pdftoppm", "pdftotext") else real_which(name),
+        )
+        items = [{"id": "t", "artifact_checks": [{"path": "report.pdf"}]}]
+        with pytest.raises(EvaluationError, match="pdf"):
+            _aj.preflight_agentic_judge(_aj.AgenticJudgeConfig(mode="agentic"), items)
+
+    def test_missing_libreoffice_for_declared_office_checks(self, tmp_path, monkeypatch) -> None:
+        self._healthy_backend(tmp_path, monkeypatch)
+        real_which = shutil.which
+        monkeypatch.setattr(
+            _aj.shutil, "which",
+            lambda name: None if name in ("libreoffice", "soffice") else real_which(name),
+        )
+        items = [{"id": "t", "artifact_checks": [{"path": "report.xlsx"}]}]
+        with pytest.raises(EvaluationError, match="LibreOffice"):
+            _aj.preflight_agentic_judge(_aj.AgenticJudgeConfig(mode="agentic"), items)
+
+    def test_text_only_checks_require_no_format_tools(self, tmp_path, monkeypatch) -> None:
+        self._healthy_backend(tmp_path, monkeypatch)
+        monkeypatch.setattr(_aj, "_probe_sandbox", lambda *a, **k: None)
+        monkeypatch.setattr(_aj, "_preflight_mcp_init", lambda *a, **k: None)
+        real_which = shutil.which
+        hidden = {"pdfinfo", "pdftoppm", "pdftotext", "libreoffice", "soffice"}
+        monkeypatch.setattr(
+            _aj.shutil, "which",
+            lambda name: None if name in hidden else real_which(name),
+        )
+        items = [{"id": "t", "artifact_checks": [{"path": "answer.txt"}]}]
+        _aj.preflight_agentic_judge(_aj.AgenticJudgeConfig(mode="agentic"), items)

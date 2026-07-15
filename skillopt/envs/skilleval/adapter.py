@@ -15,6 +15,7 @@ import shlex
 
 from skillopt.datasets.base import BatchSpec
 from skillopt.envs.base import EnvAdapter
+from skillopt.envs.skilleval.agentic_judge import preflight_agentic_judge
 from skillopt.envs.skilleval.bundle import SKILL_MD, normalize_rel_path, split_bundle
 from skillopt.envs.skilleval.contracts import JUDGE_MODES
 from skillopt.envs.skilleval.dataloader import SkillEvalDataLoader
@@ -125,6 +126,18 @@ class SkillEvalAdapter(EnvAdapter):
     def setup(self, cfg: dict) -> None:
         super().setup(cfg)
         self.dataloader.setup(cfg)
+        # Explicit agentic mode validates the whole judge environment eagerly
+        # (backend executable, sandbox usability, MCP init, format tools) so a
+        # misconfiguration fails here, before any rollout/model spend. Auto
+        # mode stays lazy: it validates when the first supported binary task
+        # is encountered (run_agentic_judge's per-task probe).
+        if self.judge_config.mode == "agentic":
+            preflight_agentic_judge(
+                self.judge_config,
+                self.dataloader.train_items
+                + self.dataloader.val_items
+                + self.dataloader.test_items,
+            )
 
     def get_dataloader(self):
         return self.dataloader

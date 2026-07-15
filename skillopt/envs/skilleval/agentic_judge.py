@@ -38,10 +38,15 @@ from skillopt.envs.skilleval.artifacts import (
     verify_evidence_snapshot,
 )
 from skillopt.envs.skilleval.inspectors import (
+    _SUFFIX_KINDS,
     EvaluationError,
     inventory_artifacts,
 )
 from skillopt.envs.skilleval.judge_cache import VerdictCache
+from skillopt.model.backend_config import (
+    get_claude_code_exec_config,
+    get_codex_exec_config,
+)
 from skillopt.envs.skilleval.verdict import (
     parse_verdict,
     run_deterministic_checks,
@@ -490,6 +495,163 @@ def _probe_sandbox(config: AgenticJudgeConfig, snapshot: EvidenceSnapshot, *, ro
         raise EvaluationError(
             f"artifact sandbox boundary probe failed: {detail}. {_APPARMOR_HINT}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Eager startup preflight (explicit `agentic` mode only)
+# ---------------------------------------------------------------------------
+
+_PREFLIGHT_VERSION_TIMEOUT = 30
+_LIBREOFFICE_KINDS = frozenset({"xls", "xlsx", "doc", "docx", "ppt", "pptx"})
+_POPPLER_PDF_TOOLS = ("pdfinfo", "pdftoppm", "pdftotext")
+
+_MCP_INIT_SOURCE = (
+    "from skillopt.envs.skilleval.artifact_mcp import create_server\n"
+    f"create_server({_EVIDENCE_MOUNT!r}, {_SCRATCH_MOUNT!r})\n"
+    "print('SKILLOPT_MCP_INIT_OK')\n"
+)
+
+
+def _preflight_backend(config: AgenticJudgeConfig) -> None:
+    """Verify the selected judge backend executable exists and answers --version."""
+    if config.backend == "claude_code_exec":
+        path = str(get_claude_code_exec_config()["path"])
+    else:
+        path = str(get_codex_exec_config()["path"])
+    resolved = shutil.which(path)
+    if resolved is None:
+        raise EvaluationError(
+            f"agentic judge preflight: backend executable not found: {path!r} "
+            f"(judge backend {config.backend}). Install the CLI or point the judge "
+            "exec path at it before running with judge_mode=agentic."
+        )
+    try:
+        proc = subprocess.run(
+            [resolved, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=_PREFLIGHT_VERSION_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise EvaluationError(
+            "agentic judge preflight: backend executable version query could not "
+            f"run ({resolved!r}): {type(exc).__name__}: {exc}"
+        ) from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:300]
+        raise EvaluationError(
+            "agentic judge preflight: backend executable failed its version query "
+            f"({resolved!r}, exit {proc.returncode}): {detail}"
+        )
+
+
+def _declared_check_kinds(items: list[dict] | None) -> dict[str, str]:
+    """Map supported binary kind -> one example artifact_checks path from *items*."""
+    kinds: dict[str, str] = {}
+    for item in items or []:
+        for check in item.get("artifact_checks") or []:
+            if not isinstance(check, dict):
+                continue
+            path = str(check.get("path") or "")
+            kind = _SUFFIX_KINDS.get(os.path.splitext(path)[1].lower())
+            if kind and kind not in kinds:
+                kinds[kind] = path
+    return kinds
+
+
+def _preflight_format_tools(items: list[dict] | None) -> None:
+    """Require LibreOffice/Poppler only for formats the task set declares."""
+    kinds = _declared_check_kinds(items)
+    missing: list[str] = []
+    office = sorted(set(kinds) & _LIBREOFFICE_KINDS)
+    if office:
+        if not (shutil.which("libreoffice") or shutil.which("soffice")):
+            raise EvaluationError(
+                "agentic judge preflight: LibreOffice (libreoffice/soffice) is not "
+                f"installed but the task set declares {', '.join(office)} checks "
+                f"(e.g. {kinds[office[0]]!r}). Install LibreOffice or remove those checks."
+            )
+        if not shutil.which("pdftoppm"):
+            missing.append(f"poppler pdftoppm (renders {', '.join(office)} pages)")
+    if "pdf" in kinds:
+        absent = [tool for tool in _POPPLER_PDF_TOOLS if not shutil.which(tool)]
+        if absent:
+            missing.append(f"poppler {'/'.join(absent)} for pdf checks (e.g. {kinds['pdf']!r})")
+    if missing:
+        raise EvaluationError(
+            "agentic judge preflight: missing required tools: " + "; ".join(missing)
+            + ". Install them before running with judge_mode=agentic."
+        )
+
+
+def _preflight_mcp_init(config: AgenticJudgeConfig, snapshot: EvidenceSnapshot) -> None:
+    """Initialize the Artifact MCP server inside the real sandbox once."""
+    inner = [sys.executable, "-c", _MCP_INIT_SOURCE]
+    argv = _build_sandbox_argv(
+        evidence_dir=snapshot.evidence_dir,
+        scratch_dir=snapshot.scratch_dir,
+        sandbox_command=config.sandbox_command,
+        inner_command=inner,
+        timeout=config.timeout,
+        max_scratch_bytes=config.max_scratch_bytes,
+    )
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=min(120, config.timeout),
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise EvaluationError(
+            f"agentic judge preflight: Artifact MCP initialization could not run: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if proc.returncode != 0 or "SKILLOPT_MCP_INIT_OK" not in (proc.stdout or ""):
+        detail = ((proc.stderr or proc.stdout or "").strip() or f"exit={proc.returncode}")[:500]
+        raise EvaluationError(
+            f"agentic judge preflight: Artifact MCP failed to initialize inside the sandbox: {detail}"
+        )
+
+
+def preflight_agentic_judge(config: AgenticJudgeConfig, items: list[dict] | None = None) -> None:
+    """Eager fail-closed preflight for explicit ``agentic`` judge mode.
+
+    Runs BEFORE any rollout/model spend: verifies the selected backend
+    executable answers a version query, Bubblewrap usability via the same
+    startup probe the per-task path uses (``_probe_sandbox``, including its
+    Ubuntu AppArmor remediation hint), Artifact MCP initialization inside the
+    sandbox, LibreOffice/Poppler availability for formats declared by the task
+    set's ``artifact_checks``, and that the strict fail-closed policy is
+    expressible for the backend. Raises ``EvaluationError`` on any failure.
+
+    ``auto`` mode must NOT call this: it keeps the lazy behavior of validating
+    when the first supported binary task is encountered (``run_agentic_judge``).
+    """
+    _preflight_backend(config)
+    _preflight_format_tools(items)
+    root = tempfile.mkdtemp(prefix="skillopt-judge-preflight-")
+    try:
+        evidence_dir = os.path.join(root, "evidence")
+        scratch_dir = os.path.join(root, "scratch")
+        os.makedirs(evidence_dir)
+        os.makedirs(scratch_dir)
+        snapshot = EvidenceSnapshot(
+            evidence_dir=evidence_dir, scratch_dir=scratch_dir, tree_hash="", files=()
+        )
+        _probe_sandbox(config, snapshot, rollout_dir=os.path.join(root, "absent-rollout"))
+        _preflight_mcp_init(config, snapshot)
+        # Strict policy support: the fail-closed per-call policy must build for
+        # this backend (unsupported/inexpressible policies raise here).
+        build_backend_policy(
+            config.backend,
+            [sys.executable, "-m", "skillopt.envs.skilleval.artifact_mcp"],
+            root,
+        )
+    finally:
+        _rmtree_quiet(root)
 
 
 # ---------------------------------------------------------------------------
@@ -1020,5 +1182,6 @@ __all__ = [
     "build_artifact_mcp_command",
     "build_backend_policy",
     "build_judge_prompt",
+    "preflight_agentic_judge",
     "run_agentic_judge",
 ]

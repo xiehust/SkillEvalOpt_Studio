@@ -33,8 +33,10 @@ _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+from skillopt.envs.skilleval.agentic_judge import preflight_agentic_judge
 from skillopt.envs.skilleval.contracts import JUDGE_MODES
 from skillopt.envs.skilleval.dataloader import load_tasks
+from skillopt.envs.skilleval.inspectors import EvaluationError
 from skillopt.envs.skilleval.evaluator import (  # noqa: F401 — merge_scores re-exported for tests/importers
     AgenticJudgeConfig,
     artifacts_listing,
@@ -336,6 +338,16 @@ def main() -> None:
 
     judge_config = _build_judge_config(args)
     _configure_backends(args)
+    if judge_config.mode == "agentic":
+        # Explicit agentic mode: preflight the whole judge environment (backend
+        # executable, sandbox usability, MCP init, format tools) BEFORE any
+        # rollout spend. Auto mode stays lazy and validates when the first
+        # supported binary task is encountered.
+        try:
+            preflight_agentic_judge(judge_config, items)
+        except EvaluationError as exc:
+            sys.exit(f"error: agentic judge preflight failed: {exc}")
+        print("[skilleval] agentic judge preflight: ok")
     os.makedirs(args.out_root, exist_ok=True)
 
     print(f"[skilleval] skills: {', '.join(skill['name'] for skill in runtime_skills)}")

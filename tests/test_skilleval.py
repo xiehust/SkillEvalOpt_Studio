@@ -1013,6 +1013,94 @@ class TestJudgeExecCli:
             evaluate_skill.main()
 
 
+class TestAgenticPreflightCli:
+    """Explicit --judge_mode agentic must preflight the judge environment BEFORE
+    any rollout spend; auto mode keeps the lazy per-task validation."""
+
+    @staticmethod
+    def _cli_setup(tmp_path, monkeypatch, judge_mode: str | None):
+        skill = tmp_path / "alpha"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("---\nname: alpha\n---\n# alpha\n", encoding="utf-8")
+        tasks = _write_tasks(tmp_path, [_valid_item()])
+        argv = [
+            "evaluate_skill.py",
+            "--skill", str(skill),
+            "--tasks", tasks,
+            "--out_root", str(tmp_path / "out"),
+            "--workers", "1",
+        ]
+        if judge_mode is not None:
+            argv += ["--judge_mode", judge_mode]
+        monkeypatch.setattr(sys, "argv", argv)
+        monkeypatch.setattr(evaluate_skill, "_configure_backends", lambda _args: None)
+
+    def test_explicit_agentic_broken_backend_stops_before_rollout(self, tmp_path, monkeypatch) -> None:
+        # Real preflight + a fake broken backend executable: the CLI must fail
+        # closed before run_batch (rollout spend) is ever invoked.
+        from skillopt.envs.skilleval import agentic_judge as aj
+
+        self._cli_setup(tmp_path, monkeypatch, "agentic")
+        monkeypatch.setattr(
+            aj, "get_claude_code_exec_config",
+            lambda: {"path": str(tmp_path / "nonexistent-claude-cli")},
+        )
+        rollout_calls: list = []
+        monkeypatch.setattr(
+            evaluate_skill, "run_batch",
+            lambda *a, **k: rollout_calls.append("rollout") or [],
+        )
+        monkeypatch.setattr(
+            evaluate_skill, "evaluate_rollouts",
+            lambda *a, **k: rollout_calls.append("judge") or [],
+        )
+        with pytest.raises(SystemExit, match="preflight"):
+            evaluate_skill.main()
+        assert rollout_calls == []
+
+    def test_explicit_agentic_healthy_preflight_runs_before_rollout(self, tmp_path, monkeypatch) -> None:
+        self._cli_setup(tmp_path, monkeypatch, "agentic")
+        order: list = []
+        monkeypatch.setattr(
+            evaluate_skill, "preflight_agentic_judge",
+            lambda config, items=None: order.append("preflight"),
+        )
+        monkeypatch.setattr(
+            evaluate_skill, "run_batch",
+            lambda items, *a, **k: order.append("rollout") or [
+                {"id": items[0]["id"], "response": "ok", "duration_s": 0.1,
+                 "work_dir": "/nx", "artifacts": []}
+            ],
+        )
+        monkeypatch.setattr(
+            evaluate_skill, "evaluate_rollouts",
+            lambda items, rollouts, **k: [_result(items[0]["id"], 1, 1.0)],
+        )
+        evaluate_skill.main()
+        assert order == ["preflight", "rollout"]
+
+    def test_auto_mode_does_not_preflight_eagerly(self, tmp_path, monkeypatch) -> None:
+        self._cli_setup(tmp_path, monkeypatch, None)  # default judge_mode=auto
+        called: list = []
+        monkeypatch.setattr(
+            evaluate_skill, "preflight_agentic_judge",
+            lambda *a, **k: called.append(a),
+        )
+        monkeypatch.setattr(
+            evaluate_skill, "run_batch",
+            lambda items, *a, **k: [
+                {"id": items[0]["id"], "response": "ok", "duration_s": 0.1,
+                 "work_dir": "/nx", "artifacts": []}
+            ],
+        )
+        monkeypatch.setattr(
+            evaluate_skill, "evaluate_rollouts",
+            lambda items, rollouts, **k: [_result(items[0]["id"], 1, 1.0)],
+        )
+        evaluate_skill.main()
+        assert called == []
+
+
 class TestSkillEvalConfigJudgeDefaults:
     """The YAML judge_* defaults must flatten onto adapter kwargs and reach the
     AgenticJudgeConfig unchanged (no skillopt/config.py mapping needed)."""
@@ -1884,6 +1972,33 @@ class TestSkillEvalAdapter:
         ref = a.build_reference_text(_valid_item())
         assert "rubric" in ref.lower()
         assert "12 month rows" in ref
+
+    def test_agentic_mode_preflights_eagerly_in_setup(self, tmp_path, monkeypatch) -> None:
+        calls = []
+        monkeypatch.setattr(
+            adapter_mod, "preflight_agentic_judge",
+            lambda config, items=None: calls.append((config, list(items or []))),
+        )
+        a = SkillEvalAdapter(
+            split_dir=_make_split_dir(tmp_path), split_mode="split_dir",
+            judge_mode="agentic",
+        )
+        a.setup({})
+        assert len(calls) == 1
+        config, items = calls[0]
+        assert config is a.judge_config
+        # every split's items are visible to the format-tool detection
+        assert len(items) == 4  # 2 train + 1 val + 1 test
+
+    def test_auto_mode_does_not_preflight_in_setup(self, tmp_path, monkeypatch) -> None:
+        calls = []
+        monkeypatch.setattr(
+            adapter_mod, "preflight_agentic_judge",
+            lambda *a, **k: calls.append(a),
+        )
+        a = SkillEvalAdapter(split_dir=_make_split_dir(tmp_path), split_mode="split_dir")
+        a.setup({})
+        assert calls == []
 
     def test_task_types_collected(self, tmp_path) -> None:
         a = self._adapter(tmp_path)
