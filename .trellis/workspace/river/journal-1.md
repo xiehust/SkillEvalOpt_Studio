@@ -137,3 +137,36 @@ Added disjoint Plugin coverage planning, proactive task generation quotas, pre-q
 ### Next Steps
 
 - None - task complete
+
+
+## Session 5: Bootstrap backend development guidelines
+
+**Date**: 2026-07-15
+**Task**: Bootstrap backend development guidelines
+**Branch**: `main`
+
+### Summary
+
+Replaced Trellis backend templates with source-backed architecture, persistence, error handling, logging, and quality contracts; updated the index and completed the bootstrap task.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `c89e261` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
