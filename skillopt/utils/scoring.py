@@ -4,6 +4,20 @@ from __future__ import annotations
 import hashlib
 
 
+class InvalidEvaluationError(RuntimeError):
+    """Raised when infrastructure-invalid rows would enter aggregate scoring."""
+
+
+def _invalid_ids(results: list) -> list[str]:
+    """Detect and collect IDs of rows with score_valid=False."""
+    return [
+        str(r.id if hasattr(r, "id") else (r.get("id", "<unknown>") if isinstance(r, dict) else "<unknown>"))
+        for r in results
+        if (getattr(r, "score_valid", None) if hasattr(r, "score_valid")
+            else (r.get("score_valid") if isinstance(r, dict) else None)) is False
+    ]
+
+
 def compute_score(results: list) -> tuple[float, float]:
     """Compute hard and soft accuracy from a list of episode results.
 
@@ -11,6 +25,12 @@ def compute_score(results: list) -> tuple[float, float]:
     """
     if not results:
         return 0.0, 0.0
+
+    invalid = _invalid_ids(results)
+    if invalid:
+        raise InvalidEvaluationError(
+            f"evaluation contains invalid score rows: {invalid}"
+        )
 
     def _hard(r: object) -> float:
         return float(r.hard if hasattr(r, "hard") else r.get("hard", 0))
