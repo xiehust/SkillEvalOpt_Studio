@@ -1117,6 +1117,58 @@ class TestEvaluateRollouts:
         assert results[0]["score_valid"] is True
         assert results[0]["error"] == "boom"
 
+    def test_score_valid_false_without_error_key_skips_agentic_judge(self, tmp_path, monkeypatch) -> None:
+        # rollout.py's artifact-collection-error path sets score_valid=False
+        # without ever setting "error" -- the row must never reach the
+        # agentic judge (which would stamp score_valid=True and silently
+        # reclassify an infrastructure failure as a scored result).
+        calls = []
+        monkeypatch.setattr(
+            evaluator,
+            "run_agentic_judge",
+            lambda **kwargs: calls.append(kwargs) or {
+                "id": "t1", "hard": 1, "soft": 1.0, "judge_reason": "ok",
+                "judge_mode": "agentic", "judge_status": "valid_pass", "score_valid": True,
+            },
+        )
+        results = evaluator.evaluate_rollouts(
+            [{"id": "t1", "question": "q", "rubric": "r", "judge_mode": "auto",
+              "artifact_checks": [{"path": "report.xlsx"}]}],
+            [{"id": "t1", "response": "done", "work_dir": str(tmp_path), "artifacts": [],
+              "score_valid": False, "artifact_collection_error": "PermissionError: denied"}],
+            state_hash="state",
+            out_root=str(tmp_path / "out"),
+            judge_config=evaluator.AgenticJudgeConfig(),
+        )
+        assert calls == []
+        assert results[0]["score_valid"] is False
+        assert results[0]["hard"] == 0
+        assert results[0]["soft"] == 0.0
+        assert results[0]["judge_status"] == "evaluation_error"
+
+    def test_score_valid_false_without_error_key_skips_chat_judge(self, tmp_path) -> None:
+        calls = []
+
+        def _record_chat_judge(item, response, listing):
+            calls.append(item)
+            return {"id": item["id"], "hard": 1, "soft": 1.0, "judge_reason": "ok", "score_valid": True}
+
+        results = evaluator.evaluate_rollouts(
+            [{"id": "t1", "question": "q", "rubric": "r", "judge_mode": "chat",
+              "_judge_mode_explicit": True, "artifact_checks": []}],
+            [{"id": "t1", "response": "done", "work_dir": str(tmp_path), "artifacts": [],
+              "score_valid": False, "artifact_collection_error": "RuntimeError: boom"}],
+            state_hash="state",
+            out_root=str(tmp_path / "out"),
+            judge_config=None,
+            chat_judge=_record_chat_judge,
+        )
+        assert calls == []
+        assert results[0]["score_valid"] is False
+        assert results[0]["hard"] == 0
+        assert results[0]["soft"] == 0.0
+        assert results[0]["judge_status"] == "evaluation_error"
+
     def test_missing_judge_config_returns_invalid_result_when_agentic_needed(self, tmp_path) -> None:
         results = evaluator.evaluate_rollouts(
             [{"id": "t1", "question": "q", "rubric": "r", "judge_mode": "agentic",

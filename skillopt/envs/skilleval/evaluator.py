@@ -412,13 +412,31 @@ def evaluate_rollouts(
     ``merge_scores`` remains the backward-compatible chat-only wrapper for
     callers that never see binary artifacts; this is the routing-aware entry
     point trainers/CLIs that support the agentic judge should call instead.
+
+    A rollout that already carries ``score_valid=False`` (an infrastructure
+    failure -- e.g. an artifact-collection error, which does not necessarily
+    also set ``error``, see ``rollout.py``) is never routed to either judge:
+    judging it would waste a call and, on the agentic path, would let the
+    judge's own ``score_valid=True`` success stamp silently overwrite the
+    infrastructure failure, turning it into a scored result and defeating the
+    ``require_valid=True`` aggregation gate this feature depends on. Mirrors
+    ``merge_scores``' pre-existing ``score_valid is False`` short-circuit,
+    checked ahead of routing for the same reason.
     """
     if len(items) != len(rollout_results):
         raise ValueError("item/result length mismatch")
     merged = []
     for item, rollout_result in zip(items, rollout_results):
         result = dict(rollout_result)
-        if result.get("error"):
+        if result.get("score_valid") is False:
+            result.update({
+                "hard": 0,
+                "soft": 0.0,
+                "judge_reason": "",
+                "judge_skipped": "invalid_rollout",
+                "judge_status": "evaluation_error",
+            })
+        elif result.get("error"):
             result.update({
                 "hard": 0, "soft": 0.0, "judge_reason": "",
                 "judge_status": "artifact_failure", "score_valid": True,
