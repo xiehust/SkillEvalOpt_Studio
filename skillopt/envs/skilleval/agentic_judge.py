@@ -403,6 +403,21 @@ def _sandbox_flags(evidence_dir: str, scratch_dir: str, *, elevated: bool) -> li
     # dirs are already user-owned, so this block is omitted and the argv stays
     # byte-identical to before this fix (env_flags + [] + mount_flags).
     ancestor_flags = _ancestor_dir_flags(mount_flags) if elevated else []
+    if elevated:
+        # bwrap-as-root creates the /tmp tmpfs root-owned mode 0755, so after
+        # the setpriv drop the unprivileged uid cannot write to it. Python's
+        # tempfile then silently skips the unusable TMPDIR and falls back to
+        # the cwd (= $HOME = /scratch), which the scratch-overlap guard in
+        # inspectors._scratch correctly refuses -- failing every MCP request.
+        # Mount the tmpfs 1777 (sticky, world-writable) like a real /tmp.
+        # Injected after ancestor computation: _mount_destinations parses
+        # mount_flags strictly and must never see a bare --perms token.
+        tmpfs_index = mount_flags.index("--tmpfs")
+        mount_flags = (
+            mount_flags[:tmpfs_index]
+            + ["--perms", "1777"]
+            + mount_flags[tmpfs_index:]
+        )
     return env_flags + ancestor_flags + mount_flags
 
 
@@ -544,6 +559,19 @@ _PROBE_SOURCE = (
     "    fd = open(p, 'w'); fd.close(); os.unlink(p)\n"
     "except OSError as exc:\n"
     "    errors.append('scratch-not-writable:%s' % exc)\n"
+    "import tempfile\n"
+    "try:\n"
+    "    tmp = os.path.realpath(tempfile.gettempdir())\n"
+    "except OSError as exc:\n"
+    "    tmp = ''\n"
+    "    errors.append('tempdir-unusable:%s' % exc)\n"
+    "if tmp == '/scratch' or tmp.startswith('/scratch' + os.sep):\n"
+    "    errors.append('tempdir-overlaps-scratch:%s' % tmp)\n"
+    "elif tmp:\n"
+    "    try:\n"
+    "        handle = tempfile.TemporaryFile(); handle.close()\n"
+    "    except OSError as exc:\n"
+    "        errors.append('tempdir-not-writable:%s' % exc)\n"
     "if rollout and os.path.exists(rollout):\n"
     "    errors.append('rollout-present')\n"
     "try:\n"
@@ -615,6 +643,14 @@ _POPPLER_PDF_TOOLS = ("pdfinfo", "pdftoppm", "pdftotext")
 _MCP_INIT_SOURCE = (
     "from skillopt.envs.skilleval.artifact_mcp import create_server\n"
     f"create_server({_EVIDENCE_MOUNT!r}, {_SCRATCH_MOUNT!r})\n"
+    # Also exercise one real scratch transaction: server construction alone
+    # cannot see per-request failures such as an unwritable in-sandbox tempdir
+    # (tempfile falling back into /scratch trips the overlap guard on every
+    # tool call while create_server still succeeds).
+    "from skillopt.envs.skilleval.inspectors._scratch import scratch_transaction\n"
+    f"with scratch_transaction({_SCRATCH_MOUNT!r}, "
+    "max_bytes=1 << 20, max_entries=64, max_depth=8):\n"
+    "    pass\n"
     "print('SKILLOPT_MCP_INIT_OK')\n"
 )
 

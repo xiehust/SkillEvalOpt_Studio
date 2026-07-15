@@ -1117,6 +1117,41 @@ class TestArtifactMcpCommandDetails:
         )
         assert "setpriv" not in plain
 
+    def test_elevated_launcher_mounts_a_world_writable_tmp(self, tmp_path) -> None:
+        # bwrap-as-root creates the /tmp tmpfs root:root 0755; after the
+        # setpriv drop the unprivileged uid could not write to it, so Python's
+        # tempfile silently fell back to the cwd (= $HOME = /scratch) and the
+        # scratch-overlap guard failed every MCP request. The elevated argv
+        # must mount the tmpfs 1777 like a real /tmp; the unprivileged argv
+        # stays untouched (its tmpfs is already owned by the invoking user).
+        from skillopt.envs.skilleval.agentic_judge import build_artifact_mcp_command
+
+        evidence = tmp_path / "evidence"
+        scratch = tmp_path / "scratch"
+        evidence.mkdir()
+        scratch.mkdir()
+        elevated = build_artifact_mcp_command(
+            evidence_dir=str(evidence), scratch_dir=str(scratch), sandbox_command=("sudo", "-n", "bwrap"),
+        )
+        quads = [elevated[i:i + 4] for i in range(len(elevated) - 3)]
+        assert ["--perms", "1777", "--tmpfs", "/tmp"] in quads
+
+        plain = build_artifact_mcp_command(
+            evidence_dir=str(evidence), scratch_dir=str(scratch), sandbox_command=("bwrap",),
+        )
+        pairs = [plain[i:i + 2] for i in range(len(plain) - 1)]
+        assert ["--tmpfs", "/tmp"] in pairs
+        assert "--perms" not in plain
+
+    def test_mcp_init_preflight_exercises_a_scratch_transaction(self) -> None:
+        # create_server alone cannot see per-request failures such as an
+        # unwritable in-sandbox tempdir; the eager preflight must run one real
+        # scratch transaction so that class fails fast, not as a false zero.
+        from skillopt.envs.skilleval.agentic_judge import _MCP_INIT_SOURCE
+
+        assert "scratch_transaction" in _MCP_INIT_SOURCE
+        assert "create_server" in _MCP_INIT_SOURCE
+
 
 class TestSandboxProbe:
     def _snapshot(self, tmp_path):
@@ -1210,6 +1245,60 @@ class TestSandboxProbe:
             capture_output=True, text=True, timeout=30,
         )
         assert "root-identity" not in (proc.stdout or "")
+
+    def test_probe_source_flags_tempdir_falling_back_into_scratch(self, tmp_path) -> None:
+        # Executes the real _PROBE_SOURCE with tempfile.gettempdir patched to
+        # /scratch from inside the child interpreter, reproducing the elevated
+        # launcher's unwritable-/tmp fallback (tempfile -> cwd = /scratch).
+        # The probe must flag it so the judgment aborts as an infrastructure
+        # EvaluationError instead of scoring a false zero.
+        import subprocess
+        import sys
+
+        from skillopt.envs.skilleval.agentic_judge import _PROBE_SOURCE
+
+        faked = (
+            "import tempfile\ntempfile.gettempdir = lambda: '/scratch'\n"
+            + _PROBE_SOURCE
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", faked, str(tmp_path / "rollout")],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert proc.returncode == 3
+        assert "tempdir-overlaps-scratch:/scratch" in proc.stdout
+
+    def test_probe_source_flags_an_unwritable_tempdir(self, tmp_path) -> None:
+        import subprocess
+        import sys
+
+        from skillopt.envs.skilleval.agentic_judge import _PROBE_SOURCE
+
+        missing = tmp_path / "no-such-tempdir"
+        faked = (
+            f"import tempfile\ntempfile.gettempdir = lambda: {str(missing)!r}\n"
+            + _PROBE_SOURCE
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", faked, str(tmp_path / "rollout")],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert proc.returncode == 3
+        assert "tempdir-not-writable:" in proc.stdout
+
+    def test_probe_source_accepts_a_usable_tempdir(self, tmp_path) -> None:
+        # The tempdir checks never fire under a healthy configuration: a real,
+        # writable tempdir outside /scratch adds no error tokens.
+        import subprocess
+        import sys
+
+        from skillopt.envs.skilleval.agentic_judge import _PROBE_SOURCE
+
+        proc = subprocess.run(
+            [sys.executable, "-c", _PROBE_SOURCE, str(tmp_path / "rollout")],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert "tempdir-" not in (proc.stdout or "")
 
 
 class TestAgenticJudgeOrchestration:
