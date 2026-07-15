@@ -5,6 +5,7 @@ import errno
 import hashlib
 import json
 import os
+import shutil
 import stat
 import struct
 import subprocess
@@ -1352,6 +1353,39 @@ def _remove_directory_at(
     finally:
         os.close(directory_descriptor)
     os.rmdir(name, dir_fd=parent_descriptor)
+
+
+def remove_locked_tree(path: str) -> None:
+    """Best-effort removal of a judge-created tree that may hold a locked
+    evidence snapshot (0o555 directories / 0o444 files).
+
+    ``shutil.rmtree`` cannot unlink entries from a non-writable directory, so a
+    plain quiet rmtree orphans the locked evidence subtree under the system temp
+    dir on every successful judgment. This mirrors the snapshot-creation failure
+    path (``_remove_directory_at``): it reopens each directory by descriptor,
+    restores the write bit before unlinking its children, and never follows a
+    symlink out of the tree. It is best-effort and never raises.
+    """
+    path = os.path.abspath(os.fspath(path))
+    parent = os.path.dirname(path)
+    name = os.path.basename(path)
+    if not name or name in (os.curdir, os.pardir):
+        return
+    try:
+        parent_descriptor = _open_absolute_directory(parent)
+    except OSError:
+        shutil.rmtree(path, ignore_errors=True)
+        return
+    try:
+        _remove_directory_at(parent_descriptor, name)
+    except FileNotFoundError:
+        pass
+    except (ValueError, OSError):
+        # The strict fd-walk refused an unexpected state (e.g. a non-directory
+        # top entry); fall back to a best-effort quiet rmtree.
+        shutil.rmtree(path, ignore_errors=True)
+    finally:
+        os.close(parent_descriptor)
 
 
 def _open_created_directory(parent_descriptor: int, name: str, mode: int) -> int:

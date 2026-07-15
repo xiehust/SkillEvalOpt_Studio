@@ -35,6 +35,7 @@ from typing import Any, Sequence
 from skillopt.envs.skilleval.artifacts import (
     EvidenceSnapshot,
     create_evidence_snapshot,
+    remove_locked_tree,
     verify_evidence_snapshot,
 )
 from skillopt.envs.skilleval.inspectors import (
@@ -1033,7 +1034,9 @@ def _run_agentic_judge_inner(
             snapshot=snapshot,
         )
     finally:
-        _rmtree_quiet(judge_evidence_root)
+        # The snapshot locks its evidence tree 0o555/0o444; a plain rmtree
+        # cannot unlink from those dirs, so use the chmod-restoring remover.
+        remove_locked_tree(judge_evidence_root)
 
 
 def _judge_with_snapshot(

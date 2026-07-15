@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 
 import pytest
 
@@ -677,6 +678,67 @@ _VALID_RUBRIC_VERDICT = json.dumps({
 
 def _rubric_task(task_id: str = "task") -> dict:
     return {"id": task_id, "question": "q", "rubric": "r", "artifact_checks": []}
+
+
+class TestEvidenceSnapshotCleanup:
+    """The orchestrator locks the evidence snapshot 0o555/0o444 for the judge;
+    it must still be fully removed from the system temp dir on every exit path.
+    A plain ``shutil.rmtree(ignore_errors=True)`` cannot unlink from those
+    non-writable directories, so it silently orphaned up to max_evidence_bytes
+    per successful judgment."""
+
+    def _run(self, tmp_path, monkeypatch, *, worker):
+        from skillopt.envs.skilleval import agentic_judge
+        from skillopt.envs.skilleval import artifacts as artifacts_mod
+
+        work = tmp_path / "work"
+        work.mkdir()
+        before = artifacts_mod.build_manifest(str(work))
+        (work / "report.txt").write_text("hello evidence", encoding="utf-8")
+        outputs = artifacts_mod.diff_manifests(
+            before, artifacts_mod.build_manifest(str(work))
+        )
+
+        created: list[str] = []
+        real_mkdtemp = agentic_judge.tempfile.mkdtemp
+
+        def tracking_mkdtemp(*args, **kwargs):
+            path = real_mkdtemp(*args, **kwargs)
+            if "skillopt-judge-evidence-" in os.path.basename(path):
+                created.append(path)
+            return path
+
+        monkeypatch.setattr(agentic_judge.tempfile, "mkdtemp", tracking_mkdtemp)
+        monkeypatch.setattr(agentic_judge, "_probe_sandbox", lambda *a, **k: None)
+        monkeypatch.setattr(agentic_judge, "_run_worker", worker)
+
+        result = agentic_judge.run_agentic_judge(
+            item={"id": "task", "question": "q", "rubric": "r", "artifact_checks": []},
+            rollout_result={"work_dir": str(work), "artifacts": outputs},
+            state_hash="state",
+            out_root=str(tmp_path / "out"),
+            config=agentic_judge.AgenticJudgeConfig(),
+        )
+        return result, created
+
+    def test_locked_evidence_snapshot_is_removed_after_success(self, tmp_path, monkeypatch) -> None:
+        result, created = self._run(
+            tmp_path, monkeypatch, worker=lambda *a, **k: _VALID_RUBRIC_VERDICT
+        )
+        assert result["score_valid"] is True
+        assert created, "expected a judge evidence snapshot to be created"
+        for path in created:
+            assert not os.path.exists(path), f"leaked locked evidence snapshot: {path}"
+
+    def test_locked_evidence_snapshot_is_removed_after_failure(self, tmp_path, monkeypatch) -> None:
+        def boom(*args, **kwargs):
+            raise RuntimeError("judge worker exploded")
+
+        result, created = self._run(tmp_path, monkeypatch, worker=boom)
+        assert result["score_valid"] is False
+        assert created, "expected a judge evidence snapshot to be created"
+        for path in created:
+            assert not os.path.exists(path), f"leaked locked evidence snapshot: {path}"
 
 
 class TestAgenticJudgeConfigValidation:
