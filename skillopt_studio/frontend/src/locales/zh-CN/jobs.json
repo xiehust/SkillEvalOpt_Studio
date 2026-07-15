@@ -122,6 +122,8 @@
     "yes": "是",
     "no": "否",
     "selectedSkills": "定向 Skill",
+    "excludedFailureCount": "排除失败",
+    "excludedFailures": "未参与训练的失败任务",
     "noSteps": "还没有完成的步骤。",
     "skillDiffTitle": "技能变化(seed → best)",
     "pluginDiffTitle": "Plugin Skill 变化(seed → best)",

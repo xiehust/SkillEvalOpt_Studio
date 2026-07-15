@@ -122,6 +122,8 @@
     "yes": "Yes",
     "no": "No",
     "selectedSkills": "Directed Skills",
+    "excludedFailureCount": "Excluded failures",
+    "excludedFailures": "Failures excluded from training",
     "noSteps": "No completed steps yet.",
     "skillDiffTitle": "Skill diff (seed → best)",
     "pluginDiffTitle": "Plugin Skill diffs (seed → best)",

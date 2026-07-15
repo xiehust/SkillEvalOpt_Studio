@@ -23,6 +23,7 @@ from skillopt.datasets.base import (
     _compute_weighted_counts,
     _load_json_or_jsonl,
 )
+from skillopt.envs.skilleval.coverage import plan_disjoint_plugin_coverage
 from skillopt.envs.skilleval.plugin import normalize_plugin_tasks
 
 _REQUIRED_FIELDS = ("id", "question", "rubric")
@@ -151,21 +152,25 @@ class SkillEvalDataLoader(SplitDataLoader):
             cfg.get("plugin_skill_names"),
             "plugin_skill_names",
         )
+        self.required_training_skills = self._normalize_skill_names(
+            cfg.get("required_training_skills"),
+            "required_training_skills",
+        )
         self.required_validation_skills = self._normalize_skill_names(
             cfg.get("required_validation_skills"),
             "required_validation_skills",
         )
         installed = set(self.plugin_skill_names)
-        unknown = [
-            name
-            for name in self.required_validation_skills
-            if name not in installed
-        ]
-        if unknown:
-            raise ValueError(
-                "required_validation_skills must be installed Plugin Skills: "
-                f"{unknown}"
-            )
+        for key, names in (
+            ("required_training_skills", self.required_training_skills),
+            ("required_validation_skills", self.required_validation_skills),
+        ):
+            unknown = [name for name in names if name not in installed]
+            if unknown:
+                raise ValueError(
+                    f"{key} must be installed Plugin Skills: {unknown}"
+                )
+        self._minimum_training_count = 0
         self._minimum_validation_count = 0
         super().setup(cfg)
 
@@ -204,82 +209,52 @@ class SkillEvalDataLoader(SplitDataLoader):
         counts: tuple[int, int, int],
         ratio: tuple[int, int, int],
     ) -> tuple[list[dict], list[dict], list[dict]]:
-        required_names = self.required_validation_skills
-        if not required_names:
+        required_training = self.required_training_skills
+        required_validation = self.required_validation_skills
+        if not required_training and not required_validation:
             return super()._partition_ratio_items(shuffled, counts, ratio)
 
-        required = set(required_names)
-        coverage = [
-            {
-                name
-                for name in item.get("target_skills", [])
-                if isinstance(name, str) and name in required
-            }
-            for item in shuffled
-        ]
-        covered = {name for targets in coverage for name in targets}
-        missing = [name for name in required_names if name not in covered]
-        if missing:
-            raise ValueError(
-                "Plugin task set cannot cover every trainable Skill; "
-                f"missing source coverage for: {missing}"
-            )
+        del counts
+        coverage_plan = plan_disjoint_plugin_coverage(
+            shuffled,
+            required_training,
+            required_validation,
+        )
+        training_indices = list(coverage_plan.training_indices)
+        validation_indices = list(coverage_plan.validation_indices)
+        unassigned = list(coverage_plan.remaining_indices)
 
-        selected: list[int] = []
-        selected_set: set[int] = set()
-        uncovered = set(required)
-        while uncovered:
-            best_index = -1
-            best_gain: set[str] = set()
-            for index, targets in enumerate(coverage):
-                if index in selected_set:
-                    continue
-                gain = targets & uncovered
-                if len(gain) > len(best_gain):
-                    best_index = index
-                    best_gain = gain
-            if best_index < 0:
-                raise RuntimeError(
-                    "coverage selection stalled after source coverage validation"
-                )
-            selected.append(best_index)
-            selected_set.add(best_index)
-            uncovered -= best_gain
+        self._minimum_training_count = len(training_indices)
+        self._minimum_validation_count = len(validation_indices)
+        minimum_total = (
+            self._minimum_training_count
+            + self._minimum_validation_count
+            + 1
+        )
+        extra_total = len(shuffled) - minimum_total
+        extra_train, extra_val, _extra_test = _compute_weighted_counts(
+            extra_total,
+            ratio,
+        )
 
-        self._minimum_validation_count = len(selected)
-        val_n = max(counts[1], self._minimum_validation_count)
-        if val_n > len(shuffled) - 2:
-            raise ValueError(
-                "Plugin ratio split cannot keep train and test non-empty: "
-                f"validation needs {self._minimum_validation_count} tasks to cover "
-                f"{list(required_names)}, but the source has {len(shuffled)} tasks"
-            )
+        training_indices.extend(unassigned[:extra_train])
+        cursor = extra_train
+        validation_indices.extend(unassigned[cursor: cursor + extra_val])
+        cursor += extra_val
+        test_indices = unassigned[cursor:]
 
-        for index in range(len(shuffled)):
-            if len(selected) >= val_n:
-                break
-            if index not in selected_set:
-                selected.append(index)
-                selected_set.add(index)
-
-        val_items = [shuffled[index] for index in selected]
-        remaining = [
-            item for index, item in enumerate(shuffled) if index not in selected_set
-        ]
-        train_n = _compute_weighted_counts(
-            len(remaining),
-            (ratio[0], ratio[2]),
-        )[0]
-        train_n = max(1, min(len(remaining) - 1, train_n))
-        train_items = remaining[:train_n]
-        test_items = remaining[train_n:]
+        train_items = [shuffled[index] for index in training_indices]
+        val_items = [shuffled[index] for index in validation_indices]
+        test_items = [shuffled[index] for index in test_indices]
         return train_items, val_items, test_items
 
     def _ratio_split_manifest(self) -> dict:
-        if not self.required_validation_skills:
+        if not self.required_training_skills and not self.required_validation_skills:
             return {}
         return {
             "coverage_aware": True,
+            "required_training_skills": list(self.required_training_skills),
             "required_validation_skills": list(self.required_validation_skills),
+            "minimum_training_count": self._minimum_training_count,
             "minimum_validation_count": self._minimum_validation_count,
         }

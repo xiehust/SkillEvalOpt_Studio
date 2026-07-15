@@ -12,6 +12,7 @@ scripts/train.py actually accepts.
 """
 from __future__ import annotations
 
+import random
 import re
 import shlex
 import shutil
@@ -21,12 +22,25 @@ from pathlib import Path
 import yaml
 
 from skillopt.config import load_config as load_structured_config
-from skillopt.envs.skilleval.plugin import collect_plugin_state
+from skillopt.envs.skilleval.coverage import (
+    PLUGIN_MIN_TASKS_PER_SKILL,
+    minimum_plugin_task_count,
+    plan_disjoint_plugin_coverage,
+    target_skill_counts,
+)
+from skillopt.envs.skilleval.plugin import (
+    collect_plugin_state,
+    normalize_plugin_tasks,
+)
 from skillopt.model.common import default_model_for_backend
 
 from skillopt_studio import skill_sources, tasksets
 from skillopt_studio.config import StudioConfig
-from skillopt_studio.models import SkillInfo
+from skillopt_studio.models import (
+    PluginCoverageReport,
+    PluginSkillCoverage,
+    SkillInfo,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -177,6 +191,142 @@ def _resolve_skill_selection(config: StudioConfig, params: dict) -> list[SkillIn
     return skills
 
 
+def _resolve_trainable_plugin_skills(
+    params: dict,
+    skills: list[SkillInfo],
+) -> list[SkillInfo]:
+    raw_trainable_ids = params.get("trainable_skill_ids")
+    if raw_trainable_ids is None:
+        trainable_ids = [item.id for item in skills]
+    elif not isinstance(raw_trainable_ids, list):
+        raise ValueError("trainable_skill_ids must be a list")
+    elif any(
+        not isinstance(skill_id, str) or not skill_id
+        for skill_id in raw_trainable_ids
+    ):
+        raise ValueError("trainable_skill_ids must contain non-empty strings")
+    else:
+        trainable_ids = list(dict.fromkeys(raw_trainable_ids))
+    selected_by_id = {item.id: item for item in skills}
+    unknown_trainable = sorted(set(trainable_ids) - set(selected_by_id))
+    if unknown_trainable:
+        raise ValueError(
+            f"trainable_skill_ids must be selected Plugin skills: {unknown_trainable}"
+        )
+    if not trainable_ids:
+        raise ValueError("select at least one trainable Plugin Skill")
+    return [selected_by_id[skill_id] for skill_id in trainable_ids]
+
+
+def analyze_plugin_training_coverage(
+    config: StudioConfig,
+    params: dict,
+) -> PluginCoverageReport:
+    """Analyze a task set against the currently selected trainable Skills."""
+    plugin_params = dict(params)
+    plugin_params["target_mode"] = "plugin"
+    skills = _resolve_skill_selection(config, plugin_params)
+    trainable_skills = _resolve_trainable_plugin_skills(plugin_params, skills)
+    plugin_state = collect_plugin_state([item.path for item in skills])
+    runtime_names_by_id = dict(
+        zip((item.id for item in skills), plugin_state.names, strict=True)
+    )
+    trainable_names = [
+        runtime_names_by_id[skill.id] for skill in trainable_skills
+    ]
+
+    taskset_id = str(params.get("taskset_id", ""))
+    taskset = tasksets.get_taskset(config, taskset_id)
+    if taskset is None:
+        raise ValueError(f"task set {taskset_id!r} not found")
+    tasks_by_split = tasksets.get_taskset_tasks(config, taskset_id)
+    all_items = [
+        item
+        for split_items in tasks_by_split.values()
+        for item in split_items
+    ]
+    normalize_plugin_tasks(all_items, set(plugin_state.names))
+
+    generation_minimum = minimum_plugin_task_count(len(trainable_skills))
+    reasons: list[str] = []
+    skill_rows: list[PluginSkillCoverage] = []
+    if taskset.mode == "single":
+        source_items = list(tasks_by_split.get("tasks", []))
+        split_seed = int(
+            load_structured_config(str(TRAIN_BASE_CONFIG))["env"].get(
+                "split_seed",
+                42,
+            )
+        )
+        random.Random(split_seed).shuffle(source_items)
+        counts = target_skill_counts(source_items, trainable_names)
+        try:
+            plan_disjoint_plugin_coverage(
+                source_items,
+                trainable_names,
+                trainable_names,
+            )
+        except ValueError as exc:
+            reasons.append(str(exc))
+        for skill in trainable_skills:
+            runtime_name = runtime_names_by_id[skill.id]
+            skill_rows.append(
+                PluginSkillCoverage(
+                    skill_id=skill.id,
+                    skill_name=runtime_name,
+                    count=counts[runtime_name],
+                    required=PLUGIN_MIN_TASKS_PER_SKILL,
+                )
+            )
+    else:
+        train_items = tasks_by_split.get("train", [])
+        validation_items = tasks_by_split.get("val", [])
+        source_counts = target_skill_counts(all_items, trainable_names)
+        train_counts = target_skill_counts(train_items, trainable_names)
+        validation_counts = target_skill_counts(
+            validation_items,
+            trainable_names,
+        )
+        missing_train = [
+            name for name in trainable_names if train_counts[name] < 1
+        ]
+        missing_validation = [
+            name for name in trainable_names if validation_counts[name] < 1
+        ]
+        if missing_train:
+            reasons.append(
+                "training tasks must target every trainable Plugin Skill; "
+                f"missing coverage for: {missing_train}"
+            )
+        if missing_validation:
+            reasons.append(
+                "validation tasks must target every trainable Plugin Skill; "
+                f"missing coverage for: {missing_validation}"
+            )
+        for skill in trainable_skills:
+            runtime_name = runtime_names_by_id[skill.id]
+            skill_rows.append(
+                PluginSkillCoverage(
+                    skill_id=skill.id,
+                    skill_name=runtime_name,
+                    count=source_counts[runtime_name],
+                    required=PLUGIN_MIN_TASKS_PER_SKILL,
+                    train_count=train_counts[runtime_name],
+                    validation_count=validation_counts[runtime_name],
+                )
+            )
+
+    return PluginCoverageReport(
+        valid=not reasons,
+        mode=taskset.mode,
+        total_count=len(all_items),
+        generation_minimum_count=generation_minimum,
+        minimum_tasks_per_skill=PLUGIN_MIN_TASKS_PER_SKILL,
+        skills=skill_rows,
+        reasons=reasons,
+    )
+
+
 def build_eval_command(config: StudioConfig, params: dict, job_dir: Path) -> list[str]:
     """argv for scripts/evaluate_skill.py; output goes to <job_dir>/out."""
     _require_script(EVAL_SCRIPT)
@@ -216,6 +366,12 @@ def build_taskgen_command(config: StudioConfig, params: dict, job_dir: Path) -> 
     target_backend = _resolve_target_backend(params)
 
     count = _validated_int(params, "count")
+    effective_count = count if count is not None else 5
+    if len(skills) > 1:
+        effective_count = max(
+            effective_count,
+            minimum_plugin_task_count(len(skills)),
+        )
     argv = [
         PYTHON, str(GEN_SCRIPT),
     ]
@@ -223,9 +379,11 @@ def build_taskgen_command(config: StudioConfig, params: dict, job_dir: Path) -> 
         argv += ["--skill", skill.path]
     argv += [
         "--backend", target_backend,
-        "--count", str(count if count is not None else 5),
+        "--count", str(effective_count),
         "--out_root", str(job_dir / "out"),
     ]
+    if len(skills) > 1:
+        argv += ["--min-tasks-per-skill", str(PLUGIN_MIN_TASKS_PER_SKILL)]
     if params.get("model"):
         argv += ["--model", str(params["model"])]
     if params.get("guidance"):
@@ -307,24 +465,7 @@ def build_train_command(config: StudioConfig, params: dict, job_dir: Path) -> li
         cfg["env"].pop("skill_init", None)
         cfg["env"].pop("skill_dir", None)
         cfg["env"].pop("trainable_files", None)
-        raw_trainable_ids = params.get("trainable_skill_ids")
-        if raw_trainable_ids is None:
-            trainable_ids = [item.id for item in skills]
-        elif not isinstance(raw_trainable_ids, list):
-            raise ValueError("trainable_skill_ids must be a list")
-        elif any(not isinstance(skill_id, str) or not skill_id for skill_id in raw_trainable_ids):
-            raise ValueError("trainable_skill_ids must contain non-empty strings")
-        else:
-            trainable_ids = list(dict.fromkeys(raw_trainable_ids))
-        selected_by_id = {item.id: item for item in skills}
-        unknown_trainable = sorted(set(trainable_ids) - set(selected_by_id))
-        if unknown_trainable:
-            raise ValueError(
-                f"trainable_skill_ids must be selected Plugin skills: {unknown_trainable}"
-            )
-        if not trainable_ids:
-            raise ValueError("select at least one trainable Plugin Skill")
-        trainable_skills = [selected_by_id[skill_id] for skill_id in trainable_ids]
+        trainable_skills = _resolve_trainable_plugin_skills(params, skills)
         max_skills = _validated_int(params, "max_skills_per_candidate")
         if max_skills is not None:
             if max_skills > len(trainable_skills):
@@ -366,6 +507,10 @@ def build_train_command(config: StudioConfig, params: dict, job_dir: Path) -> li
         cfg["env"].pop("split_dir", None)
     if params.get("eval_test") is not None:
         cfg["evaluation"]["eval_test"] = bool(params["eval_test"])
+    if plugin_mode:
+        coverage_report = analyze_plugin_training_coverage(config, params)
+        if not coverage_report.valid:
+            raise ValueError("; ".join(coverage_report.reasons))
     for cfg_key in ("workers", "timeout", "limit"):
         value = _validated_int(params, cfg_key)
         if value is not None:

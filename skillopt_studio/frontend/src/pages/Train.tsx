@@ -1,7 +1,15 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import { api, ApiError, BackendStatus, SkillInfo, TaskSetInfo } from "../api";
+import {
+  api,
+  ApiError,
+  BackendStatus,
+  PluginCoverageReport,
+  PluginCoverageRequest,
+  SkillInfo,
+  TaskSetInfo,
+} from "../api";
 import { buildPluginGroups, filterPluginGroups } from "../components/pluginGroups";
 import { BackendSelect, Card, ErrorBanner, Mono, PageHeader, SourceFilterChips, SourceTag, Spinner } from "../components/ui";
 
@@ -34,12 +42,16 @@ export default function Train() {
   const [targetBackend, setTargetBackend] = useState("claude_code_exec");
   const [backends, setBackends] = useState<BackendStatus[] | null>(null);
   const [targetModel, setTargetModel] = useState("global.anthropic.claude-opus-4-8");
-  const [optimizerModel, setOptimizerModel] = useState("openai.gpt-5.5");
+  const [optimizerModel, setOptimizerModel] = useState("openai.gpt-5.6-sol");
   const [workers, setWorkers] = useState(3);
   const [timeout_, setTimeout_] = useState(900);
 
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [coverageReport, setCoverageReport] = useState<PluginCoverageReport | null>(null);
+  const [coverageReportKey, setCoverageReportKey] = useState("");
+  const [coverageLoading, setCoverageLoading] = useState(false);
+  const [coverageError, setCoverageError] = useState<string | null>(null);
 
   useEffect(() => {
     Promise.all([api.skills(), api.tasksets()])
@@ -98,6 +110,73 @@ export default function Train() {
 
   const selectedTaskset = tasksets?.find((taskset) => taskset.id === tasksetId);
   const selectedSkill = skills?.find((skill) => skill.id === skillId);
+  const coverageRequest = useMemo<PluginCoverageRequest | null>(() => {
+    if (
+      targetMode !== "plugin"
+      || !selectedPlugin
+      || pluginSkillIds.length < 2
+      || trainablePluginSkillIds.length < 1
+      || !tasksetId
+    ) {
+      return null;
+    }
+    return {
+      skill_ids: pluginSkillIds,
+      trainable_skill_ids: trainablePluginSkillIds,
+      plugin: selectedPlugin.name,
+      split_ratio: splitRatio,
+    };
+  }, [
+    pluginSkillIds,
+    selectedPlugin,
+    splitRatio,
+    targetMode,
+    tasksetId,
+    trainablePluginSkillIds,
+  ]);
+  const coverageKey = coverageRequest
+    ? JSON.stringify([tasksetId, coverageRequest])
+    : "";
+  const coverageIsCurrent = coverageKey !== "" && coverageReportKey === coverageKey;
+  const coverageBlocked = Boolean(
+    coverageRequest
+    && (
+      !coverageIsCurrent
+      || coverageLoading
+      || coverageError
+      || !coverageReport?.valid
+    ),
+  );
+
+  useEffect(() => {
+    let active = true;
+    setCoverageReport(null);
+    setCoverageError(null);
+    if (!coverageRequest) {
+      setCoverageReportKey("");
+      setCoverageLoading(false);
+      return () => {
+        active = false;
+      };
+    }
+
+    setCoverageReportKey(coverageKey);
+    setCoverageLoading(true);
+    api.pluginCoverage(tasksetId, coverageRequest)
+      .then((report) => {
+        if (!active) return;
+        setCoverageReport(report);
+        setCoverageLoading(false);
+      })
+      .catch((err) => {
+        if (!active) return;
+        setCoverageError(err instanceof ApiError ? err.message : String(err));
+        setCoverageLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [coverageKey, coverageRequest, tasksetId]);
 
   const toggleTrainable = (file: string) => {
     setTrainableFiles((current) =>
@@ -166,6 +245,14 @@ export default function Train() {
     }
     if (selectedTaskset?.mode === "single" && !/^[1-9]\d*:[1-9]\d*:[1-9]\d*$/.test(splitRatio)) {
       setFormError(t("train.errSplitRatio"));
+      return;
+    }
+    if (coverageRequest && coverageBlocked) {
+      setFormError(
+        coverageError
+        ?? coverageReport?.reasons.join("; ")
+        ?? t("train.coveragePending"),
+      );
       return;
     }
     setFormError(null);
@@ -445,6 +532,73 @@ export default function Train() {
                 </p>
               </div>
             )}
+            {coverageRequest && (
+              <div
+                className="mt-4 border border-line bg-panel2/40 px-3 py-3"
+                data-testid="plugin-coverage-report"
+              >
+                {!coverageIsCurrent || coverageLoading ? (
+                  <p className="text-sm text-muted" data-testid="plugin-coverage-loading">
+                    {t("train.coverageLoading")}
+                  </p>
+                ) : coverageError ? (
+                  <p className="text-sm text-red-400 break-words">
+                    {t("train.coverageCheckFailed", { reason: coverageError })}
+                  </p>
+                ) : coverageReport ? (
+                  <div className="space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span
+                        className={coverageReport.valid ? "text-sm text-green-400" : "text-sm text-red-400"}
+                        data-testid="plugin-coverage-status"
+                      >
+                        {coverageReport.valid
+                          ? t("train.coverageReady")
+                          : t("train.coverageBlocked")}
+                      </span>
+                      <span className="text-xs text-muted">
+                        {t("train.coverageTotal", { count: coverageReport.total_count })}
+                      </span>
+                    </div>
+                    <div className="grid gap-x-5 gap-y-2 md:grid-cols-2">
+                      {coverageReport.skills.map((skill) => (
+                        <div
+                          key={skill.skill_id}
+                          className="min-w-0 border-t border-line/70 pt-2"
+                          data-coverage-skill={skill.skill_name}
+                        >
+                          <Mono className="block truncate text-xs text-text">
+                            {skill.skill_name}
+                          </Mono>
+                          {coverageReport.mode === "single" ? (
+                            <span className="text-xs text-muted">
+                              {t("train.coverageSourceCount", {
+                                count: skill.count,
+                                required: skill.required,
+                              })}
+                            </span>
+                          ) : (
+                            <span className="text-xs text-muted">
+                              {t("train.coverageSplitCount", {
+                                train: skill.train_count ?? 0,
+                                validation: skill.validation_count ?? 0,
+                              })}
+                            </span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                    {coverageReport.reasons.length > 0 && (
+                      <ul className="space-y-1 text-xs text-red-300">
+                        {coverageReport.reasons.map((reason) => (
+                          <li key={reason} className="break-words">{reason}</li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                ) : null}
+              </div>
+            )}
           </Card>
 
           <Card title={t("train.trainParamsTitle")}>
@@ -559,7 +713,12 @@ export default function Train() {
             </div>
           )}
 
-          <button type="submit" className="btn-primary" disabled={submitting} data-testid="train-submit">
+          <button
+            type="submit"
+            className="btn-primary"
+            disabled={submitting || coverageBlocked}
+            data-testid="train-submit"
+          >
             {submitting ? t("picker.creatingJob") : `↻ ${t("common:actions.train")}`}
           </button>
         </form>

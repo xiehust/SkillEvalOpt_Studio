@@ -68,6 +68,12 @@ def parse_args() -> argparse.Namespace:
                         "(codex_exec: the codex CLI's own configured default)")
     p.add_argument("--count", type=int, default=5,
                    help="Number of tasks to generate")
+    p.add_argument(
+        "--min-tasks-per-skill",
+        type=int,
+        default=1,
+        help="Minimum distinct generated tasks targeting each Skill in multi-skill mode",
+    )
     p.add_argument("--guidance", type=str, default="",
                    help="Optional free-text guidance folded into the generation prompt")
     p.add_argument("--timeout", type=int, default=900,
@@ -155,11 +161,18 @@ def build_multi_skill_prompt(
     count: int,
     guidance: str = "",
     feedback: str | None = None,
+    min_tasks_per_skill: int = 1,
 ) -> str:
     """Unified generation prompt for multiple named skills."""
     if len(skills) < 2:
         raise ValueError("build_multi_skill_prompt requires at least two skills")
-    return _build_prompt(skills, count, guidance, feedback)
+    return _build_prompt(
+        skills,
+        count,
+        guidance,
+        feedback,
+        min_tasks_per_skill=min_tasks_per_skill,
+    )
 
 
 def _build_prompt(
@@ -167,9 +180,12 @@ def _build_prompt(
     count: int,
     guidance: str,
     feedback: str | None,
+    *,
+    min_tasks_per_skill: int = 1,
 ) -> str:
     """Generation prompt implementation shared by single and multi-skill modes."""
     multi = len(skills) > 1
+    task_word = "task" if min_tasks_per_skill == 1 else "tasks"
     per_skill_budget = min(
         MAX_SKILL_CHARS,
         max(2000, MAX_TOTAL_SKILL_CHARS // max(1, len(skills))),
@@ -214,8 +230,8 @@ def _build_prompt(
             else "this skill actually follows it — cover the skill's core workflow plus edge cases. "
         )
         + (
-            "When the requested count is at least the number of skills, every skill must be "
-            "covered by at least one task. "
+            f"Every skill must appear in target_skills for at least "
+            f"{min_tasks_per_skill} distinct {task_word}. "
             if multi
             else ""
         )
@@ -267,6 +283,7 @@ def validate_generated_tasks(
     tasks: list[dict],
     requested_count: int,
     skills: list[SkillDocument],
+    min_tasks_per_skill: int = 1,
 ) -> None:
     if len(tasks) != requested_count:
         raise ValueError(
@@ -276,7 +293,7 @@ def validate_generated_tasks(
         return
 
     allowed = {skill.name for skill in skills}
-    covered: set[str] = set()
+    coverage_counts = {name: 0 for name in allowed}
     for index, task in enumerate(tasks):
         targets = task.get("target_skills")
         if not isinstance(targets, list) or not targets:
@@ -301,12 +318,22 @@ def validate_generated_tasks(
                 f"item #{index} (id={task.get('id')!r}): 'task_type' is required "
                 "in multi-skill mode"
             )
-        covered.update(targets)
+        for target in set(targets):
+            coverage_counts[target] += 1
 
-    if requested_count >= len(skills) and covered != allowed:
+    insufficient = [
+        name
+        for name in sorted(allowed)
+        if coverage_counts[name] < min_tasks_per_skill
+    ]
+    if insufficient:
+        details = ", ".join(
+            f"{name}={coverage_counts[name]}/{min_tasks_per_skill}"
+            for name in insufficient
+        )
         raise ValueError(
-            "multi-skill task set does not cover every skill; missing "
-            f"{sorted(allowed - covered)}"
+            "multi-skill task set has insufficient per-Skill coverage: "
+            f"{details}"
         )
 
 
@@ -329,6 +356,11 @@ def main() -> None:
     args = parse_args()
     if args.count < 1:
         sys.exit(f"error: --count must be >= 1, got {args.count}")
+    if args.min_tasks_per_skill < 1:
+        sys.exit(
+            "error: --min-tasks-per-skill must be >= 1, "
+            f"got {args.min_tasks_per_skill}"
+        )
     skill_paths = list(dict.fromkeys(args.skill))
     skills = [collect_skill_document(path) for path in skill_paths]
     skill_names = [skill.name for skill in skills]
@@ -364,7 +396,11 @@ def main() -> None:
         print(f"[taskgen] attempt {attempt}/{MAX_ATTEMPTS}", flush=True)
         if len(skills) > 1:
             prompt = build_multi_skill_prompt(
-                skills, args.count, args.guidance, feedback
+                skills,
+                args.count,
+                args.guidance,
+                feedback,
+                min_tasks_per_skill=args.min_tasks_per_skill,
             )
         else:
             prompt = build_prompt(
@@ -379,9 +415,15 @@ def main() -> None:
             if not os.path.isfile(out_file):
                 raise ValueError(f"agent did not write {OUTPUT_FILENAME} in its working directory")
             tasks = load_tasks(out_file)
-            validate_generated_tasks(tasks, args.count, skills)
+            validate_generated_tasks(
+                tasks,
+                args.count,
+                skills,
+                min_tasks_per_skill=args.min_tasks_per_skill,
+            )
             break
         except ValueError as exc:
+            tasks = None
             feedback = str(exc)
             print(f"[taskgen] validation failed: {feedback}", flush=True)
             if os.path.isfile(out_file):
@@ -404,6 +446,7 @@ def main() -> None:
         "skills": skill_paths,
         "skill_names": skill_names,
         "skill_count": len(skills),
+        "min_tasks_per_skill": args.min_tasks_per_skill,
         "attempts": attempts,
         "duration_s": duration_s,
     }

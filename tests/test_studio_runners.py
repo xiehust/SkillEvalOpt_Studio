@@ -224,7 +224,7 @@ p = argparse.ArgumentParser()
 for flag in ("--backend", "--model", "--guidance", "--out_root"):
     p.add_argument(flag, default="")
 p.add_argument("--skill", action="append", default=[])
-for flag in ("--count", "--timeout"):
+for flag in ("--count", "--timeout", "--min-tasks-per-skill"):
     p.add_argument(flag, type=int, default=0)
 a = p.parse_args()
 os.makedirs(a.out_root, exist_ok=True)
@@ -238,7 +238,9 @@ with open(os.path.join(a.out_root, "generated_tasks.json"), "w", encoding="utf-8
     json.dump(tasks, f)
 summary = {"count": len(tasks), "requested_count": a.count, "backend": a.backend,
            "model": a.model, "skill": a.skill[0] if len(a.skill) == 1 else None,
-           "skills": a.skill, "skill_count": len(a.skill), "attempts": 1, "duration_s": 0.1}
+           "skills": a.skill, "skill_count": len(a.skill),
+           "min_tasks_per_skill": a.min_tasks_per_skill,
+           "attempts": 1, "duration_s": 0.1}
 with open(os.path.join(a.out_root, "gen_summary.json"), "w", encoding="utf-8") as f:
     json.dump(summary, f)
 print(f"[taskgen] done: {len(tasks)} tasks", flush=True)
@@ -317,6 +319,28 @@ def single_taskset(studio_config):
 @pytest.fixture
 def split_taskset(studio_config):
     files = {"train": valid_tasks("tr", 4), "val": valid_tasks("va", 2), "test": valid_tasks("te", 2)}
+    return save_taskset(studio_config, "split-set", files, "split")
+
+
+@pytest.fixture
+def plugin_split_taskset(studio_config):
+    def items(prefix: str, count: int) -> bytes:
+        tasks = [
+            {
+                "id": f"{prefix}{index}",
+                "question": f"Q{index}?",
+                "rubric": f"Answer must mention {index}.",
+                "target_skills": ["knowledge-init"],
+            }
+            for index in range(count)
+        ]
+        return json.dumps(tasks).encode("utf-8")
+
+    files = {
+        "train": items("tr", 4),
+        "val": items("va", 2),
+        "test": items("te", 2),
+    }
     return save_taskset(studio_config, "split-set", files, "split")
 
 
@@ -577,7 +601,7 @@ class TestBuildTrainConfig:
         studio_config,
         stub_scripts,
         plugin_skills,
-        split_taskset,
+        plugin_split_taskset,
     ):
         job_dir = job_dir_of(studio_config, "train-plugin")
         (plugin_skills[0] / ".studio_sample.json").write_text(
@@ -713,6 +737,28 @@ class TestBuildTaskgenCommand:
         ]
         assert skill_args == [str(skill_a), str(skill_b)]
         assert argv[argv.index("--count") + 1] == "8"
+        assert argv[argv.index("--min-tasks-per-skill") + 1] == "2"
+
+    def test_multi_skill_count_is_raised_to_training_minimum(
+        self,
+        studio_config,
+        stub_scripts,
+        plugin_skills,
+    ):
+        argv = build_taskgen_command(
+            studio_config,
+            {
+                "skill_ids": [
+                    "claude-plugins--knowledge-init",
+                    "claude-plugins--knowledge-status",
+                ],
+                "plugin": "knowledge",
+                "count": 2,
+            },
+            job_dir_of(studio_config, "gen-plugin-minimum"),
+        )
+        assert argv[argv.index("--count") + 1] == "5"
+        assert argv[argv.index("--min-tasks-per-skill") + 1] == "2"
 
     def test_multi_skill_requires_same_plugin(
         self, studio_config, stub_scripts, plugin_skills, claude_skill
@@ -839,6 +885,167 @@ class TestStudioApiE2E:
         assert aggregates["weakest_skill"]["name"] == "knowledge-status"
         assert body["rows"][0]["target_skills"] == ["knowledge-init"]
 
+    def test_plugin_coverage_reports_ratio_and_split_counts(
+        self,
+        studio_config,
+        client,
+        plugin_skills,
+    ):
+        skill_ids = [
+            "claude-plugins--knowledge-init",
+            "claude-plugins--knowledge-status",
+        ]
+        ratio_tasks = [
+            {
+                "id": "init-1",
+                "question": "Initialize once.",
+                "rubric": "Initializes.",
+                "target_skills": ["knowledge-init"],
+            },
+            {
+                "id": "init-2",
+                "question": "Initialize again.",
+                "rubric": "Initializes.",
+                "target_skills": ["knowledge-init"],
+            },
+            {
+                "id": "status-1",
+                "question": "Show status once.",
+                "rubric": "Shows status.",
+                "target_skills": ["knowledge-status"],
+            },
+            {
+                "id": "status-2",
+                "question": "Show status again.",
+                "rubric": "Shows status.",
+                "target_skills": ["knowledge-status"],
+            },
+            {
+                "id": "reserve",
+                "question": "Summarize the plugin.",
+                "rubric": "Summarizes.",
+            },
+        ]
+        save_taskset(
+            studio_config,
+            "coverage-ratio",
+            {"tasks": json.dumps(ratio_tasks).encode("utf-8")},
+            "single",
+        )
+        payload = {
+            "plugin": "knowledge",
+            "skill_ids": skill_ids,
+            "trainable_skill_ids": skill_ids,
+            "split_ratio": "4:3:3",
+        }
+
+        ratio_response = client.post(
+            "/api/tasksets/coverage-ratio/plugin-coverage",
+            json=payload,
+        )
+
+        assert ratio_response.status_code == 200, ratio_response.text
+        ratio_report = ratio_response.json()
+        assert ratio_report["valid"] is True
+        assert ratio_report["mode"] == "single"
+        assert ratio_report["generation_minimum_count"] == 5
+        assert {
+            row["skill_name"]: row["count"] for row in ratio_report["skills"]
+        } == {"knowledge-init": 2, "knowledge-status": 2}
+
+        split_tasks = {
+            "train": [ratio_tasks[0], ratio_tasks[2]],
+            "val": [ratio_tasks[1], ratio_tasks[3]],
+            "test": [ratio_tasks[4]],
+        }
+        save_taskset(
+            studio_config,
+            "coverage-split",
+            {
+                split: json.dumps(items).encode("utf-8")
+                for split, items in split_tasks.items()
+            },
+            "split",
+        )
+
+        split_response = client.post(
+            "/api/tasksets/coverage-split/plugin-coverage",
+            json=payload,
+        )
+
+        assert split_response.status_code == 200, split_response.text
+        split_report = split_response.json()
+        assert split_report["valid"] is True
+        assert split_report["mode"] == "split"
+        assert all(
+            row["train_count"] == 1 and row["validation_count"] == 1
+            for row in split_report["skills"]
+        )
+
+    def test_invalid_plugin_coverage_rejects_job_before_queue(
+        self,
+        studio_config,
+        client,
+        plugin_skills,
+    ):
+        skill_ids = [
+            "claude-plugins--knowledge-init",
+            "claude-plugins--knowledge-status",
+        ]
+        tasks = [
+            {
+                "id": "init",
+                "question": "Initialize.",
+                "rubric": "Initializes.",
+                "target_skills": ["knowledge-init"],
+            },
+            {
+                "id": "status",
+                "question": "Show status.",
+                "rubric": "Shows status.",
+                "target_skills": ["knowledge-status"],
+            },
+            {
+                "id": "reserve",
+                "question": "Summarize.",
+                "rubric": "Summarizes.",
+            },
+        ]
+        save_taskset(
+            studio_config,
+            "coverage-invalid",
+            {"tasks": json.dumps(tasks).encode("utf-8")},
+            "single",
+        )
+        params = {
+            "target_mode": "plugin",
+            "plugin": "knowledge",
+            "skill_ids": skill_ids,
+            "trainable_skill_ids": skill_ids,
+            "taskset_id": "coverage-invalid",
+        }
+
+        report = client.post(
+            "/api/tasksets/coverage-invalid/plugin-coverage",
+            json={
+                "plugin": "knowledge",
+                "skill_ids": skill_ids,
+                "trainable_skill_ids": skill_ids,
+            },
+        )
+        response = client.post(
+            "/api/jobs",
+            json={"type": "train", "params": params},
+        )
+
+        assert report.status_code == 200
+        assert report.json()["valid"] is False
+        assert "knowledge-init=1/2" in report.json()["reasons"][0]
+        assert "knowledge-status=1/2" in report.json()["reasons"][0]
+        assert response.status_code == 400
+        assert "source task counts are insufficient" in response.json()["detail"]
+        assert client.get("/api/jobs").json() == []
+
     def test_train_job_end_to_end(self, studio_config, client, claude_skill, single_taskset):
         response = client.post(
             "/api/jobs",
@@ -871,7 +1078,7 @@ class TestStudioApiE2E:
         studio_config,
         client,
         plugin_skills,
-        split_taskset,
+        plugin_split_taskset,
     ):
         skill_ids = [
             "claude-plugins--knowledge-init",
@@ -952,6 +1159,8 @@ class TestStudioApiE2E:
         body = client.get(f"/api/jobs/{job_id}/results").json()
         assert body["summary"]["skill_count"] == 2
         assert len(body["summary"]["skills"]) == 2
+        assert body["summary"]["requested_count"] == 5
+        assert body["summary"]["min_tasks_per_skill"] == 2
 
     def test_unsupported_type_message_lists_taskgen(self, client):
         response = client.post("/api/jobs", json={"type": "bogus", "params": {}})
@@ -1126,6 +1335,14 @@ class TestArtifactsFunctions:
                 "current_score": 0.4,
                 "best_score": 0.4,
                 "best_step": 0,
+                "excluded_failures": [
+                    {
+                        "task_id": "task-error",
+                        "category": "task_failure",
+                        "target_skills": ["alpha"],
+                        "reason": "Response stalled mid-stream",
+                    }
+                ],
             }
         ]
         (out / "history.json").write_text(json.dumps(history), encoding="utf-8")
@@ -1136,6 +1353,10 @@ class TestArtifactsFunctions:
         assert summary["finished"] is False
         assert summary["steps"][0]["selection_hard"] == 0.5
         assert summary["steps"][0]["selection_soft"] == 0.6
+        assert summary["totals"]["excluded_failures"] == 1
+        assert summary["steps"][0]["excluded_failures"][0]["reason"] == (
+            "Response stalled mid-stream"
+        )
 
     def test_read_artifact_binary_returns_meta_only(self, studio_config):
         job = self._fake_job(studio_config, name="job-bin")
@@ -1303,3 +1524,7 @@ class TestBackendSelection:
         assert by_backend["claude_code_exec"]["cli"] == "claude"
         assert by_backend["codex_exec"]["available"] is False
         assert by_backend["codex_exec"]["path"] is None
+        assert body["taskgen"] == {
+            "plugin_min_tasks_per_skill": 2,
+            "plugin_test_reserve": 1,
+        }

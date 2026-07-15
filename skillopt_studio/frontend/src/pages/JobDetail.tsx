@@ -557,6 +557,13 @@ function TrainResultsView({ results }: { results: TrainResults }) {
         <StatBadge label={t("train.steps")} value={summary.totals.steps} />
         <StatBadge label={t("train.accepts")} value={summary.totals.accepts ?? "—"} tone="good" />
         <StatBadge label={t("train.rejects")} value={summary.totals.rejects ?? "—"} tone="critText" />
+        {summary.totals.excluded_failures > 0 && (
+          <StatBadge
+            label={t("train.excludedFailureCount")}
+            value={summary.totals.excluded_failures}
+            tone="critText"
+          />
+        )}
         <StatBadge
           label={t("train.bestStepScore")}
           value={`#${summary.best_step ?? "—"} / ${summary.best_score?.toFixed(3) ?? "—"}`}
@@ -662,6 +669,20 @@ function TrainResultsView({ results }: { results: TrainResults }) {
                 <span className="basis-full text-xs text-critText">
                   {step.gate_reasons.join("; ")}
                 </span>
+              )}
+              {step.excluded_failures && step.excluded_failures.length > 0 && (
+                <div className="basis-full space-y-1 text-xs text-critText">
+                  <span className="font-semibold">{t("train.excludedFailures")}</span>
+                  {step.excluded_failures.map((failure) => (
+                    <p key={`${failure.task_id}-${failure.category}`} className="break-words">
+                      <Mono>{failure.task_id}</Mono>
+                      {" · "}
+                      {failure.category}
+                      {failure.target_skills.length > 0 && ` · ${failure.target_skills.join(", ")}`}
+                      {failure.reason && ` · ${failure.reason}`}
+                    </p>
+                  ))}
+                </div>
               )}
             </div>
           ))}

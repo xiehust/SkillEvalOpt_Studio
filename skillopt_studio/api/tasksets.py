@@ -3,10 +3,16 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 
-from skillopt_studio import tasksets
+from skillopt_studio import runners, tasksets
 from skillopt_studio.api import get_config
 from skillopt_studio.config import StudioConfig
-from skillopt_studio.models import TaskSetInfo, TaskSetItemsCreate, TaskSetUpdate
+from skillopt_studio.models import (
+    PluginCoverageReport,
+    PluginCoverageRequest,
+    TaskSetInfo,
+    TaskSetItemsCreate,
+    TaskSetUpdate,
+)
 
 router = APIRouter(prefix="/tasksets", tags=["tasksets"])
 
@@ -42,6 +48,23 @@ def create_taskset_items(
 ) -> TaskSetInfo:
     try:
         return tasksets.create_taskset_from_items(config, body.name, body.mode, body.tasks_by_split)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/{taskset_id}/plugin-coverage",
+    response_model=PluginCoverageReport,
+)
+def plugin_coverage(
+    taskset_id: str,
+    body: PluginCoverageRequest,
+    config: StudioConfig = Depends(get_config),
+) -> PluginCoverageReport:
+    params = body.model_dump()
+    params["taskset_id"] = taskset_id
+    try:
+        return runners.analyze_plugin_training_coverage(config, params)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

@@ -11,6 +11,11 @@ import pytest
 
 from skillopt.engine.plugin_trainer import PluginTrainer
 from skillopt.envs.skilleval.adapter import SkillEvalAdapter
+from skillopt.envs.skilleval.coverage import (
+    minimum_plugin_task_count,
+    plan_disjoint_plugin_coverage,
+    target_skill_counts,
+)
 from skillopt.envs.skilleval.plugin import (
     PluginState,
     collect_plugin_state,
@@ -57,6 +62,47 @@ def _aggregate(
             for name, values in by_skill.items()
         },
     }
+
+
+class TestPluginCoveragePlanner:
+    def test_generation_minimum_reserves_two_per_skill_and_test(self) -> None:
+        assert minimum_plugin_task_count(0) == 1
+        assert minimum_plugin_task_count(6) == 13
+
+    def test_plans_disjoint_covers_and_retains_test(self) -> None:
+        items = [
+            {"id": "a1", "target_skills": ["alpha"]},
+            {"id": "a2", "target_skills": ["alpha"]},
+            {"id": "b1", "target_skills": ["beta"]},
+            {"id": "b2", "target_skills": ["beta"]},
+            {"id": "reserve", "target_skills": []},
+        ]
+
+        plan = plan_disjoint_plugin_coverage(
+            items,
+            ["alpha", "beta"],
+            ["alpha", "beta"],
+        )
+
+        assert set(plan.training_indices).isdisjoint(plan.validation_indices)
+        assert len(plan.remaining_indices) == 1
+        assert target_skill_counts(items, ["alpha", "beta"]) == {
+            "alpha": 2,
+            "beta": 2,
+        }
+
+    def test_reports_undercovered_skill_counts(self) -> None:
+        items = [
+            {"id": "a1", "target_skills": ["alpha"]},
+            {"id": "a2", "target_skills": ["alpha"]},
+            {"id": "b1", "target_skills": ["beta"]},
+        ]
+        with pytest.raises(ValueError, match=r"beta=1/2"):
+            plan_disjoint_plugin_coverage(
+                items,
+                ["alpha", "beta"],
+                ["alpha", "beta"],
+            )
 
 
 class TestPluginState:
@@ -147,7 +193,11 @@ class TestFailureAttribution:
             "judge_failure",
         ]
         assert attrs[-2].responsible_skills == ()
+        assert attrs[-2].target_skills == ("alpha",)
+        assert attrs[-2].reason == "boom"
         assert attrs[-1].gradient_eligible is False
+        assert attrs[-1].target_skills == ("beta",)
+        assert attrs[-1].to_dict()["reason"] == "bad"
         assert select_responsible_skills(attrs, ["alpha", "beta"], 1) == ["beta"]
 
     def test_selection_tie_uses_runtime_order(self) -> None:
@@ -186,6 +236,23 @@ class TestPluginGate:
         )
         assert gate.action == "accept_new_best"
         assert gate.reasons == ()
+
+    def test_rejects_gain_disconnected_from_modified_skill(self) -> None:
+        current = _aggregate((0.40, 0.40), alpha=(0.40, 0.40), beta=(0.40, 0.40))
+        candidate = _aggregate((0.50, 0.50), alpha=(0.40, 0.40), beta=(0.60, 0.60))
+
+        gate = evaluate_plugin_gate(
+            current,
+            candidate,
+            ["alpha", "beta"],
+            modified_skill_names=["alpha"],
+        )
+
+        assert gate.action == "reject"
+        assert gate.reasons == (
+            "no modified Skill strictly improved its validation score: "
+            "alpha 0.400000->0.400000",
+        )
 
     def test_coverage_requires_every_skill(self) -> None:
         with pytest.raises(ValueError, match="beta"):
@@ -391,7 +458,7 @@ class TestPluginTrainer:
         with pytest.raises(ValueError, match="max_skills_per_candidate"):
             PluginTrainer(cfg, adapter, state).preflight()
 
-    def test_ratio_split_expands_validation_for_trainable_coverage(
+    def test_ratio_split_reserves_disjoint_train_and_validation_coverage(
         self,
         tmp_path,
     ) -> None:
@@ -453,17 +520,32 @@ class TestPluginTrainer:
             for item in first._selection_items
             for target in item["target_skills"]
         } >= {"alpha", "beta", "gamma"}
+        train_targets = {
+            target
+            for item in first.dataloader.train_items
+            for target in item["target_skills"]
+        }
+        assert train_targets >= {"alpha", "beta", "gamma"}
+        assert {
+            item["id"] for item in first.dataloader.train_items
+        }.isdisjoint(first_ids)
 
         manifest = json.loads(
             (first_split / "split_manifest.json").read_text(encoding="utf-8")
         )
-        assert manifest["counts"] == {"train": 3, "val": 2, "test": 2}
+        assert manifest["counts"] == {"train": 4, "val": 2, "test": 1}
         assert manifest["coverage_aware"] is True
+        assert manifest["required_training_skills"] == [
+            "alpha",
+            "beta",
+            "gamma",
+        ]
         assert manifest["required_validation_skills"] == [
             "alpha",
             "beta",
             "gamma",
         ]
+        assert manifest["minimum_training_count"] == 3
         assert manifest["minimum_validation_count"] == 2
 
     def test_ratio_split_rejects_missing_or_truncated_trainable_coverage(
@@ -518,11 +600,249 @@ class TestPluginTrainer:
             else task
             for task in complete_tasks
         ]
-        with pytest.raises(ValueError, match="missing source coverage.*gamma"):
+        with pytest.raises(ValueError, match="source task counts.*gamma=0/2"):
             preflight(without_gamma, "split-missing")
 
         with pytest.raises(ValueError, match="gamma"):
             preflight(complete_tasks, "split-truncated", sel_env_num=1)
+
+    def test_ratio_split_rejects_single_source_task_for_trainable_skill(
+        self,
+        tmp_path,
+    ) -> None:
+        names = [
+            "webnovel-init",
+            "webnovel-learn",
+            "webnovel-plan",
+            "webnovel-query",
+            "webnovel-review",
+            "webnovel-write",
+        ]
+        state = collect_plugin_state(
+            [str(_make_skill(tmp_path, name)) for name in names]
+        )
+        targets = [
+            ["webnovel-init"],
+            ["webnovel-learn"],
+            ["webnovel-plan"],
+            ["webnovel-query"],
+            ["webnovel-review"],
+            ["webnovel-write"],
+            ["webnovel-query"],
+            ["webnovel-review"],
+            ["webnovel-learn"],
+            ["webnovel-init", "webnovel-plan"],
+        ]
+        tasks = [
+            _task(f"task-{index:03d}", task_targets)
+            for index, task_targets in enumerate(targets, start=1)
+        ]
+        data_path = tmp_path / "webnovel-tasks.json"
+        data_path.write_text(json.dumps(tasks), encoding="utf-8")
+        split_output = tmp_path / "webnovel-split"
+        cfg = _trainer_cfg(
+            tmp_path,
+            "",
+            split_mode="ratio",
+            split_dir="",
+            data_path=str(data_path),
+            split_output_dir=str(split_output),
+            split_ratio="4:3:3",
+            eval_test=False,
+        )
+        adapter = SkillEvalAdapter(
+            data_path=str(data_path),
+            split_mode="ratio",
+            split_ratio="4:3:3",
+            split_output_dir=str(split_output),
+            workers=1,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=r"source task counts.*webnovel-write=1/2",
+        ):
+            PluginTrainer(cfg, adapter, state).preflight()
+
+    def test_ratio_split_rejects_dual_coverage_without_test_room(
+        self,
+        tmp_path,
+    ) -> None:
+        state = collect_plugin_state(
+            [
+                str(_make_skill(tmp_path, "alpha")),
+                str(_make_skill(tmp_path, "beta")),
+            ]
+        )
+        tasks = [
+            _task("task-a1", ["alpha"]),
+            _task("task-a2", ["alpha"]),
+            _task("task-b1", ["beta"]),
+            _task("task-b2", ["beta"]),
+        ]
+        data_path = tmp_path / "no-test-room.json"
+        data_path.write_text(json.dumps(tasks), encoding="utf-8")
+        split_output = tmp_path / "no-test-room"
+        cfg = _trainer_cfg(
+            tmp_path,
+            "",
+            split_mode="ratio",
+            split_dir="",
+            data_path=str(data_path),
+            split_output_dir=str(split_output),
+        )
+        adapter = SkillEvalAdapter(
+            data_path=str(data_path),
+            split_mode="ratio",
+            split_output_dir=str(split_output),
+            workers=1,
+        )
+
+        with pytest.raises(ValueError, match="cannot keep test non-empty"):
+            PluginTrainer(cfg, adapter, state).preflight()
+
+    def test_ratio_split_tries_alternate_test_reservations(
+        self,
+        tmp_path,
+    ) -> None:
+        state = collect_plugin_state(
+            [
+                str(_make_skill(tmp_path, "alpha")),
+                str(_make_skill(tmp_path, "beta")),
+                str(_make_skill(tmp_path, "gamma")),
+            ]
+        )
+        tasks = [
+            _task("task-c", ["gamma"]),
+            _task("task-b", ["beta"]),
+            _task("task-ab", ["alpha", "beta"]),
+            _task("task-a", ["alpha"]),
+            _task("task-ac", ["alpha", "gamma"]),
+        ]
+        data_path = tmp_path / "alternate-test.json"
+        data_path.write_text(json.dumps(tasks), encoding="utf-8")
+        split_output = tmp_path / "alternate-test-split"
+        cfg = _trainer_cfg(
+            tmp_path,
+            "",
+            split_mode="ratio",
+            split_dir="",
+            data_path=str(data_path),
+            split_output_dir=str(split_output),
+            split_seed=42,
+        )
+        adapter = SkillEvalAdapter(
+            data_path=str(data_path),
+            split_mode="ratio",
+            split_output_dir=str(split_output),
+            workers=1,
+        )
+
+        trainer = PluginTrainer(cfg, adapter, state)
+        trainer.preflight()
+
+        train_items = trainer.dataloader.train_items
+        val_items = trainer.dataloader.val_items
+        test_items = trainer.dataloader.test_items
+        assert len(train_items) == len(val_items) == 2
+        assert len(test_items) == 1
+        assert {
+            target
+            for item in train_items
+            for target in item["target_skills"]
+        } >= {"alpha", "beta", "gamma"}
+        assert {
+            target
+            for item in val_items
+            for target in item["target_skills"]
+        } >= {"alpha", "beta", "gamma"}
+
+    def test_explicit_split_requires_training_coverage(
+        self,
+        tmp_path,
+    ) -> None:
+        state = collect_plugin_state(
+            [
+                str(_make_skill(tmp_path, "alpha")),
+                str(_make_skill(tmp_path, "beta")),
+            ]
+        )
+        split = _write_split(
+            tmp_path,
+            [_task("train-a", ["alpha"])],
+            [_task("val-a", ["alpha"]), _task("val-b", ["beta"])],
+            [_task("test-a", ["alpha"])],
+        )
+        cfg = _trainer_cfg(tmp_path, split)
+        adapter = SkillEvalAdapter(split_dir=str(split), split_mode="split_dir")
+
+        with pytest.raises(
+            ValueError,
+            match=r"training tasks.*missing coverage.*beta",
+        ):
+            PluginTrainer(cfg, adapter, state).preflight()
+
+    def test_rollout_failures_are_persisted_without_gradients(
+        self,
+        tmp_path,
+        monkeypatch,
+    ) -> None:
+        state = collect_plugin_state(
+            [
+                str(_make_skill(tmp_path, "alpha")),
+                str(_make_skill(tmp_path, "frozen")),
+            ],
+            ["alpha"],
+        )
+        split = _write_split(
+            tmp_path,
+            [_task("train-a", ["alpha"])],
+            [_task("val-a", ["alpha"])],
+            [_task("test-a", ["alpha"])],
+        )
+        cfg = _trainer_cfg(tmp_path, split, batch_size=1, eval_test=False)
+        adapter = SkillEvalAdapter(
+            split_dir=str(split),
+            split_mode="split_dir",
+            workers=1,
+        )
+
+        def fake_rollout(items, plugin_state, out_dir, **kwargs):
+            del plugin_state, out_dir, kwargs
+            return [
+                {
+                    "id": item["id"],
+                    "hard": int(item["id"].startswith("val-")),
+                    "soft": float(item["id"].startswith("val-")),
+                    "error": (
+                        "Response stalled mid-stream"
+                        if item["id"].startswith("train-")
+                        else None
+                    ),
+                    "task_type": item.get("task_type", "default"),
+                    "target_skills": list(item.get("target_skills") or []),
+                }
+                for item in items
+            ]
+
+        monkeypatch.setattr(adapter, "rollout_plugin", fake_rollout)
+        trainer = PluginTrainer(cfg, adapter, state)
+        trainer.preflight()
+        summary = trainer.train()
+
+        assert summary["total_skips"] == 1
+        history = json.loads(
+            (tmp_path / "out" / "history.json").read_text(encoding="utf-8")
+        )
+        assert history[0]["action"] == "skip_no_attribution"
+        assert history[0]["excluded_failures"] == [
+            {
+                "task_id": "train-a",
+                "category": "task_failure",
+                "target_skills": ["alpha"],
+                "reason": "Response stalled mid-stream",
+            }
+        ]
 
     def test_frozen_skill_needs_no_coverage_or_regression_metric(
         self,
@@ -683,7 +1003,7 @@ class TestPluginTrainer:
         )
         split = _write_split(
             tmp_path,
-            [_task("train-a", ["alpha"])],
+            [_task("train-a", ["alpha"]), _task("train-b", ["beta"])],
             [
                 _task("val-a", ["alpha"]),
                 _task("val-b", ["beta"]),
@@ -694,7 +1014,7 @@ class TestPluginTrainer:
         cfg = _trainer_cfg(
             tmp_path,
             split,
-            batch_size=1,
+            batch_size=2,
             max_skills_per_candidate=1,
             eval_test=False,
         )
@@ -754,4 +1074,68 @@ class TestPluginTrainer:
         )
         assert runtime["current_snapshot"].endswith(
             os.path.join("plugin_versions", "plugin_v0000")
+        )
+
+    def test_rejects_candidate_when_only_unmodified_skill_improves(
+        self,
+        tmp_path,
+        monkeypatch,
+    ) -> None:
+        state = collect_plugin_state(
+            [
+                str(_make_skill(tmp_path, "alpha")),
+                str(_make_skill(tmp_path, "beta")),
+            ]
+        )
+        split = _write_split(
+            tmp_path,
+            [_task("train-a", ["alpha"]), _task("train-b", ["beta"])],
+            [_task("val-a", ["alpha"]), _task("val-b", ["beta"])],
+            [_task("test-a", ["alpha"]), _task("test-b", ["beta"])],
+        )
+        cfg = _trainer_cfg(
+            tmp_path,
+            split,
+            batch_size=2,
+            max_skills_per_candidate=1,
+            eval_test=False,
+        )
+        adapter = SkillEvalAdapter(
+            split_dir=str(split),
+            split_mode="split_dir",
+            workers=1,
+            analyst_workers=1,
+            failure_only=True,
+            minibatch_size=2,
+            edit_budget=1,
+        )
+        _patch_append_reflection(monkeypatch, adapter, [])
+
+        def fake_rollout(items, plugin_state, out_dir, **kwargs):
+            del out_dir, kwargs
+            alpha_changed = "## Improved" in plugin_state.skill("alpha").content
+            return [
+                {
+                    "id": item["id"],
+                    "hard": int(alpha_changed and item["id"] == "val-b"),
+                    "soft": float(alpha_changed and item["id"] == "val-b"),
+                    "task_type": item.get("task_type", "default"),
+                    "target_skills": list(item.get("target_skills") or []),
+                }
+                for item in items
+            ]
+
+        monkeypatch.setattr(adapter, "rollout_plugin", fake_rollout)
+        trainer = PluginTrainer(cfg, adapter, state)
+        trainer.preflight()
+        summary = trainer.train()
+
+        assert summary["total_rejects"] == 1
+        history = json.loads(
+            (tmp_path / "out" / "history.json").read_text(encoding="utf-8")
+        )
+        assert history[0]["selected_skills"] == ["alpha"]
+        assert any(
+            "no modified Skill strictly improved" in reason
+            for reason in history[0]["gate_reasons"]
         )

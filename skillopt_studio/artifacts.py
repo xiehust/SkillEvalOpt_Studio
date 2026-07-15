@@ -21,7 +21,7 @@ _STEP_FIELDS = (
     "step", "epoch", "action", "selection_hard", "selection_soft",
     "current_score", "best_score", "best_step", "skill_len", "wall_time_s",
     "selected_skills", "attribution_counts", "current_skill_scores",
-    "regressions", "gate_reasons",
+    "regressions", "gate_reasons", "excluded_failures",
 )
 
 _ROW_FIELDS = (
@@ -172,6 +172,11 @@ def train_summary(config: StudioConfig, job: JobInfo) -> dict | None:
 
     token_summary = summary.get("token_summary") or {}
     token_totals = token_summary.get("_total") or {}
+    excluded_failure_count = sum(
+        len(failures)
+        for step in steps
+        if isinstance((failures := step.get("excluded_failures")), list)
+    )
     result = {
         "mode": mode,
         "steps": steps,
@@ -192,6 +197,7 @@ def train_summary(config: StudioConfig, job: JobInfo) -> dict | None:
             "rejects": summary.get("total_rejects"),
             "skips": summary.get("total_skips"),
             "wall_time_s": summary.get("total_wall_time_s"),
+            "excluded_failures": excluded_failure_count,
         },
         "token_totals": token_totals,
         "finished": bool(summary),

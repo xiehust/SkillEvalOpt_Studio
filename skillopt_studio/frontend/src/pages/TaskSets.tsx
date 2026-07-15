@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import { api, ApiError, TaskItem, TaskSetInfo } from "../api";
+import { api, ApiError, StudioEnvironment, TaskItem, TaskSetInfo } from "../api";
 import GenerateTaskSetForm from "../components/GenerateTaskSetForm";
 import TaskItemsEditor, { emptyItem, validateItems } from "../components/TaskItemsEditor";
 import TaskSetFormatDoc from "../components/TaskSetFormatDoc";
@@ -166,6 +166,7 @@ function CreateTaskSetForm({
   const { t } = useTranslation("tasksets");
   const [tab, setTab] = useState<CreateTab>(imported ? "manual" : "upload");
   const [name, setName] = useState(imported?.name ?? "");
+  const [taskgenRules, setTaskgenRules] = useState<StudioEnvironment["taskgen"] | null>(null);
 
   useEffect(() => {
     if (imported) {
@@ -173,6 +174,20 @@ function CreateTaskSetForm({
       if (imported.name) setName(imported.name);
     }
   }, [imported]);
+
+  useEffect(() => {
+    let active = true;
+    api.environment()
+      .then((environment) => {
+        if (active) setTaskgenRules(environment.taskgen);
+      })
+      .catch(() => {
+        if (active) setTaskgenRules(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   return (
     <Card title={t("list.newTaskset")} className="mb-6">
@@ -207,6 +222,17 @@ function CreateTaskSetForm({
                 data-testid="taskset-name"
               />
             </div>
+            {taskgenRules && (
+              <div
+                className="border-l-2 border-amber bg-amber/[.07] px-3 py-2 text-xs leading-relaxed text-muted"
+                data-testid="plugin-coverage-guidance"
+              >
+                {t("list.pluginCoverageGuidance", {
+                  minimum: taskgenRules.plugin_min_tasks_per_skill,
+                  reserve: taskgenRules.plugin_test_reserve,
+                })}
+              </div>
+            )}
             <TaskSetFormatDoc />
           </>
         )}

@@ -30,6 +30,7 @@
       "namePlaceholder": "例如:报表生成回归集",
       "nameRequired": "请填写任务集名称"
     },
+    "pluginCoverageGuidance": "Plugin 多 Skill 训练要求每个可训练 Skill 至少出现在 {{minimum}} 个不同的源任务中,以便训练集与验证集保持不重叠;另需预留 {{reserve}} 个 test 任务。任务集仍可复用,发起训练时会按实际选择的可训练 Skill 再次检查。",
     "upload": {
       "mode": "模式",
       "modeSingle": "single — 单个 tasks.json(训练时按比例自动分割)",

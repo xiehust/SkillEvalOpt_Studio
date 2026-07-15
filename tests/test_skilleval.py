@@ -333,6 +333,32 @@ class TestRunBatch:
         assert "RuntimeError: CLI crashed" in results[1]["error"]
         assert "error" not in results[0]
 
+    def test_empty_response_records_exec_failure_reason(self, tmp_path, monkeypatch) -> None:
+        raw = (
+            "===== CLAUDE CLI ATTEMPT 1 =====\n"
+            + json.dumps({
+                "type": "result",
+                "is_error": True,
+                "result": "API Error: Response stalled mid-stream",
+            })
+        )
+        self._patch_harness(monkeypatch, lambda **kw: ("", raw))
+        results = run_batch([_valid_item("t1")], "# skill", str(tmp_path))
+        assert results[0]["response"] == ""
+        assert results[0]["error"] == (
+            "claude_code_exec failed to produce a final response: "
+            "CLAUDE CLI attempt 1: API Error: Response stalled mid-stream"
+        )
+
+    def test_empty_response_without_diagnostic_records_fallback(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        self._patch_harness(monkeypatch, lambda **kw: ("", ""))
+        results = run_batch([_valid_item("t1")], "# skill", str(tmp_path))
+        assert results[0]["error"] == (
+            "claude_code_exec returned an empty response after all attempts"
+        )
+
     def test_work_dir_shape_and_workspace_seeding(self, tmp_path, monkeypatch) -> None:
         prepared = self._patch_harness(
             monkeypatch, lambda **kw: ("ok", "raw")
@@ -550,6 +576,16 @@ class TestBuildReport:
         assert "`t1`: RuntimeError: crashed" in report
         assert "### Judge errors" in report
         assert "`t2`: unparseable judge reply" in report
+
+    def test_task_reason_falls_back_to_execution_failures(self) -> None:
+        report = evaluate_skill.build_report([
+            _result("t1", 0, 0.0, judge_reason="", error="target timed out"),
+            _result("t2", 0, 0.0, judge_reason="", judge_error="judge unavailable"),
+            _result("t3", 0, 0.0, judge_reason="", judge_skipped="empty_response"),
+        ])
+        assert "| t1 | ✗ | 0.00 | target timed out |" in report
+        assert "| t2 | ✗ | 0.00 | judge unavailable |" in report
+        assert "| t3 | ✗ | 0.00 | judge skipped: empty_response |" in report
 
     def test_no_failures_says_none(self) -> None:
         report = evaluate_skill.build_report([_result("t1", 1, 1.0)])

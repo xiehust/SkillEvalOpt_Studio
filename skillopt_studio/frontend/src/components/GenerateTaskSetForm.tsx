@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import { api, ApiError, BackendStatus, SkillInfo } from "../api";
+import { api, ApiError, BackendStatus, SkillInfo, StudioEnvironment } from "../api";
 import { buildPluginGroups, filterPluginGroups, PluginGroup } from "./pluginGroups";
 import { BackendSelect, ErrorBanner, Mono, SourceTag, Spinner } from "./ui";
 
@@ -16,6 +16,7 @@ export default function GenerateTaskSetForm() {
   const navigate = useNavigate();
   const [skills, setSkills] = useState<SkillInfo[] | null>(null);
   const [backends, setBackends] = useState<BackendStatus[] | null>(null);
+  const [taskgenRules, setTaskgenRules] = useState<StudioEnvironment["taskgen"] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const [targetMode, setTargetMode] = useState<TargetMode>("skill");
@@ -36,7 +37,15 @@ export default function GenerateTaskSetForm() {
     api.skills().then(setSkills).catch((err) =>
       setLoadError(err instanceof ApiError ? err.message : String(err)),
     );
-    api.environment().then((env) => setBackends(env.backends)).catch(() => setBackends(null));
+    api.environment()
+      .then((env) => {
+        setBackends(env.backends);
+        setTaskgenRules(env.taskgen);
+      })
+      .catch(() => {
+        setBackends(null);
+        setTaskgenRules(null);
+      });
   }, []);
 
   // 与评估向导一致:按技能来源推荐后端;codex 模型留空 = CLI 自身默认
@@ -69,6 +78,13 @@ export default function GenerateTaskSetForm() {
   }, [pluginGroups, skillQuery]);
 
   const selectedPlugin = pluginGroups.find((group) => group.key === pluginKey);
+  const minimumPluginCount = taskgenRules
+    ? pluginSkillIds.length * taskgenRules.plugin_min_tasks_per_skill
+      + taskgenRules.plugin_test_reserve
+    : 0;
+  const effectiveCount = targetMode === "plugin"
+    ? Math.max(count, minimumPluginCount)
+    : count;
 
   const backendAvailable =
     backends === null || backends.find((s) => s.backend === targetBackend)?.available !== false;
@@ -82,7 +98,6 @@ export default function GenerateTaskSetForm() {
   const selectPlugin = (group: PluginGroup) => {
     setPluginKey(group.key);
     setPluginSkillIds(group.skills.map((skill) => skill.id));
-    setCount((current) => Math.max(current, Math.min(30, group.skills.length)));
     applyBackend(group.source === "codex" ? "codex_exec" : "claude_code_exec");
   };
 
@@ -104,7 +119,7 @@ export default function GenerateTaskSetForm() {
       setFormError(t("taskgen.errNoPluginSkills"));
       return;
     }
-    if (count < 1 || count > 30) {
+    if (effectiveCount < 1 || effectiveCount > 30) {
       setFormError(t("taskgen.errCountRange", { min: 1, max: 30 }));
       return;
     }
@@ -126,7 +141,7 @@ export default function GenerateTaskSetForm() {
           : { skill_ids: pluginSkillIds, plugin: selectedPlugin?.name }),
         target_backend: targetBackend,
         model: model.trim(),
-        count,
+        count: effectiveCount,
         guidance: guidance.trim(),
         timeout: timeout_,
       });
@@ -306,10 +321,22 @@ export default function GenerateTaskSetForm() {
           <input
             type="number"
             className="input"
-            value={count}
+            min={targetMode === "plugin" ? Math.max(1, minimumPluginCount) : 1}
+            max={30}
+            value={effectiveCount}
             onChange={(event) => setCount(Number(event.target.value))}
             data-testid="gen-count"
           />
+          {targetMode === "plugin" && taskgenRules && pluginSkillIds.length > 0 && (
+            <p className="text-xs text-muted mt-1.5" data-testid="gen-plugin-minimum">
+              {t("taskgen.pluginMinimumHint", {
+                perSkill: taskgenRules.plugin_min_tasks_per_skill,
+                skills: pluginSkillIds.length,
+                reserve: taskgenRules.plugin_test_reserve,
+                effective: effectiveCount,
+              })}
+            </p>
+          )}
         </div>
         <div>
           <label className="label">{t("taskgen.timeoutLabel", { min: 60, max: 3600 })}</label>

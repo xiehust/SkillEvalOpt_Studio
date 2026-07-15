@@ -782,6 +782,60 @@ def _parse_claude_cli_json(stdout: str) -> dict | None:
     return None
 
 
+def _append_exec_error(raw: str, *, backend: str, error: str) -> str:
+    marker = json.dumps(
+        {"type": "exec_error", "backend": backend, "error": error},
+        ensure_ascii=False,
+    )
+    return f"{raw.rstrip()}\n{marker}" if raw.strip() else marker
+
+
+def extract_exec_failure(raw: str) -> str | None:
+    """Extract concise per-attempt failure reasons from an exec transcript."""
+    if not (raw or "").strip():
+        return None
+
+    attempt = ""
+    reasons: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        match = re.fullmatch(r"===== (.+?) ATTEMPT (\d+) =====", stripped)
+        if match:
+            attempt = f"{match.group(1)} attempt {match.group(2)}"
+            continue
+        if not stripped.startswith("{"):
+            continue
+        try:
+            payload = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+
+        reason = ""
+        if payload.get("type") == "exec_error":
+            reason = str(payload.get("error") or "").strip()
+        elif payload.get("is_error"):
+            reason = str(
+                payload.get("result")
+                or payload.get("error")
+                or payload.get("parse_error")
+                or ""
+            ).strip()
+        if not reason:
+            continue
+
+        reason = re.sub(r"\s+", " ", reason)
+        if len(reason) > 1000:
+            reason = reason[:997] + "..."
+        label = attempt or str(payload.get("backend") or "").strip()
+        detail = f"{label}: {reason}" if label else reason
+        if detail not in reasons:
+            reasons.append(detail)
+
+    return "; ".join(reasons) if reasons else None
+
+
 _CODEX_TOKENS_USED_RE = re.compile(r"^tokens used$", re.MULTILINE)
 
 
@@ -893,6 +947,11 @@ def _run_claude_code_cli_exec(
         raw = stdout
         if stderr:
             raw = f"{raw}\n[stderr]\n{stderr}" if raw else stderr
+        raw = _append_exec_error(
+            raw,
+            backend="claude_code_exec",
+            error=f"timed out after {timeout} seconds",
+        )
         return "", raw
 
     stdout = proc.stdout or ""
@@ -911,6 +970,12 @@ def _run_claude_code_cli_exec(
         return response, raw
     response = stdout.strip()
     if proc.returncode != 0 and not response:
+        detail = stderr.strip() or "no diagnostic output"
+        raw = _append_exec_error(
+            raw,
+            backend="claude_code_exec",
+            error=f"process exited with code {proc.returncode}: {detail}",
+        )
         return "", raw
     return response, raw
 

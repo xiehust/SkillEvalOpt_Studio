@@ -136,10 +136,17 @@ def build_report(results: list[dict]) -> str:
 
     # Per-task detail
     lines += ["## Tasks", "",
-              "| id | pass | soft | judge reason | duration (s) |",
+              "| id | pass | soft | reason | duration (s) |",
               "|---|---|---|---|---|"]
     for r in results:
-        reason = str(r.get("judge_reason", "")).replace("|", "\\|").replace("\n", " ")
+        skipped = r.get("judge_skipped")
+        reason_value = (
+            r.get("error")
+            or r.get("judge_error")
+            or r.get("judge_reason")
+            or (f"judge skipped: {skipped}" if skipped else "")
+        )
+        reason = str(reason_value).replace("|", "\\|").replace("\n", " ")
         if len(reason) > 80:
             reason = reason[:77] + "..."
         mark = "✓" if r.get("hard") else "✗"

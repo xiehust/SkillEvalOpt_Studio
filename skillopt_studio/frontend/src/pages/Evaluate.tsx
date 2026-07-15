@@ -23,7 +23,7 @@ export default function Evaluate() {
   const [targetBackend, setTargetBackend] = useState("claude_code_exec");
   const [backends, setBackends] = useState<BackendStatus[] | null>(null);
   const [model, setModel] = useState("global.anthropic.claude-opus-4-8");
-  const [optimizerModel, setOptimizerModel] = useState("openai.gpt-5.5");
+  const [optimizerModel, setOptimizerModel] = useState("openai.gpt-5.6-sol");
   const [workers, setWorkers] = useState(3);
   const [timeout_, setTimeout_] = useState(900);
   const [limit, setLimit] = useState(0);

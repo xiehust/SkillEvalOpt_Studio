@@ -62,6 +62,32 @@ class TaskSetUpdate(BaseModel):
     tasks_by_split: dict[str, list[dict]]
 
 
+class PluginCoverageRequest(BaseModel):
+    skill_ids: list[str]
+    trainable_skill_ids: Optional[list[str]] = None
+    plugin: str
+    split_ratio: str = "4:3:3"
+
+
+class PluginSkillCoverage(BaseModel):
+    skill_id: str
+    skill_name: str
+    count: int
+    required: int
+    train_count: Optional[int] = None
+    validation_count: Optional[int] = None
+
+
+class PluginCoverageReport(BaseModel):
+    valid: bool
+    mode: TaskSetMode
+    total_count: int
+    generation_minimum_count: int
+    minimum_tasks_per_skill: int
+    skills: list[PluginSkillCoverage]
+    reasons: list[str] = Field(default_factory=list)
+
+
 class JobInfo(BaseModel):
     id: str
     # "eval" | "train" (+ "echo", an internal harmless test type used before the

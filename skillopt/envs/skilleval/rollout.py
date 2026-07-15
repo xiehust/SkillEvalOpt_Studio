@@ -18,6 +18,7 @@ from typing import TypedDict
 
 from skillopt.model.backend_config import get_target_backend
 from skillopt.model.codex_harness import (
+    extract_exec_failure,
     extract_exec_usage,
     prepare_workspace,
     run_claude_code_exec,
@@ -128,7 +129,8 @@ def _rollout_one(
         # edits (the default exec prompt injects "Do not modify files.") and
         # extend the read-only default tool set accordingly. codex_exec gets
         # the same freedom through its workspace-write sandbox default.
-        if get_target_backend() == "codex_exec":
+        backend = "codex_exec" if get_target_backend() == "codex_exec" else "claude_code_exec"
+        if backend == "codex_exec":
             response, raw = run_codex_exec(
                 work_dir=work_dir,
                 prompt=PLUGIN_GUIDE_PROMPT if runtime_skills else GUIDE_PROMPT,
@@ -148,6 +150,13 @@ def _rollout_one(
         usage = extract_exec_usage(raw)
         if usage is not None:
             result["usage"] = usage
+        if not response.strip():
+            detail = extract_exec_failure(raw)
+            result["error"] = (
+                f"{backend} failed to produce a final response: {detail}"
+                if detail
+                else f"{backend} returned an empty response after all attempts"
+            )
     except Exception as exc:  # noqa: BLE001 — isolate task failures
         result["error"] = f"{type(exc).__name__}: {exc}"
         result["error_traceback"] = traceback.format_exc(limit=5)

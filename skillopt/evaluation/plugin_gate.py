@@ -23,14 +23,20 @@ class FailureAttribution:
     category: AttributionCategory
     responsible_skills: tuple[str, ...]
     gradient_eligible: bool
+    target_skills: tuple[str, ...] = ()
+    reason: str | None = None
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "task_id": self.task_id,
             "category": self.category,
             "responsible_skills": list(self.responsible_skills),
             "gradient_eligible": self.gradient_eligible,
+            "target_skills": list(self.target_skills),
         }
+        if self.reason is not None:
+            data["reason"] = self.reason
+        return data
 
 
 @dataclass(frozen=True)
@@ -52,17 +58,25 @@ def attribute_failures(
         if float(result.get("hard", 0)) >= 1.0:
             continue
 
+        target_skills = tuple(
+            name
+            for name in result.get("target_skills", [])
+            if isinstance(name, str)
+        )
+        reason: str | None = None
         if result.get("error"):
             category: AttributionCategory = "task_failure"
             responsible: tuple[str, ...] = ()
+            reason = str(result["error"]).strip() or "unknown rollout error"
         elif result.get("judge_error"):
             category = "judge_failure"
             responsible = ()
+            reason = str(result["judge_error"]).strip() or "unknown judge error"
         else:
             targets = tuple(
                 name
-                for name in result.get("target_skills", [])
-                if isinstance(name, str) and name in trainable
+                for name in target_skills
+                if name in trainable
             )
             task_type = str(result.get("task_type") or "default")
             if task_type == "routing":
@@ -81,6 +95,8 @@ def attribute_failures(
                 category=category,
                 responsible_skills=responsible,
                 gradient_eligible=bool(responsible),
+                target_skills=target_skills,
+                reason=reason,
             )
         )
     return attributions
@@ -108,7 +124,12 @@ def select_responsible_skills(
     return ranked[:max_skills]
 
 
-def validate_plugin_coverage(items: list[dict], skill_names: list[str]) -> None:
+def validate_plugin_coverage(
+    items: list[dict],
+    skill_names: list[str],
+    *,
+    split_name: str = "validation",
+) -> None:
     covered = {
         name
         for item in items
@@ -118,7 +139,7 @@ def validate_plugin_coverage(items: list[dict], skill_names: list[str]) -> None:
     missing = [name for name in skill_names if name not in covered]
     if missing:
         raise ValueError(
-            "validation tasks must target every Plugin Skill; "
+            f"{split_name} tasks must target every trainable Plugin Skill; "
             f"missing coverage for: {missing}"
         )
 
@@ -159,6 +180,7 @@ def evaluate_plugin_gate(
     metric: GateMetric = "hard",
     mixed_weight: float = 0.5,
     max_skill_regression: float = 0.0,
+    modified_skill_names: list[str] | tuple[str, ...] | None = None,
 ) -> PluginGateResult:
     if not 0.0 <= max_skill_regression <= 1.0:
         raise ValueError(
@@ -184,6 +206,27 @@ def evaluate_plugin_gate(
             reasons.append(
                 f"{name} regressed by {regression:.6f} "
                 f"(limit {max_skill_regression:.6f})"
+            )
+    if modified_skill_names is not None:
+        modified = list(dict.fromkeys(modified_skill_names))
+        unknown = [name for name in modified if name not in current_skills]
+        if unknown:
+            raise ValueError(
+                f"modified Skills are not trainable Plugin Skills: {unknown}"
+            )
+        improved = [
+            name
+            for name in modified
+            if candidate_skills[name] > current_skills[name]
+        ]
+        if not improved:
+            scores = ", ".join(
+                f"{name} {current_skills[name]:.6f}->{candidate_skills[name]:.6f}"
+                for name in modified
+            )
+            reasons.append(
+                "no modified Skill strictly improved its validation score: "
+                f"{scores or '(none)'}"
             )
     return PluginGateResult(
         action="reject" if reasons else "accept_new_best",

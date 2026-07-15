@@ -54,6 +54,32 @@ export interface TaskSetDetail {
   tasks_by_split: Record<string, TaskItem[]>;
 }
 
+export interface PluginCoverageRequest {
+  skill_ids: string[];
+  trainable_skill_ids?: string[];
+  plugin: string;
+  split_ratio?: string;
+}
+
+export interface PluginSkillCoverage {
+  skill_id: string;
+  skill_name: string;
+  count: number;
+  required: number;
+  train_count: number | null;
+  validation_count: number | null;
+}
+
+export interface PluginCoverageReport {
+  valid: boolean;
+  mode: "single" | "split";
+  total_count: number;
+  generation_minimum_count: number;
+  minimum_tasks_per_skill: number;
+  skills: PluginSkillCoverage[];
+  reasons: string[];
+}
+
 export type JobStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 
 export interface TokenUsage {
@@ -179,6 +205,14 @@ export interface TrainStep {
   current_skill_scores?: Record<string, number> | null;
   regressions?: Record<string, number> | null;
   gate_reasons?: string[] | null;
+  excluded_failures?: TrainExcludedFailure[] | null;
+}
+
+export interface TrainExcludedFailure {
+  task_id: string;
+  category: "task_failure" | "judge_failure";
+  target_skills: string[];
+  reason: string;
 }
 
 export interface PluginTrainMetrics {
@@ -205,6 +239,7 @@ export interface TrainResults {
       rejects: number | null;
       skips: number | null;
       wall_time_s: number | null;
+      excluded_failures: number;
     };
     token_totals: Record<string, number>;
     finished: boolean;
@@ -223,6 +258,7 @@ export interface TaskgenSummary {
   skills?: string[];
   skill_names?: string[];
   skill_count?: number;
+  min_tasks_per_skill?: number;
   attempts?: number;
   duration_s?: number;
 }
@@ -257,6 +293,14 @@ export interface BackendStatus {
   cli: string;
   available: boolean;
   path: string | null;
+}
+
+export interface StudioEnvironment {
+  backends: BackendStatus[];
+  taskgen: {
+    plugin_min_tasks_per_skill: number;
+    plugin_test_reserve: number;
+  };
 }
 
 export class ApiError extends Error {
@@ -308,7 +352,7 @@ export const api = {
       body: JSON.stringify({ username, password }),
     }),
   logout: () => request<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
-  environment: () => request<{ backends: BackendStatus[] }>("/api/environment"),
+  environment: () => request<StudioEnvironment>("/api/environment"),
   skills: () => request<SkillInfo[]>("/api/skills"),
   skillDetail: (id: string) => request<SkillDetail>(`/api/skills/${encodeURIComponent(id)}`),
   skillFile: (id: string, path: string) =>
@@ -327,6 +371,12 @@ export const api = {
   tasksets: () => request<TaskSetInfo[]>("/api/tasksets"),
   tasksetDetail: (id: string, full = false) =>
     request<TaskSetDetail>(`/api/tasksets/${encodeURIComponent(id)}${full ? "?full=1" : ""}`),
+  pluginCoverage: (id: string, payload: PluginCoverageRequest) =>
+    request<PluginCoverageReport>(`/api/tasksets/${encodeURIComponent(id)}/plugin-coverage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
   createTaskset: (name: string, mode: "single" | "split", files: Record<string, File>) => {
     const form = new FormData();
     form.append("name", name);

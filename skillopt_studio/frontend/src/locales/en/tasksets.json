@@ -30,6 +30,7 @@
       "namePlaceholder": "e.g. Report-generation regression set",
       "nameRequired": "Please enter a task set name"
     },
+    "pluginCoverageGuidance": "Plugin multi-Skill training needs at least {{minimum}} distinct source tasks for every trainable Skill so training and validation stay disjoint, plus {{reserve}} additional task reserved for test. Task sets stay reusable; the selected trainable Skills are checked again when training starts.",
     "upload": {
       "mode": "Mode",
       "modeSingle": "single — one tasks.json (auto-split by ratio during training)",

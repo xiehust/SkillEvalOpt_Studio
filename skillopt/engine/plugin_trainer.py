@@ -100,12 +100,20 @@ class PluginTrainer:
             raise ValueError("gate_mixed_weight must be in [0, 1]")
 
         cfg["plugin_skill_names"] = list(self.initial_state.names)
+        cfg["required_training_skills"] = list(
+            self.initial_state.trainable_names
+        )
         cfg["required_validation_skills"] = list(
             self.initial_state.trainable_names
         )
         self.adapter.setup(cfg)
         self.dataloader = self.adapter.get_dataloader()
 
+        validate_plugin_coverage(
+            list(self.dataloader.train_items),
+            list(self.initial_state.trainable_names),
+            split_name="training",
+        )
         selection_limit = int(cfg.get("sel_env_num", 0) or 0)
         self._selection_items = list(self.dataloader.val_items)
         if selection_limit > 0:
@@ -113,6 +121,7 @@ class PluginTrainer:
         validate_plugin_coverage(
             self._selection_items,
             list(self.initial_state.trainable_names),
+            split_name="validation",
         )
 
         batch_size = int(cfg.get("batch_size", 0) or 0)
@@ -388,6 +397,16 @@ class PluginTrainer:
                     "attribution_counts": dict(
                         Counter(entry.category for entry in attributions)
                     ),
+                    "excluded_failures": [
+                        {
+                            "task_id": row["task_id"],
+                            "category": row["category"],
+                            "target_skills": row["target_skills"],
+                            "reason": row.get("reason", ""),
+                        }
+                        for row in attribution_rows
+                        if row["category"] in {"task_failure", "judge_failure"}
+                    ],
                 }
                 if not selected:
                     step_record["action"] = "skip_no_attribution"
@@ -403,6 +422,12 @@ class PluginTrainer:
                         batch.seed,
                     )
                     step_record["skill_reports"] = skill_reports
+                    modified_skills = [
+                        name
+                        for name in selected
+                        if candidate_state.skill(name).content
+                        != current_state.skill(name).content
+                    ]
                     if plugin_hash(candidate_state) == plugin_hash(current_state):
                         step_record["action"] = "skip_no_applied_edits"
                     else:
@@ -422,6 +447,7 @@ class PluginTrainer:
                             max_skill_regression=float(
                                 cfg.get("max_skill_regression", 0.0)
                             ),
+                            modified_skill_names=modified_skills,
                         )
                         step_record.update(
                             {

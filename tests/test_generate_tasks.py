@@ -78,8 +78,20 @@ class TestBuildPrompt:
         assert "### Skill: skill-a" in prompt
         assert "### Skill: skill-b" in prompt
         assert '"target_skills"' in prompt
-        assert "every skill must be covered" in prompt
+        assert "Every skill must appear in target_skills for at least 1 distinct task" in prompt
         assert "routing/disambiguation" in prompt
+
+    def test_multi_skill_prompt_includes_strict_per_skill_quota(self):
+        skills = [
+            gen.SkillDocument("skill-a", "/a", "# A", []),
+            gen.SkillDocument("skill-b", "/b", "# B", []),
+        ]
+        prompt = gen.build_multi_skill_prompt(
+            skills,
+            5,
+            min_tasks_per_skill=2,
+        )
+        assert "at least 2 distinct tasks" in prompt
 
 
 class TestValidateGeneratedTasks:
@@ -98,8 +110,25 @@ class TestValidateGeneratedTasks:
 
     def test_multi_skill_requires_full_coverage_when_count_allows(self):
         items = [MULTI_ITEMS[0], dict(MULTI_ITEMS[0], id="task_002")]
-        with pytest.raises(ValueError, match="does not cover every skill"):
+        with pytest.raises(
+            ValueError,
+            match=r"insufficient per-Skill coverage: skill-b=0/1",
+        ):
             gen.validate_generated_tasks(items, 2, self.skills)
+
+    def test_multi_skill_reports_actual_and_required_quota(self):
+        items = [
+            MULTI_ITEMS[0],
+            dict(MULTI_ITEMS[0], id="task_002"),
+            dict(MULTI_ITEMS[1], id="task_003"),
+        ]
+        with pytest.raises(ValueError, match=r"skill-b=1/2"):
+            gen.validate_generated_tasks(
+                items,
+                3,
+                self.skills,
+                min_tasks_per_skill=2,
+            )
 
     def test_generated_count_must_match_request(self):
         with pytest.raises(ValueError, match="expected exactly 3"):
@@ -241,3 +270,64 @@ class TestMainDispatch:
         assert summary["skill_names"] == ["skill-a", "skill-b"]
         assert summary["skill_count"] == 2
         assert len(summary["skills"]) == 2
+        assert summary["min_tasks_per_skill"] == 1
+
+    def test_multi_skill_quota_failure_is_retried_with_details(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        deficient = [
+            MULTI_ITEMS[0],
+            dict(MULTI_ITEMS[0], id="task_002"),
+            dict(MULTI_ITEMS[0], id="task_003"),
+            dict(MULTI_ITEMS[0], id="task_004"),
+        ]
+        sufficient = [
+            MULTI_ITEMS[0],
+            dict(MULTI_ITEMS[0], id="task_002"),
+            dict(MULTI_ITEMS[1], id="task_003"),
+            dict(MULTI_ITEMS[1], id="task_004"),
+        ]
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            gen,
+            "run_claude_code_exec",
+            _fake_writer([deficient, sufficient], calls),
+        )
+
+        out_root = _run_multi_main(
+            monkeypatch,
+            tmp_path,
+            ["--count", "4", "--min-tasks-per-skill", "2"],
+        )
+
+        assert len(calls) == 2
+        assert "skill-b=0/2" in calls[1]["prompt"]
+        summary = json.loads(
+            (out_root / "gen_summary.json").read_text(encoding="utf-8")
+        )
+        assert summary["min_tasks_per_skill"] == 2
+
+    def test_multi_skill_quota_failure_twice_exits_nonzero(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        deficient = [
+            MULTI_ITEMS[0],
+            dict(MULTI_ITEMS[0], id="task_002"),
+        ]
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            gen,
+            "run_claude_code_exec",
+            _fake_writer([deficient, deficient], calls),
+        )
+
+        with pytest.raises(SystemExit, match="skill-b=0/2"):
+            _run_multi_main(
+                monkeypatch,
+                tmp_path,
+                ["--count", "2", "--min-tasks-per-skill", "2"],
+            )

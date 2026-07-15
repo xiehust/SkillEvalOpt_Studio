@@ -7,7 +7,7 @@ import subprocess
 import pytest
 
 from skillopt.model import codex_harness
-from skillopt.model.codex_harness import extract_exec_usage
+from skillopt.model.codex_harness import extract_exec_failure, extract_exec_usage
 
 
 def _cli_json(result: str = "hello", *, is_error: bool = False,
@@ -76,6 +76,24 @@ class TestExtractExecUsage:
         assert extract_exec_usage("tokens used\nnot a number") is None
 
 
+class TestExtractExecFailure:
+    def test_collects_claude_api_errors_by_attempt(self) -> None:
+        raw = (
+            "===== CLAUDE CLI ATTEMPT 1 =====\n"
+            f"{_cli_json('API Error: Response stalled mid-stream', is_error=True)}\n\n"
+            "===== CLAUDE CLI ATTEMPT 2 =====\n"
+            f"{_cli_json('API Error: overloaded', is_error=True)}"
+        )
+        assert extract_exec_failure(raw) == (
+            "CLAUDE CLI attempt 1: API Error: Response stalled mid-stream; "
+            "CLAUDE CLI attempt 2: API Error: overloaded"
+        )
+
+    def test_empty_or_unstructured_raw_has_no_failure(self) -> None:
+        assert extract_exec_failure("") is None
+        assert extract_exec_failure("plain text output") is None
+
+
 class TestClaudeCliJsonMode:
     """_run_claude_code_cli_exec: JSON parsing with text fallback semantics."""
 
@@ -114,6 +132,22 @@ class TestClaudeCliJsonMode:
         response, raw = self._run(monkeypatch, "", returncode=1, stderr="boom")
         assert response == ""
         assert "boom" in raw
+        assert extract_exec_failure(raw) == (
+            "claude_code_exec: process exited with code 1: boom"
+        )
+
+    def test_timeout_reason_is_preserved(self, monkeypatch) -> None:
+        def fake_run(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+        monkeypatch.setattr(codex_harness.subprocess, "run", fake_run)
+        response, raw = codex_harness._run_claude_code_cli_exec(
+            work_dir="/tmp", prompt="p", model="m", timeout=5,
+        )
+        assert response == ""
+        assert extract_exec_failure(raw) == (
+            "claude_code_exec: timed out after 5 seconds"
+        )
 
 
 class TestRolloutUsageField:

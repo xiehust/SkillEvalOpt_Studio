@@ -39,6 +39,10 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
     def environment() -> dict:
         """CLI availability for each exec backend — the wizards surface this
         so a missing `claude`/`codex` binary is flagged before submitting."""
+        from skillopt.envs.skilleval.coverage import (
+            PLUGIN_MIN_TASKS_PER_SKILL,
+            PLUGIN_TEST_RESERVE,
+        )
         from skillopt_studio import runners
 
         backends = []
@@ -47,7 +51,13 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
             backends.append(
                 {"backend": backend, "cli": cli, "available": path is not None, "path": path}
             )
-        return {"backends": backends}
+        return {
+            "backends": backends,
+            "taskgen": {
+                "plugin_min_tasks_per_skill": PLUGIN_MIN_TASKS_PER_SKILL,
+                "plugin_test_reserve": PLUGIN_TEST_RESERVE,
+            },
+        }
 
     from skillopt_studio import auth
     from skillopt_studio.api import dashboard as dashboard_api
