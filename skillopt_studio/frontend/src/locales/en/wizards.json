@@ -85,6 +85,7 @@
     "introPre": "An AI agent reads the selected skills together and drafts evaluation tasks. The results ",
     "introBold": "are not saved directly",
     "introPost": ": once the job finishes, review it on the detail page and click “Import as new taskset” to confirm in the manual editor before saving.",
+    "expandIntro": "The AI reads the selected skills and the bounded snapshot of every existing split. Results are appended only to the current draft and are not persisted until you save the task set.",
     "errNoSkill": "Select a skill to generate tasks for first.",
     "errNoPluginSkills": "Select a plugin and keep at least two skills.",
     "errCountRange": "The number to generate must be between {{min}} and {{max}}.",

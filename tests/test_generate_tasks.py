@@ -331,3 +331,146 @@ class TestMainDispatch:
                 tmp_path,
                 ["--count", "2", "--min-tasks-per-skill", "2"],
             )
+
+
+class TestExistingTaskExpansion:
+    @staticmethod
+    def _snapshot(tmp_path: Path, *, target_split: str = "val", count: int = 4) -> Path:
+        payload = {
+            "taskset_id": "existing-set",
+            "target_split": target_split,
+            "tasks_by_split": {
+                "train": [
+                    {
+                        "id": f"reserved_{index:03d}",
+                        "question": f"Existing train scenario {index} " + "x" * 700,
+                        "rubric": "Must preserve the existing behavior.",
+                        "files": {"input.txt": "contents must not enter the prompt"},
+                    }
+                    for index in range(count)
+                ],
+                "val": [
+                    {
+                        "id": "val_existing",
+                        "question": "Existing target scenario",
+                        "rubric": "Must remain distinct.",
+                    }
+                ],
+            },
+        }
+        path = tmp_path / "existing_tasks.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_prompt_is_target_first_bounded_and_omits_file_contents(self, tmp_path):
+        snapshot = self._snapshot(
+            tmp_path,
+            count=gen.MAX_EXISTING_TASK_ITEMS + 50,
+        )
+        context = gen.load_existing_task_context(str(snapshot), "val")
+        expansion = gen.build_existing_tasks_prompt(context)
+
+        assert expansion.index("### Existing split: val") < expansion.index("### Existing split: train")
+        assert "Existing target scenario" in expansion
+        assert "semantic duplicates across every split" in expansion
+        assert "contents must not enter the prompt" not in expansion
+        assert '"file_paths":["input.txt"]' in expansion
+        assert len(expansion) <= gen.MAX_EXISTING_TASK_CONTEXT_CHARS
+        assert expansion.count("\n- ") <= gen.MAX_EXISTING_TASK_ITEMS
+        assert "reserved_149" in context.reserved_ids
+
+    def test_no_context_prompt_remains_compatible(self):
+        assert gen.build_prompt("skill", [], 2) == gen.build_prompt(
+            "skill", [], 2, existing_context=None
+        )
+        assert "Existing task-set context" not in gen.build_prompt("skill", [], 2)
+
+    def test_reserved_id_collision_is_rejected_for_single_skill(self):
+        skill = [gen.SkillDocument("skill", "/skill", "# Skill", [])]
+        with pytest.raises(ValueError, match="collide with existing reserved IDs"):
+            gen.validate_generated_tasks(
+                VALID_ITEMS,
+                2,
+                skill,
+                reserved_ids=frozenset({"task_002"}),
+            )
+
+    def test_reserved_id_collision_retries_and_records_expansion_summary(
+        self, monkeypatch, tmp_path
+    ):
+        snapshot = self._snapshot(tmp_path, count=2)
+        collision = [dict(VALID_ITEMS[0], id="reserved_001"), VALID_ITEMS[1]]
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            gen,
+            "run_claude_code_exec",
+            _fake_writer([collision, VALID_ITEMS], calls),
+        )
+
+        out_root = _run_main(
+            monkeypatch,
+            tmp_path,
+            [
+                "--count", "2",
+                "--existing-tasks", str(snapshot),
+                "--target-split", "val",
+            ],
+        )
+
+        assert len(calls) == 2
+        assert "collide with existing reserved IDs" in calls[1]["prompt"]
+        summary = json.loads((out_root / "gen_summary.json").read_text(encoding="utf-8"))
+        assert summary["taskset_id"] == "existing-set"
+        assert summary["target_split"] == "val"
+
+    def test_context_flags_are_all_or_none_before_backend_call(self, monkeypatch, tmp_path):
+        calls: list[dict] = []
+        monkeypatch.setattr(gen, "run_claude_code_exec", lambda **kwargs: calls.append(kwargs))
+        snapshot = self._snapshot(tmp_path)
+
+        with pytest.raises(SystemExit, match="must be provided together"):
+            _run_main(monkeypatch, tmp_path, ["--existing-tasks", str(snapshot)])
+
+        assert calls == []
+
+    def test_prompt_budget_caps_oversized_snapshot_metadata(self, tmp_path):
+        snapshot = self._snapshot(tmp_path)
+        payload = json.loads(snapshot.read_text(encoding="utf-8"))
+        payload["taskset_id"] = "set-" + "x" * (gen.MAX_EXISTING_TASK_CONTEXT_CHARS * 2)
+        snapshot.write_text(json.dumps(payload), encoding="utf-8")
+
+        context = gen.load_existing_task_context(str(snapshot), "val")
+        expansion = gen.build_existing_tasks_prompt(context)
+
+        assert len(expansion) <= gen.MAX_EXISTING_TASK_CONTEXT_CHARS
+        assert "…" in expansion
+
+    @pytest.mark.parametrize(
+        ("mutate", "message"),
+        [
+            (lambda payload: payload.update(target_split="train"), "must match"),
+            (lambda payload: payload.update(tasks_by_split={"train": []}), "canonical"),
+            (
+                lambda payload: payload["tasks_by_split"]["val"].append({"question": "missing id"}),
+                "non-empty string id",
+            ),
+        ],
+    )
+    def test_invalid_snapshot_is_rejected_before_backend_call(
+        self, monkeypatch, tmp_path, mutate, message
+    ):
+        snapshot = self._snapshot(tmp_path)
+        payload = json.loads(snapshot.read_text(encoding="utf-8"))
+        mutate(payload)
+        snapshot.write_text(json.dumps(payload), encoding="utf-8")
+        calls: list[dict] = []
+        monkeypatch.setattr(gen, "run_claude_code_exec", lambda **kwargs: calls.append(kwargs))
+
+        with pytest.raises(SystemExit, match=message):
+            _run_main(
+                monkeypatch,
+                tmp_path,
+                ["--existing-tasks", str(snapshot), "--target-split", "val"],
+            )
+
+        assert calls == []

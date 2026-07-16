@@ -20,6 +20,8 @@ Then read the guides that match the change:
   [Error Handling](./error-handling.md)
 - CLI progress, server logs, diagnostics, or secret redaction:
   [Logging And Observability](./logging-guidelines.md)
+- Task generation or existing-task-set AI expansion:
+  [Studio Taskgen Expansion](./taskgen-expansion.md)
 - Multi-Skill evaluation:
   [SkillEval Plugin Evaluation](./skilleval-plugin-evaluation.md)
 - Multi-Skill training:
@@ -36,6 +38,7 @@ Then read the guides that match the change:
 | [Error Handling](./error-handling.md) | Fail-fast validation, per-task isolation, job failures, and API mapping | Active |
 | [Quality Guidelines](./quality-guidelines.md) | Architecture invariants, testing, verification, and forbidden patterns | Active |
 | [Logging And Observability](./logging-guidelines.md) | CLI progress, server logging, artifacts, and secret redaction | Active |
+| [Studio Taskgen Expansion](./taskgen-expansion.md) | Optional existing-task snapshots, prompt budgets, ID reservation, and editor recovery | Active |
 | [SkillEval Plugin Evaluation](./skilleval-plugin-evaluation.md) | Multi-Skill runtime, Studio payload, validation, and metrics | Active |
 | [SkillEval Plugin Training](./skilleval-plugin-training.md) | Directed multi-Skill updates, complete-Plugin gate, resume, and Studio contracts | Active |
 

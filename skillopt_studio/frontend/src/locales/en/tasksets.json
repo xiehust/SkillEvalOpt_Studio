@@ -71,6 +71,18 @@
     "splitGroup": "{{split}} split",
     "emptyToDelete": " (clear all tasks and save = delete this split)",
     "addTest": "+ Add test split",
+    "expand": {
+      "title": "AI expand tasks",
+      "hint": "Generation runs in the background and appends only to this unsaved draft. Save after review to persist it.",
+      "open": "Configure expansion",
+      "hide": "Hide expansion form",
+      "targetSplit": "Target split",
+      "jobDetail": "View job detail",
+      "appended": "Appended {{count}} generated tasks to {{split}}; review and save when ready.",
+      "emptyResult": "The generation job returned no task items, so the draft was not changed.",
+      "noDraft": "No active edit draft is available. Open the job detail to restore these results.",
+      "invalidRestoreTarget": "The original task set no longer accepts the recorded expansion split."
+    },
     "splitCardTitle": "{{split}} ({{count}} tasks)",
     "table": {
       "id": "ID",

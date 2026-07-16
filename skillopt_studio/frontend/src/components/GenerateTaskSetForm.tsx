@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import { api, ApiError, BackendStatus, SkillInfo, StudioEnvironment } from "../api";
+import { api, ApiError, BackendStatus, JobInfo, SkillInfo, StudioEnvironment } from "../api";
 import { buildPluginGroups, filterPluginGroups, PluginGroup } from "./pluginGroups";
 import { BackendSelect, ErrorBanner, Mono, SourceTag, Spinner } from "./ui";
 
@@ -11,7 +11,13 @@ type TargetMode = "skill" | "plugin";
  * “AI 自动生成”标签页:选定单个技能或同一 Plugin 下的多个技能,提交 taskgen 作业。
  * 生成结果不直接落库——作业完成后在详情页审阅,再导入手动编辑器保存。
  */
-export default function GenerateTaskSetForm() {
+export default function GenerateTaskSetForm({
+  extraJobParams = {},
+  onJobCreated,
+}: {
+  extraJobParams?: Record<string, unknown>;
+  onJobCreated?: (job: JobInfo) => void;
+}) {
   const { t } = useTranslation("wizards");
   const navigate = useNavigate();
   const [skills, setSkills] = useState<SkillInfo[] | null>(null);
@@ -144,8 +150,14 @@ export default function GenerateTaskSetForm() {
         count: effectiveCount,
         guidance: guidance.trim(),
         timeout: timeout_,
+        ...extraJobParams,
       });
-      navigate(`/jobs/${job.id}`);
+      if (onJobCreated) {
+        onJobCreated(job);
+        setSubmitting(false);
+      } else {
+        navigate(`/jobs/${job.id}`);
+      }
     } catch (err) {
       setFormError(err instanceof ApiError ? err.message : String(err));
       setSubmitting(false);
@@ -158,7 +170,11 @@ export default function GenerateTaskSetForm() {
   return (
     <form onSubmit={onSubmit} noValidate className="space-y-4" data-testid="taskset-generate-form">
       <p className="text-xs text-muted">
-        {t("taskgen.introPre")}<b>{t("taskgen.introBold")}</b>{t("taskgen.introPost")}
+        {onJobCreated ? (
+          t("taskgen.expandIntro")
+        ) : (
+          <>{t("taskgen.introPre")}<b>{t("taskgen.introBold")}</b>{t("taskgen.introPost")}</>
+        )}
       </p>
 
       <div>

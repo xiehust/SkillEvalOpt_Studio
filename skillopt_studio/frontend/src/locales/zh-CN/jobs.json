@@ -68,6 +68,10 @@
     "cliDefault": "CLI 默认",
     "attempts": "尝试次数",
     "duration": "耗时",
+    "expansionTarget": "扩充目标",
+    "expansionReviewTitle": "生成的扩充任务（追加前请审阅）",
+    "appendOriginal": "追加到原任务集",
+    "emptyResult": "该任务生成作业没有返回任何任务。",
     "reviewTitle": "生成的任务(审阅后导入)",
     "importAsNew": "导入为新任务集",
     "table": {

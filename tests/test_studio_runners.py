@@ -221,7 +221,8 @@ print("  [PLUGIN STEP 1/1] action=accept_new_best score=0.7500", flush=True)
 FAKE_GEN_SCRIPT = """\
 import argparse, json, os
 p = argparse.ArgumentParser()
-for flag in ("--backend", "--model", "--guidance", "--out_root"):
+for flag in ("--backend", "--model", "--guidance", "--out_root",
+             "--existing-tasks", "--target-split"):
     p.add_argument(flag, default="")
 p.add_argument("--skill", action="append", default=[])
 for flag in ("--count", "--timeout", "--min-tasks-per-skill"):
@@ -241,6 +242,11 @@ summary = {"count": len(tasks), "requested_count": a.count, "backend": a.backend
            "skills": a.skill, "skill_count": len(a.skill),
            "min_tasks_per_skill": a.min_tasks_per_skill,
            "attempts": 1, "duration_s": 0.1}
+if a.existing_tasks:
+    with open(a.existing_tasks, encoding="utf-8") as f:
+        snapshot = json.load(f)
+    summary["taskset_id"] = snapshot["taskset_id"]
+    summary["target_split"] = a.target_split
 with open(os.path.join(a.out_root, "gen_summary.json"), "w", encoding="utf-8") as f:
     json.dump(summary, f)
 print(f"[taskgen] done: {len(tasks)} tasks", flush=True)
@@ -784,6 +790,120 @@ class TestBuildTaskgenCommand:
                 job_dir_of(studio_config, "gen-bad-list"),
             )
 
+    def test_single_expansion_writes_full_snapshot_and_flags(
+        self, studio_config, stub_scripts, claude_skill, single_taskset
+    ):
+        job_dir = job_dir_of(studio_config, "gen-expand-single")
+        argv = build_taskgen_command(
+            studio_config,
+            {
+                "skill_id": "claude--local-skill",
+                "taskset_id": "single-set",
+                "target_split": "tasks",
+            },
+            job_dir,
+        )
+
+        snapshot_path = job_dir / "existing_tasks.json"
+        assert argv[argv.index("--existing-tasks") + 1] == str(snapshot_path)
+        assert argv[argv.index("--target-split") + 1] == "tasks"
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        assert snapshot["taskset_id"] == "single-set"
+        assert snapshot["target_split"] == "tasks"
+        assert [item["id"] for item in snapshot["tasks_by_split"]["tasks"]] == [
+            "t0", "t1", "t2", "t3"
+        ]
+
+    @pytest.mark.parametrize("target_split", ["train", "test"])
+    def test_split_expansion_accepts_existing_or_optional_test(
+        self, studio_config, stub_scripts, claude_skill, split_taskset, target_split
+    ):
+        if target_split == "test":
+            (studio_config.tasksets_dir / "split-set" / "test.json").unlink()
+        job_dir = job_dir_of(studio_config, f"gen-expand-{target_split}")
+
+        argv = build_taskgen_command(
+            studio_config,
+            {
+                "skill_id": "claude--local-skill",
+                "taskset_id": "split-set",
+                "target_split": target_split,
+            },
+            job_dir,
+        )
+
+        assert argv[argv.index("--target-split") + 1] == target_split
+        snapshot = json.loads((job_dir / "existing_tasks.json").read_text(encoding="utf-8"))
+        assert set(snapshot["tasks_by_split"]) == (
+            {"train", "val"} if target_split == "test" else {"train", "val", "test"}
+        )
+
+    def test_expansion_context_is_all_or_none(
+        self, studio_config, stub_scripts, claude_skill, single_taskset
+    ):
+        for params in (
+            {"taskset_id": "single-set"},
+            {"target_split": "tasks"},
+        ):
+            with pytest.raises(ValueError, match="must be provided together"):
+                build_taskgen_command(
+                    studio_config,
+                    {"skill_id": "claude--local-skill", **params},
+                    job_dir_of(studio_config, "gen-expand-pair-" + str(len(params))),
+                )
+
+    def test_expansion_rejects_missing_wrong_split_and_sample(
+        self, studio_config, stub_scripts, claude_skill, single_taskset, split_taskset
+    ):
+        cases = [
+            ("ghost", "tasks", "not found"),
+            ("single-set", "train", "single-mode"),
+            ("split-set", "tasks", "existing split"),
+        ]
+        for index, (taskset_id, target_split, message) in enumerate(cases):
+            with pytest.raises(ValueError, match=message):
+                build_taskgen_command(
+                    studio_config,
+                    {
+                        "skill_id": "claude--local-skill",
+                        "taskset_id": taskset_id,
+                        "target_split": target_split,
+                    },
+                    job_dir_of(studio_config, f"gen-expand-invalid-{index}"),
+                )
+
+        studio_config.samples_enabled = True
+        save_taskset(
+            studio_config,
+            "sample-expand",
+            {"tasks": valid_tasks(count=1)},
+            "single",
+            sample=True,
+        )
+        with pytest.raises(ValueError, match="read-only sample"):
+            build_taskgen_command(
+                studio_config,
+                {
+                    "skill_id": "claude--local-skill",
+                    "taskset_id": "sample-expand",
+                    "target_split": "tasks",
+                },
+                job_dir_of(studio_config, "gen-expand-sample"),
+            )
+
+    def test_ordinary_taskgen_has_no_expansion_artifact_or_flags(
+        self, studio_config, stub_scripts, claude_skill
+    ):
+        job_dir = job_dir_of(studio_config, "gen-ordinary-compatible")
+        argv = build_taskgen_command(
+            studio_config,
+            {"skill_id": "claude--local-skill"},
+            job_dir,
+        )
+        assert "--existing-tasks" not in argv
+        assert "--target-split" not in argv
+        assert not (job_dir / "existing_tasks.json").exists()
+
 
 class TestStudioApiE2E:
     @pytest.fixture
@@ -1135,6 +1255,56 @@ class TestStudioApiE2E:
         assert body["tasks"][0]["rubric"] == "Must satisfy criterion 0."
         assert body["summary"]["requested_count"] == 3
         assert body["summary"]["backend"] == "claude_code_exec"
+
+    def test_taskgen_expansion_job_end_to_end(
+        self, studio_config, client, claude_skill, split_taskset
+    ):
+        response = client.post(
+            "/api/jobs",
+            json={
+                "type": "taskgen",
+                "params": {
+                    "skill_id": "claude--local-skill",
+                    "count": 2,
+                    "taskset_id": "split-set",
+                    "target_split": "val",
+                },
+            },
+        )
+        assert response.status_code == 200, response.text
+        job = response.json()
+        assert job["params"]["taskset_id"] == "split-set"
+        assert job["params"]["target_split"] == "val"
+        self._wait_status(client, job["id"], "succeeded")
+
+        body = client.get(f"/api/jobs/{job['id']}/results").json()
+        assert body["type"] == "taskgen"
+        assert body["summary"]["taskset_id"] == "split-set"
+        assert body["summary"]["target_split"] == "val"
+        snapshot = json.loads(
+            (studio_config.jobs_dir / job["id"] / "existing_tasks.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert set(snapshot["tasks_by_split"]) == {"train", "val", "test"}
+
+    def test_taskgen_expansion_validation_fails_before_queue(
+        self, client, claude_skill
+    ):
+        response = client.post(
+            "/api/jobs",
+            json={
+                "type": "taskgen",
+                "params": {
+                    "skill_id": "claude--local-skill",
+                    "taskset_id": "missing",
+                    "target_split": "tasks",
+                },
+            },
+        )
+        assert response.status_code == 400
+        assert "not found" in response.json()["detail"]
+        assert client.get("/api/jobs").json() == []
 
     def test_multi_skill_taskgen_job_end_to_end(
         self, studio_config, client, plugin_skills

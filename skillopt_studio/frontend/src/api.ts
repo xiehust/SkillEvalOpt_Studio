@@ -261,6 +261,8 @@ export interface TaskgenSummary {
   min_tasks_per_skill?: number;
   attempts?: number;
   duration_s?: number;
+  taskset_id?: string;
+  target_split?: string;
 }
 
 export interface TaskgenResults {

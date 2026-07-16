@@ -1,0 +1,8 @@
+{"file":".trellis/spec/backend/index.md","reason":"Final package-level quality checklist"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Required tests, build, full-suite, and forbidden-pattern checks"}
+{"file":".trellis/spec/backend/database-guidelines.md","reason":"Review snapshot persistence and backward-compatible job/artifact fields"}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Verify validation timing and visible API/job errors"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Audit end-to-end data flow and frontend/backend contract consistency"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Detect duplicated taskgen or ID allocation logic"}
+{"file":".trellis/tasks/07-16-taskset-ai-expand/research/existing-flow.md","reason":"Review implementation against confirmed existing flow and compatibility constraints"}
+{"file":".trellis/spec/backend/taskgen-expansion.md","reason":"Executable contract for expansion job params, snapshots, prompt budgets, validation, merge, and recovery"}

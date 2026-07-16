@@ -71,6 +71,18 @@
     "splitGroup": "{{split}} 分组",
     "emptyToDelete": "(清空全部任务并保存 = 删除该分组)",
     "addTest": "+ 添加 test 分组",
+    "expand": {
+      "title": "AI 扩充任务",
+      "hint": "生成作业在后台运行，结果只追加到当前未保存草稿；审阅后仍需点击保存才会落库。",
+      "open": "配置 AI 扩充",
+      "hide": "收起扩充表单",
+      "targetSplit": "目标分组",
+      "jobDetail": "查看作业详情",
+      "appended": "已向 {{split}} 追加 {{count}} 条生成任务，请审阅并在确认后保存。",
+      "emptyResult": "生成作业未返回任务条目，当前草稿未发生变化。",
+      "noDraft": "当前没有可用的编辑草稿，请从作业详情恢复追加。",
+      "invalidRestoreTarget": "原任务集已不再接受作业记录的目标分组。"
+    },
     "splitCardTitle": "{{split}}({{count}} 条)",
     "table": {
       "id": "ID",

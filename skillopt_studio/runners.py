@@ -12,6 +12,7 @@ scripts/train.py actually accepts.
 """
 from __future__ import annotations
 
+import json
 import random
 import re
 import shlex
@@ -359,11 +360,62 @@ def build_eval_command(config: StudioConfig, params: dict, job_dir: Path) -> lis
     return argv
 
 
+def _materialize_taskgen_expansion(
+    config: StudioConfig,
+    params: dict,
+    job_dir: Path,
+) -> tuple[Path, str] | None:
+    has_taskset = "taskset_id" in params
+    has_target = "target_split" in params
+    if has_taskset != has_target:
+        raise ValueError("taskset_id and target_split must be provided together for taskgen expansion")
+    if not has_taskset:
+        return None
+
+    taskset_id = params.get("taskset_id")
+    target_split = params.get("target_split")
+    if not isinstance(taskset_id, str) or not taskset_id:
+        raise ValueError("taskset_id must be a non-empty string")
+    if not isinstance(target_split, str) or not target_split:
+        raise ValueError("target_split must be a non-empty string")
+    taskset = tasksets.get_taskset(config, taskset_id)
+    if taskset is None:
+        raise ValueError(f"task set {taskset_id!r} not found")
+    if taskset.sample:
+        raise ValueError(f"task set {taskset_id!r} is a read-only sample and cannot be expanded")
+
+    tasks_by_split = tasksets.get_taskset_tasks(config, taskset_id)
+    if taskset.mode == "single":
+        if target_split != "tasks":
+            raise ValueError("single-mode taskgen expansion target_split must be 'tasks'")
+    elif target_split not in tasks_by_split and target_split != "test":
+        raise ValueError(
+            f"split-mode target_split must be an existing split or optional 'test', got {target_split!r}"
+        )
+
+    job_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path = job_dir / "existing_tasks.json"
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "taskset_id": taskset_id,
+                "target_split": target_split,
+                "tasks_by_split": tasks_by_split,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return snapshot_path, target_split
+
+
 def build_taskgen_command(config: StudioConfig, params: dict, job_dir: Path) -> list[str]:
     """argv for scripts/generate_tasks.py; output goes to <job_dir>/out."""
     _require_script(GEN_SCRIPT)
     skills = _resolve_skill_selection(config, params)
     target_backend = _resolve_target_backend(params)
+    expansion = _materialize_taskgen_expansion(config, params, job_dir)
 
     count = _validated_int(params, "count")
     effective_count = count if count is not None else 5
@@ -391,6 +443,12 @@ def build_taskgen_command(config: StudioConfig, params: dict, job_dir: Path) -> 
     timeout = _validated_int(params, "timeout")
     if timeout is not None:
         argv += ["--timeout", str(timeout)]
+    if expansion is not None:
+        snapshot_path, target_split = expansion
+        argv += [
+            "--existing-tasks", str(snapshot_path),
+            "--target-split", target_split,
+        ]
     return argv
 
 

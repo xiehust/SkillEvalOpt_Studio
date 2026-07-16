@@ -1,0 +1,9 @@
+{"file":".trellis/spec/backend/index.md","reason":"Studio backend package ownership and pre-development checklist"}
+{"file":".trellis/spec/backend/directory-structure.md","reason":"Keep routes, runners, taskset persistence, scripts, and frontend responsibilities separated"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Testing, validation, architecture, and verification requirements"}
+{"file":".trellis/spec/backend/database-guidelines.md","reason":"Filesystem snapshot, optional schema fields, path safety, and compatibility rules"}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Fail-fast CLI/API validation before model calls and observable job failures"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Feature spans React, HTTP job params, runner snapshot, CLI prompt, and result recovery"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Reuse existing taskgen form/backend and task ID allocation helper"}
+{"file":".trellis/tasks/07-16-taskset-ai-expand/research/existing-flow.md","reason":"Confirmed code paths, compatibility constraints, and approved product decisions"}
+{"file":".trellis/spec/backend/taskgen-expansion.md","reason":"Executable contract for expansion job params, snapshots, prompt budgets, validation, merge, and recovery"}

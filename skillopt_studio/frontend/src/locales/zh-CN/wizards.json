@@ -85,6 +85,7 @@
     "introPre": "由 AI agent 统一阅读所选 Skill 后自动撰写评估任务。生成结果",
     "introBold": "不会直接保存",
     "introPost": ":作业完成后在详情页审阅,点击“导入为新任务集”进入手动编辑器确认再保存。",
+    "expandIntro": "AI 会读取所选 Skill 与全部现有分组的受限快照。结果只追加到当前草稿，点击任务集保存前不会落库。",
     "errNoSkill": "请先选择要生成任务的技能。",
     "errNoPluginSkills": "请选择一个 Plugin,并至少保留两个 Skill。",
     "errCountRange": "生成数量需在 {{min}}-{{max}} 之间。",

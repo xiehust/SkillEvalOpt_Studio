@@ -68,6 +68,10 @@
     "cliDefault": "CLI default",
     "attempts": "Attempts",
     "duration": "Duration",
+    "expansionTarget": "Expansion target",
+    "expansionReviewTitle": "Generated expansion tasks (review before appending)",
+    "appendOriginal": "Append to original taskset",
+    "emptyResult": "This task generation job returned no tasks.",
     "reviewTitle": "Generated tasks (review, then import)",
     "importAsNew": "Import as new taskset",
     "table": {

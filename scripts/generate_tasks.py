@@ -24,7 +24,7 @@ import json
 import os
 import sys
 import time
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import yaml
 
@@ -41,6 +41,9 @@ EXEC_BACKENDS = ("claude_code_exec", "codex_exec")
 OUTPUT_FILENAME = "generated_tasks.json"
 MAX_SKILL_CHARS = 16000
 MAX_TOTAL_SKILL_CHARS = 64000
+MAX_EXISTING_TASK_ITEMS = 100
+MAX_EXISTING_TASK_CONTEXT_CHARS = 24000
+MAX_EXISTING_TASK_FIELD_CHARS = 600
 MAX_ATTEMPTS = 2
 
 
@@ -49,6 +52,13 @@ class SkillDocument(NamedTuple):
     path: str
     content: str
     support_files: list[str]
+
+
+class ExistingTaskContext(NamedTuple):
+    taskset_id: str
+    target_split: str
+    tasks_by_split: dict[str, list[dict]]
+    reserved_ids: frozenset[str]
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,7 +90,72 @@ def parse_args() -> argparse.Namespace:
                    help="Agent timeout in seconds per attempt")
     p.add_argument("--out_root", type=str, required=True,
                    help="Output directory for generated_tasks.json / gen_summary.json")
+    p.add_argument(
+        "--existing-tasks",
+        type=str,
+        default="",
+        help="Optional Studio expansion snapshot JSON",
+    )
+    p.add_argument(
+        "--target-split",
+        type=str,
+        default="",
+        help="Target split recorded in --existing-tasks",
+    )
     return p.parse_args()
+
+
+def load_existing_task_context(path: str, target_split: str) -> ExistingTaskContext:
+    """Strictly decode a Studio expansion snapshot before any model call."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid --existing-tasks snapshot: {exc}") from None
+    if not isinstance(payload, dict):
+        raise ValueError("--existing-tasks snapshot must be a JSON object")
+    taskset_id = payload.get("taskset_id")
+    snapshot_target = payload.get("target_split")
+    tasks_by_split = payload.get("tasks_by_split")
+    if not isinstance(taskset_id, str) or not taskset_id:
+        raise ValueError("--existing-tasks snapshot taskset_id must be a non-empty string")
+    if snapshot_target != target_split:
+        raise ValueError(
+            "--target-split must match the snapshot target_split, "
+            f"got {target_split!r} and {snapshot_target!r}"
+        )
+    if not isinstance(tasks_by_split, dict) or not tasks_by_split:
+        raise ValueError("--existing-tasks snapshot tasks_by_split must be a non-empty object")
+
+    normalized: dict[str, list[dict]] = {}
+    reserved_ids: set[str] = set()
+    for split, items in tasks_by_split.items():
+        if not isinstance(split, str) or not split:
+            raise ValueError("snapshot split names must be non-empty strings")
+        if not isinstance(items, list):
+            raise ValueError(f"snapshot split {split!r} must contain an array")
+        normalized_items: list[dict] = []
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                raise ValueError(f"snapshot {split} item #{index} must be an object")
+            task_id = item.get("id")
+            if not isinstance(task_id, str) or not task_id:
+                raise ValueError(f"snapshot {split} item #{index} has no non-empty string id")
+            reserved_ids.add(task_id)
+            normalized_items.append(item)
+        normalized[split] = normalized_items
+    split_names = set(normalized)
+    single_shape = split_names == {"tasks"}
+    split_shape = {"train", "val"}.issubset(split_names) and split_names <= {"train", "val", "test"}
+    if not single_shape and not split_shape:
+        raise ValueError(
+            "snapshot tasks_by_split must be canonical single {tasks} or split {train,val[,test]}"
+        )
+    if single_shape and target_split != "tasks":
+        raise ValueError("single snapshot target split must be 'tasks'")
+    if split_shape and target_split not in normalized and target_split != "test":
+        raise ValueError(f"snapshot target split {target_split!r} does not exist")
+    return ExistingTaskContext(taskset_id, target_split, normalized, frozenset(reserved_ids))
 
 
 def collect_skill(path: str) -> tuple[str, list[str]]:
@@ -145,6 +220,7 @@ def build_prompt(
     count: int,
     guidance: str = "",
     feedback: str | None = None,
+    existing_context: ExistingTaskContext | None = None,
 ) -> str:
     """Backward-compatible single-skill generation prompt."""
     skill = SkillDocument(
@@ -153,7 +229,9 @@ def build_prompt(
         content=skill_content,
         support_files=support_files,
     )
-    return _build_prompt([skill], count, guidance, feedback)
+    return _build_prompt(
+        [skill], count, guidance, feedback, existing_context=existing_context
+    )
 
 
 def build_multi_skill_prompt(
@@ -162,6 +240,7 @@ def build_multi_skill_prompt(
     guidance: str = "",
     feedback: str | None = None,
     min_tasks_per_skill: int = 1,
+    existing_context: ExistingTaskContext | None = None,
 ) -> str:
     """Unified generation prompt for multiple named skills."""
     if len(skills) < 2:
@@ -172,6 +251,7 @@ def build_multi_skill_prompt(
         guidance,
         feedback,
         min_tasks_per_skill=min_tasks_per_skill,
+        existing_context=existing_context,
     )
 
 
@@ -182,6 +262,7 @@ def _build_prompt(
     feedback: str | None,
     *,
     min_tasks_per_skill: int = 1,
+    existing_context: ExistingTaskContext | None = None,
 ) -> str:
     """Generation prompt implementation shared by single and multi-skill modes."""
     multi = len(skills) > 1
@@ -266,6 +347,8 @@ def _build_prompt(
         "",
         f"Do NOT print the JSON to stdout — write the `{OUTPUT_FILENAME}` file.",
     ]
+    if existing_context is not None:
+        parts += ["", build_existing_tasks_prompt(existing_context)]
     if guidance.strip():
         parts += ["", "## User guidance", "", guidance.strip()]
     if feedback:
@@ -279,15 +362,87 @@ def _build_prompt(
     return "\n".join(parts)
 
 
+def _bounded_task_summary(task: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {"id": task["id"]}
+    for key in ("question", "rubric", "task_type", "target_skills"):
+        value = task.get(key)
+        if value in (None, "", []):
+            continue
+        if isinstance(value, str) and len(value) > MAX_EXISTING_TASK_FIELD_CHARS:
+            value = value[:MAX_EXISTING_TASK_FIELD_CHARS] + "…"
+        summary[key] = value
+    files = task.get("files")
+    if isinstance(files, dict) and files:
+        summary["file_paths"] = sorted(str(name) for name in files)
+    return summary
+
+
+def build_existing_tasks_prompt(context: ExistingTaskContext) -> str:
+    """Build deterministic target-first context within fixed item/character budgets."""
+    split_order = [context.target_split] + [
+        split for split in context.tasks_by_split if split != context.target_split
+    ]
+    display_taskset_id = context.taskset_id
+    if len(display_taskset_id) > MAX_EXISTING_TASK_FIELD_CHARS:
+        display_taskset_id = display_taskset_id[:MAX_EXISTING_TASK_FIELD_CHARS] + "…"
+    lines = [
+        "## Existing task-set context",
+        "",
+        f"You are expanding task set {display_taskset_id!r}, target split "
+        f"{context.target_split!r}. Author only NEW scenarios that add coverage. Avoid "
+        "semantic duplicates across every split, not only duplicate wording or IDs.",
+        "The existing IDs below and any omitted by the display budget are reserved; do not reuse them.",
+    ]
+    item_count = 0
+    omitted = 0
+    for split_index, split in enumerate(split_order):
+        lines += ["", f"### Existing split: {split}"]
+        future_headers = sum(
+            len(f"\n\n### Existing split: {future_split}")
+            for future_split in split_order[split_index + 1:]
+        )
+        for task in context.tasks_by_split.get(split, []):
+            if item_count >= MAX_EXISTING_TASK_ITEMS:
+                omitted += 1
+                continue
+            encoded = json.dumps(
+                _bounded_task_summary(task), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            candidate = "- " + encoded
+            if (
+                len("\n".join(lines + [candidate])) + future_headers
+                > MAX_EXISTING_TASK_CONTEXT_CHARS
+            ):
+                omitted += 1
+                continue
+            lines.append(candidate)
+            item_count += 1
+    if omitted:
+        marker = f"\n[... {omitted} existing task summaries omitted by deterministic prompt limits ...]"
+        text = "\n".join(lines)
+        if len(text) + len(marker) <= MAX_EXISTING_TASK_CONTEXT_CHARS:
+            text += marker
+        return text
+    return "\n".join(lines)
+
+
 def validate_generated_tasks(
     tasks: list[dict],
     requested_count: int,
     skills: list[SkillDocument],
     min_tasks_per_skill: int = 1,
+    reserved_ids: frozenset[str] = frozenset(),
 ) -> None:
     if len(tasks) != requested_count:
         raise ValueError(
             f"expected exactly {requested_count} generated tasks, got {len(tasks)}"
+        )
+    collisions = sorted(
+        task.get("id") for task in tasks if task.get("id") in reserved_ids
+    )
+    if collisions:
+        raise ValueError(
+            f"generated task IDs collide with existing reserved IDs: {collisions}"
         )
     if len(skills) < 2:
         return
@@ -354,6 +509,16 @@ def run_agent(backend: str, work_dir: str, prompt: str, model: str, timeout: int
 
 def main() -> None:
     args = parse_args()
+    if bool(args.existing_tasks) != bool(args.target_split):
+        sys.exit("error: --existing-tasks and --target-split must be provided together")
+    try:
+        existing_context = (
+            load_existing_task_context(args.existing_tasks, args.target_split)
+            if args.existing_tasks
+            else None
+        )
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
     if args.count < 1:
         sys.exit(f"error: --count must be >= 1, got {args.count}")
     if args.min_tasks_per_skill < 1:
@@ -401,6 +566,7 @@ def main() -> None:
                 args.guidance,
                 feedback,
                 min_tasks_per_skill=args.min_tasks_per_skill,
+                existing_context=existing_context,
             )
         else:
             prompt = build_prompt(
@@ -409,6 +575,7 @@ def main() -> None:
                 args.count,
                 args.guidance,
                 feedback,
+                existing_context=existing_context,
             )
         run_agent(args.backend, work_dir, prompt, model, args.timeout)
         try:
@@ -420,6 +587,9 @@ def main() -> None:
                 args.count,
                 skills,
                 min_tasks_per_skill=args.min_tasks_per_skill,
+                reserved_ids=(
+                    existing_context.reserved_ids if existing_context else frozenset()
+                ),
             )
             break
         except ValueError as exc:
@@ -450,6 +620,9 @@ def main() -> None:
         "attempts": attempts,
         "duration_s": duration_s,
     }
+    if existing_context is not None:
+        summary["taskset_id"] = existing_context.taskset_id
+        summary["target_split"] = existing_context.target_split
     with open(os.path.join(out_root, "gen_summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 

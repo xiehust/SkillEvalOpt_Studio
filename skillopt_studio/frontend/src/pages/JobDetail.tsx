@@ -281,6 +281,13 @@ function TaskgenResultsView({ results, job }: { results: TaskgenResults; job: Jo
   const { t } = useTranslation("jobs");
   const navigate = useNavigate();
   const { tasks, summary } = results;
+  const expansionTasksetId = typeof job.params.taskset_id === "string"
+    ? job.params.taskset_id
+    : null;
+  const expansionTargetSplit = typeof job.params.target_split === "string"
+    ? job.params.target_split
+    : null;
+  const isExpansion = Boolean(expansionTasksetId && expansionTargetSplit);
 
   const suggestedName = () => {
     const plugin = String(job.params.plugin ?? "");
@@ -303,6 +310,21 @@ function TaskgenResultsView({ results, job }: { results: TaskgenResults; job: Jo
     });
   };
 
+  const appendToOriginal = () => {
+    if (!expansionTasksetId || !expansionTargetSplit || tasks.length === 0) return;
+    navigate(`/tasksets/${encodeURIComponent(expansionTasksetId)}`, {
+      state: {
+        appendGeneratedTasks: tasks,
+        targetSplit: expansionTargetSplit,
+        sourceJobId: job.id,
+      },
+    });
+  };
+
+  if (tasks.length === 0) {
+    return <ErrorBanner message={t("taskgen.emptyResult")} />;
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap gap-3">
@@ -317,14 +339,36 @@ function TaskgenResultsView({ results, job }: { results: TaskgenResults; job: Jo
         {summary.duration_s != null && (
           <StatBadge label={t("taskgen.duration")} value={formatDuration(summary.duration_s)} tone="muted" />
         )}
+        {isExpansion && (
+          <StatBadge
+            label={t("taskgen.expansionTarget")}
+            value={`${expansionTasksetId} / ${expansionTargetSplit}`}
+            tone="s5"
+          />
+        )}
       </div>
 
       <Card
-        title={t("taskgen.reviewTitle")}
+        title={isExpansion ? t("taskgen.expansionReviewTitle") : t("taskgen.reviewTitle")}
         actions={
-          <button className="btn-primary" onClick={importTasks} data-testid="taskgen-import">
-            {t("taskgen.importAsNew")}
-          </button>
+          <div className="flex flex-wrap gap-2">
+            {isExpansion && (
+              <button
+                className="btn-primary"
+                onClick={appendToOriginal}
+                data-testid="taskgen-append-original"
+              >
+                {t("taskgen.appendOriginal")}
+              </button>
+            )}
+            <button
+              className={isExpansion ? "btn-ghost" : "btn-primary"}
+              onClick={importTasks}
+              data-testid="taskgen-import"
+            >
+              {t("taskgen.importAsNew")}
+            </button>
+          </div>
         }
       >
         <div className="overflow-x-auto -m-4">
