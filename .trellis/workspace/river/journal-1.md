@@ -170,3 +170,36 @@ Replaced Trellis backend templates with source-backed architecture, persistence,
 ### Next Steps
 
 - None - task complete
+
+
+## Session 6: Fix Codex taskgen generation failures
+
+**Date**: 2026-07-16
+**Task**: Fix Codex taskgen generation failures
+**Branch**: `main`
+
+### Summary
+
+Diagnosed taskgen-20260716-014610-bf11d6: a parent Trellis UserPromptSubmit hook was resolved relative to gen_workspace and blocked Codex before the model turn, while Ubuntu AppArmor also prevented bwrap user namespaces. Isolated Codex exec workspaces from parent project discovery/hooks, preserved agent diagnostics when generated_tasks.json is missing, installed and loaded the recommended bwrap AppArmor profile, passed 1254 backend tests plus frontend build, and verified the original 13-task expansion as taskgen-20260716-020447-9b6dc1 with no ID collisions.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `29e058a` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
