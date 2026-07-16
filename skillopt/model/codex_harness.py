@@ -1432,6 +1432,12 @@ def _run_codex_cli_exec(
         "never",
         "-C",
         work_dir,
+        # Exec workspaces often live below the host repository. Keep parent
+        # project config, instructions, skills, and hooks out of the target run.
+        "-c",
+        "project_root_markers=[]",
+        "--disable",
+        "hooks",
     ]
     if config.get("profile"):
         cmd.extend(["-p", str(config["profile"])])
@@ -1488,6 +1494,16 @@ def _run_codex_cli_exec(
         detail = (stderr or stdout).strip()
         raise RuntimeError(
             f"codex exec failed with exit code {proc.returncode}: {detail[:4000]}"
+        )
+    blocked_hook = re.search(
+        r"(?m)^hook: ([^\r\n]+)\r?\nhook: \1 Blocked\r?$",
+        raw,
+    )
+    if blocked_hook and not last_message.strip():
+        _persist_codex_artifacts(work_dir, raw, last_message)
+        raise RuntimeError(
+            f"codex exec was blocked by hook {blocked_hook.group(1)!r}; "
+            "isolated exec workspaces must not inherit lifecycle hooks"
         )
     return last_message, raw
 

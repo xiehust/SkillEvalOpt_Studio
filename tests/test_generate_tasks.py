@@ -247,6 +247,7 @@ class TestMainDispatch:
         with pytest.raises(SystemExit) as excinfo:
             _run_main(monkeypatch, tmp_path, ["--count", "2"])
         assert "did not write" in str(excinfo.value)
+        assert "I forgot to write the file" in str(excinfo.value)
         assert "did not write" in calls[1]["prompt"]
 
     def test_summary_records_model_and_backend(self, monkeypatch, tmp_path):

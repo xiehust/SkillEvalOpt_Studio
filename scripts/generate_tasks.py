@@ -577,10 +577,14 @@ def main() -> None:
                 feedback,
                 existing_context=existing_context,
             )
-        run_agent(args.backend, work_dir, prompt, model, args.timeout)
+        agent_response = run_agent(args.backend, work_dir, prompt, model, args.timeout)
         try:
             if not os.path.isfile(out_file):
-                raise ValueError(f"agent did not write {OUTPUT_FILENAME} in its working directory")
+                detail = " ".join(agent_response.split())
+                suffix = f"; agent response: {detail[:500]}" if detail else ""
+                raise ValueError(
+                    f"agent did not write {OUTPUT_FILENAME} in its working directory{suffix}"
+                )
             tasks = load_tasks(out_file)
             validate_generated_tasks(
                 tasks,

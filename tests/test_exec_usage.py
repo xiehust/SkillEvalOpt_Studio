@@ -150,6 +150,44 @@ class TestClaudeCliJsonMode:
         )
 
 
+class TestCodexCliIsolation:
+    def test_command_does_not_discover_parent_project_or_run_hooks(self, tmp_path, monkeypatch) -> None:
+        captured: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            index = cmd.index("--output-last-message")
+            with open(cmd[index + 1], "w", encoding="utf-8") as handle:
+                handle.write("done")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(codex_harness.subprocess, "run", fake_run)
+        response, _raw = codex_harness._run_codex_cli_exec(
+            work_dir=str(tmp_path), prompt="p", model="", timeout=5,
+        )
+
+        cmd = captured["cmd"]
+        assert "project_root_markers=[]" in cmd
+        disable_index = cmd.index("--disable")
+        assert cmd[disable_index + 1] == "hooks"
+        assert response == "done"
+
+    def test_zero_exit_blocked_hook_is_reported(self, tmp_path, monkeypatch) -> None:
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+
+        def fake_run(cmd, **kwargs):
+            stderr = "hook: UserPromptSubmit\nhook: UserPromptSubmit Blocked\n"
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr=stderr)
+
+        monkeypatch.setattr(codex_harness.subprocess, "run", fake_run)
+        with pytest.raises(RuntimeError, match="blocked by hook 'UserPromptSubmit'"):
+            codex_harness._run_codex_cli_exec(
+                work_dir=str(work_dir), prompt="p", model="", timeout=5,
+            )
+        assert (tmp_path / "codex_raw.txt").is_file()
+
+
 class TestRolloutUsageField:
     def test_rollout_result_carries_usage(self, tmp_path, monkeypatch) -> None:
         from skillopt.envs.skilleval import rollout

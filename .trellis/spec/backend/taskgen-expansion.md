@@ -4,7 +4,7 @@
 
 ### 1. Scope / Trigger
 
-This contract applies when Studio creates a `taskgen` job that should add complementary tasks to an existing editable task set. It spans the React editor, generic Studio job API, runner-owned filesystem snapshot, `scripts/generate_tasks.py`, and JobDetail recovery.
+This contract applies when Studio creates a `taskgen` job that should add complementary tasks to an existing editable task set. It spans the React editor, generic Studio job API, runner-owned filesystem snapshot, `scripts/generate_tasks.py`, the isolated Codex/Claude exec workspace, and JobDetail recovery.
 
 Keep this as an optional extension of normal task generation. Do not add a second model endpoint or write generated tasks directly to task-set persistence.
 
@@ -52,6 +52,15 @@ scripts/generate_tasks.py ... \
   --target-split train
 ```
 
+Codex task generation must run with a workspace-local project root and no lifecycle hooks:
+
+```text
+codex exec -C <work_dir> \
+  -c project_root_markers=[] \
+  --disable hooks \
+  ...
+```
+
 ### 3. Contracts
 
 Expansion job params:
@@ -80,6 +89,10 @@ The existing-task prompt section is deterministic: target split first, remaining
 
 `generated_tasks.json` remains a task array. Expansion metadata in `gen_summary.json` is optional, so old jobs remain readable. Job params are the source of truth for frontend recovery.
 
+Studio output directories normally live below the SkillOpt repository. A Codex target run must treat its generated workspace as the project root so it cannot discover parent `.codex/`, `AGENTS.md`, or unrelated repository Skills. Lifecycle hooks must also be disabled: a parent `UserPromptSubmit` hook may execute relative to the generated workspace, fail before the model turn, and still leave Codex with a zero exit code and an empty final response.
+
+When the agent returns without writing `generated_tasks.json`, taskgen validation includes a bounded, single-line form of the final agent response when one exists. This preserves infrastructure explanations such as a failed Codex sandbox initialization instead of reducing every failure to “agent did not write”.
+
 The frontend keeps generated tasks in `editSplits` only. It may persist them only through the existing full task-set Save action. JobDetail recovery passes router state with `appendGeneratedTasks`, `targetSplit`, and `sourceJobId`; TaskSetDetail reloads full data, validates the target, merges once, and clears router state.
 
 Editable, non-sample TaskSetDetail pages expose `taskset-ai-expand-shortcut` in the `PageHeader` action group. The shortcut must call the full-data loader through an explicit wrapper such as `() => enterEdit({ openExpansion: true })`; normal Edit calls `() => enterEdit()`. Do not pass an options-accepting loader directly as a React click handler, because the click event would be interpreted as the options argument. Failed full-data loads must remain visible while the page is still outside edit mode.
@@ -95,6 +108,10 @@ Editable, non-sample TaskSetDetail pages expose `taskset-ai-expand-shortcut` in 
 | Split mode target is neither existing nor optional `test` | HTTP 400 before queueing |
 | Snapshot is unreadable, malformed, noncanonical, or target mismatches CLI | CLI preflight failure before backend/model call |
 | Generated ID is in `reserved_ids` | Validation failure enters the existing second-attempt feedback path |
+| Parent repository has Codex hooks or instructions | The exec command stops parent project discovery and disables hooks |
+| Codex reports a successful process exit but a hook blocked the turn | The harness raises an explicit blocked-hook error and persists its trace |
+| Agent writes no output but returns a diagnostic response | Validation and retry feedback include a bounded form of that response |
+| Host cannot initialize the configured Codex sandbox | The diagnostic reaches the taskgen job log; fix the host sandbox instead of silently weakening it |
 | Residual collision during frontend merge | Allocate the next available `task_NNN` across all splits; never overwrite |
 | Job result target does not match current task set/draft mode | Show a localized error and leave the draft untouched |
 | Empty/non-taskgen result | Show an explicit error; do not silently append or save |
@@ -108,6 +125,8 @@ Editable, non-sample TaskSetDetail pages expose `taskset-ai-expand-shortcut` in 
 - **Base compatibility:** ordinary taskgen omits both expansion fields; no snapshot or new CLI flags are produced, and JobDetail retains “import as new task set”.
 - **Bad request:** only `taskset_id` is supplied; command construction fails and the reserved empty job directory is cleaned up.
 - **Bad generation:** the first result reuses `task_001`; validation feedback requests a complete rewrite, and only a collision-free retry succeeds.
+- **Bad host hook:** a repository-level `UserPromptSubmit` hook would resolve its command relative to `gen_workspace`; Codex isolation prevents it from running.
+- **Bad host sandbox:** Codex replies that its workspace sandbox failed to initialize and writes no file; taskgen includes that reply in the validation failure so the operator can repair bwrap/AppArmor.
 - **Bad recovery:** stale job params point to another task set; TaskSetDetail reports an invalid restore target and does not mutate `editSplits`.
 
 ### 6. Tests Required
@@ -118,7 +137,13 @@ Generator tests in `tests/test_generate_tasks.py` must assert:
 - target-first ordering, item/character budgets, and oversized metadata bounds;
 - IDs from displayed and omitted tasks remain reserved;
 - collision feedback reaches the retry and expansion summary metadata is written;
+- a missing output file preserves a bounded agent diagnostic in retry/final errors;
 - prompts without expansion context remain compatible.
+
+Exec harness tests in `tests/test_exec_usage.py` must assert:
+
+- non-judge Codex CLI argv contains `project_root_markers=[]` and `--disable hooks`;
+- a zero-exit transcript that reports a blocked hook raises an explicit error and persists the raw trace.
 
 Studio tests in `tests/test_studio_runners.py` must assert:
 
@@ -138,6 +163,11 @@ Frontend contract changes require `npm run build`, matching English/Simplified C
 argv += ["--taskset-id", params["taskset_id"]]
 ```
 
+```python
+# Lets a job-local Codex run inherit parent hooks, AGENTS.md, and unrelated Skills.
+cmd = ["codex", "exec", "-C", work_dir]
+```
+
 ```tsx
 // Bypasses human review and the task-set full-replace validation boundary.
 await api.updateTaskset(id, { tasks_by_split: mergedGeneratedTasks });
@@ -149,6 +179,15 @@ await api.updateTaskset(id, { tasks_by_split: mergedGeneratedTasks });
 # Resolve and validate synchronously, then pass an immutable job-local snapshot.
 snapshot_path, target_split = _materialize_taskgen_expansion(config, params, job_dir)
 argv += ["--existing-tasks", str(snapshot_path), "--target-split", target_split]
+```
+
+```python
+# Keep the generated workspace isolated while retaining user-level provider/auth config.
+cmd = [
+    "codex", "exec", "-C", work_dir,
+    "-c", "project_root_markers=[]",
+    "--disable", "hooks",
+]
 ```
 
 ```tsx
