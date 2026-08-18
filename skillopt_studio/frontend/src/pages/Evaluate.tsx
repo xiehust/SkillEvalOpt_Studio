@@ -3,7 +3,7 @@ import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { api, ApiError, BackendStatus, SkillInfo, TaskSetInfo } from "../api";
 import { buildPluginGroups, filterPluginGroups } from "../components/pluginGroups";
-import { BackendSelect, Card, ErrorBanner, Mono, PageHeader, SourceFilterChips, SourceTag, Spinner } from "../components/ui";
+import { BackendSelect, Card, ErrorBanner, ExecRunnerToggle, Mono, PageHeader, SourceFilterChips, SourceTag, Spinner } from "../components/ui";
 
 export default function Evaluate() {
   const { t } = useTranslation("wizards");
@@ -22,6 +22,8 @@ export default function Evaluate() {
   const [tasksetId, setTasksetId] = useState("");
   const [targetBackend, setTargetBackend] = useState("claude_code_exec");
   const [backends, setBackends] = useState<BackendStatus[] | null>(null);
+  const [agentcoreAvailable, setAgentcoreAvailable] = useState(false);
+  const [useAgentcore, setUseAgentcore] = useState(false);
   const [model, setModel] = useState("global.anthropic.claude-opus-4-8");
   const [optimizerModel, setOptimizerModel] = useState("openai.gpt-5.6-sol");
   const [workers, setWorkers] = useState(3);
@@ -38,7 +40,12 @@ export default function Evaluate() {
         setTasksets(tasksetList);
       })
       .catch((err) => setLoadError(err instanceof ApiError ? err.message : String(err)));
-    api.environment().then((env) => setBackends(env.backends)).catch(() => setBackends(null));
+    api.environment()
+      .then((env) => {
+        setBackends(env.backends);
+        setAgentcoreAvailable(Boolean(env.agentcore?.available));
+      })
+      .catch(() => setBackends(null));
   }, []);
 
   // 按技能来源推荐执行后端:codex 源技能默认 Codex 执行,模型留空走后端默认
@@ -108,6 +115,7 @@ export default function Evaluate() {
         workers,
         timeout: timeout_,
         ...(limit > 0 ? { limit } : {}),
+        ...(useAgentcore ? { exec_runner: "agentcore" } : {}),
       });
       navigate(`/jobs/${job.id}`);
     } catch (err) {
@@ -346,6 +354,12 @@ export default function Evaluate() {
                   value={limit} onChange={(e) => setLimit(Number(e.target.value))}
                 />
               </div>
+              <ExecRunnerToggle
+                checked={useAgentcore}
+                onChange={setUseAgentcore}
+                available={agentcoreAvailable}
+                className="pt-6"
+              />
             </div>
           </Card>
 

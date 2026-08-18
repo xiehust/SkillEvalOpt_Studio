@@ -3,7 +3,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { api, ApiError, BackendStatus, JobInfo, SkillInfo, StudioEnvironment } from "../api";
 import { buildPluginGroups, filterPluginGroups, PluginGroup } from "./pluginGroups";
-import { BackendSelect, ErrorBanner, Mono, SourceTag, Spinner } from "./ui";
+import { BackendSelect, ErrorBanner, ExecRunnerToggle, Mono, SourceTag, Spinner } from "./ui";
 
 type TargetMode = "skill" | "plugin";
 
@@ -22,6 +22,8 @@ export default function GenerateTaskSetForm({
   const navigate = useNavigate();
   const [skills, setSkills] = useState<SkillInfo[] | null>(null);
   const [backends, setBackends] = useState<BackendStatus[] | null>(null);
+  const [agentcoreAvailable, setAgentcoreAvailable] = useState(false);
+  const [useAgentcore, setUseAgentcore] = useState(false);
   const [taskgenRules, setTaskgenRules] = useState<StudioEnvironment["taskgen"] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -46,6 +48,7 @@ export default function GenerateTaskSetForm({
     api.environment()
       .then((env) => {
         setBackends(env.backends);
+        setAgentcoreAvailable(Boolean(env.agentcore?.available));
         setTaskgenRules(env.taskgen);
       })
       .catch(() => {
@@ -133,7 +136,8 @@ export default function GenerateTaskSetForm({
       setFormError(t("taskgen.errTimeoutRange", { min: 60, max: 3600 }));
       return;
     }
-    if (!backendAvailable) {
+    // AgentCore 执行时 CLI 跑在远端镜像里,本机缺 CLI 不阻塞提交
+    if (!backendAvailable && !useAgentcore) {
       setFormError(t("taskgen.errBackendUnavailable"));
       return;
     }
@@ -150,6 +154,7 @@ export default function GenerateTaskSetForm({
         count: effectiveCount,
         guidance: guidance.trim(),
         timeout: timeout_,
+        ...(useAgentcore ? { exec_runner: "agentcore" } : {}),
         ...extraJobParams,
       });
       if (onJobCreated) {
@@ -330,6 +335,12 @@ export default function GenerateTaskSetForm({
           />
         </div>
       </div>
+
+      <ExecRunnerToggle
+        checked={useAgentcore}
+        onChange={setUseAgentcore}
+        available={agentcoreAvailable}
+      />
 
       <div className="grid gap-4 md:grid-cols-2">
         <div>

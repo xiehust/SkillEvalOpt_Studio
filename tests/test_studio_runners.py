@@ -1698,3 +1698,73 @@ class TestBackendSelection:
             "plugin_min_tasks_per_skill": 2,
             "plugin_test_reserve": 1,
         }
+
+
+class TestExecRunnerEnv:
+    """params.exec_runner → job env overrides (AgentCore remote execution)."""
+
+    def test_local_default_empty(self):
+        assert runners.exec_runner_env({}) == {}
+        assert runners.exec_runner_env({"exec_runner": "local"}) == {}
+
+    def test_unknown_runner_rejected(self):
+        with pytest.raises(ValueError, match="exec_runner must be"):
+            runners.exec_runner_env({"exec_runner": "lambda"})
+
+    def test_agentcore_requires_studio_env(self, monkeypatch):
+        monkeypatch.delenv("SKILLOPT_AGENTCORE_RUNTIME_ARN", raising=False)
+        monkeypatch.delenv("SKILLOPT_AGENTCORE_S3_BUCKET", raising=False)
+        with pytest.raises(ValueError, match="SKILLOPT_AGENTCORE_RUNTIME_ARN"):
+            runners.exec_runner_env({"exec_runner": "agentcore"})
+
+    def test_agentcore_env_passthrough(self, monkeypatch):
+        monkeypatch.setenv("SKILLOPT_AGENTCORE_RUNTIME_ARN", "arn:aws:bedrock-agentcore:us-west-2:1:runtime/x")
+        monkeypatch.setenv("SKILLOPT_AGENTCORE_S3_BUCKET", "bkt")
+        assert runners.exec_runner_env({"exec_runner": "agentcore"}) == {
+            "SKILLOPT_EXEC_RUNNER": "agentcore"
+        }
+
+    def test_agentcore_skips_local_cli_check(self, studio_config, stub_scripts, claude_skill,
+                                             single_taskset, monkeypatch):
+        monkeypatch.setattr(runners, "cli_path", lambda backend: None)
+        argv = build_eval_command(
+            studio_config,
+            {"skill_id": "claude--local-skill", "taskset_id": "single-set",
+             "exec_runner": "agentcore"},
+            job_dir_of(studio_config, "eval-agentcore"),
+        )
+        assert argv[argv.index("--target_backend") + 1] == "claude_code_exec"
+
+    def test_job_record_carries_env(self, studio_config, stub_scripts, claude_skill,
+                                    single_taskset, monkeypatch):
+        monkeypatch.setenv("SKILLOPT_AGENTCORE_RUNTIME_ARN", "arn:aws:bedrock-agentcore:us-west-2:1:runtime/x")
+        monkeypatch.setenv("SKILLOPT_AGENTCORE_S3_BUCKET", "bkt")
+        app = create_app(studio_config)
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/jobs",
+                json={"type": "eval",
+                      "params": {"skill_id": "claude--local-skill", "taskset_id": "single-set",
+                                 "exec_runner": "agentcore"}},
+            )
+            assert response.status_code == 200, response.text
+            job_id = response.json()["id"]
+        record = json.loads(
+            (studio_config.jobs_dir / job_id / "job.json").read_text(encoding="utf-8")
+        )
+        assert record["env"] == {"SKILLOPT_EXEC_RUNNER": "agentcore"}
+
+    def test_job_rejected_without_studio_env(self, studio_config, stub_scripts, claude_skill,
+                                             single_taskset, monkeypatch):
+        monkeypatch.delenv("SKILLOPT_AGENTCORE_RUNTIME_ARN", raising=False)
+        monkeypatch.delenv("SKILLOPT_AGENTCORE_S3_BUCKET", raising=False)
+        app = create_app(studio_config)
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/jobs",
+                json={"type": "eval",
+                      "params": {"skill_id": "claude--local-skill", "taskset_id": "single-set",
+                                 "exec_runner": "agentcore"}},
+            )
+        assert response.status_code == 400
+        assert "SKILLOPT_AGENTCORE_RUNTIME_ARN" in response.json()["detail"]

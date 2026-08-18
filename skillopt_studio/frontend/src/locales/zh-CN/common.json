@@ -36,6 +36,11 @@
     "notDetectedSuffix": "(未检测到 CLI)",
     "hint": "按技能来源自动推荐:codex 源技能默认用 Codex 执行。"
   },
+  "execRunner": {
+    "agentcoreLabel": "在 AgentCore 云端执行",
+    "agentcoreHint": "任务在远端 AgentCore runtime 中执行,不占用本机 CLI。",
+    "unavailableHint": "AgentCore runtime 未配置(先运行 scripts/agentcore/setup_infra.py)"
+  },
   "pagination": {
     "total": "共 {{total}} 条",
     "perPage": "{{size}} 条/页",

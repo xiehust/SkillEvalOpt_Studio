@@ -299,6 +299,7 @@ export interface BackendStatus {
 
 export interface StudioEnvironment {
   backends: BackendStatus[];
+  agentcore: { available: boolean };
   taskgen: {
     plugin_min_tasks_per_skill: number;
     plugin_test_reserve: number;

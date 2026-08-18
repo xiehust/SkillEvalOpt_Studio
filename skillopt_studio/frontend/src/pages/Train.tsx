@@ -11,7 +11,7 @@ import {
   TaskSetInfo,
 } from "../api";
 import { buildPluginGroups, filterPluginGroups } from "../components/pluginGroups";
-import { BackendSelect, Card, ErrorBanner, Mono, PageHeader, SourceFilterChips, SourceTag, Spinner } from "../components/ui";
+import { BackendSelect, Card, ErrorBanner, ExecRunnerToggle, Mono, PageHeader, SourceFilterChips, SourceTag, Spinner } from "../components/ui";
 
 export default function Train() {
   const { t } = useTranslation("wizards");
@@ -41,6 +41,8 @@ export default function Train() {
   const [evalTest, setEvalTest] = useState(false);
   const [targetBackend, setTargetBackend] = useState("claude_code_exec");
   const [backends, setBackends] = useState<BackendStatus[] | null>(null);
+  const [agentcoreAvailable, setAgentcoreAvailable] = useState(false);
+  const [useAgentcore, setUseAgentcore] = useState(false);
   const [targetModel, setTargetModel] = useState("global.anthropic.claude-opus-4-8");
   const [optimizerModel, setOptimizerModel] = useState("openai.gpt-5.6-sol");
   const [workers, setWorkers] = useState(3);
@@ -60,7 +62,12 @@ export default function Train() {
         setTasksets(tasksetList);
       })
       .catch((err) => setLoadError(err instanceof ApiError ? err.message : String(err)));
-    api.environment().then((env) => setBackends(env.backends)).catch(() => setBackends(null));
+    api.environment()
+      .then((env) => {
+        setBackends(env.backends);
+        setAgentcoreAvailable(Boolean(env.agentcore?.available));
+      })
+      .catch(() => setBackends(null));
   }, []);
 
   // 按技能来源推荐执行后端;codex 后端时模型留空(走后端默认)
@@ -283,6 +290,7 @@ export default function Train() {
           ? { trainable_files: trainableFiles }
           : {}),
         ...(selectedTaskset?.mode === "single" ? { split_ratio: splitRatio } : {}),
+        ...(useAgentcore ? { exec_runner: "agentcore" } : {}),
       });
       navigate(`/jobs/${job.id}`);
     } catch (err) {
@@ -704,6 +712,12 @@ export default function Train() {
                   <span className="block text-xs text-muted">{t("train.evalTestHint")}</span>
                 </label>
               </div>
+              <ExecRunnerToggle
+                checked={useAgentcore}
+                onChange={setUseAgentcore}
+                available={agentcoreAvailable}
+                className="pt-6"
+              />
             </div>
           </Card>
 

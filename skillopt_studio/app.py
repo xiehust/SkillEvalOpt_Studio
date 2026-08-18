@@ -51,8 +51,13 @@ def create_app(config: StudioConfig | None = None) -> FastAPI:
             backends.append(
                 {"backend": backend, "cli": cli, "available": path is not None, "path": path}
             )
+        try:
+            agentcore_available = bool(runners.exec_runner_env({"exec_runner": "agentcore"}))
+        except ValueError:
+            agentcore_available = False
         return {
             "backends": backends,
+            "agentcore": {"available": agentcore_available},
             "taskgen": {
                 "plugin_min_tasks_per_skill": PLUGIN_MIN_TASKS_PER_SKILL,
                 "plugin_test_reserve": PLUGIN_TEST_RESERVE,

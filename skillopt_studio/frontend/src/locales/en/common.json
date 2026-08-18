@@ -36,6 +36,11 @@
     "notDetectedSuffix": " (CLI not detected)",
     "hint": "Auto-recommended by skill source: codex-sourced skills default to the Codex backend."
   },
+  "execRunner": {
+    "agentcoreLabel": "Run on AgentCore (cloud)",
+    "agentcoreHint": "Tasks execute in the remote AgentCore runtime instead of this host.",
+    "unavailableHint": "AgentCore runtime not configured (run scripts/agentcore/setup_infra.py)"
+  },
   "pagination": {
     "total": "{{total}} total",
     "perPage": "{{size}} / page",

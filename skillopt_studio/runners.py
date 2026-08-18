@@ -13,6 +13,7 @@ scripts/train.py actually accepts.
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 import shlex
@@ -93,15 +94,46 @@ def cli_path(backend: str) -> str | None:
     return shutil.which(cli) if cli else None
 
 
+def _exec_runner(params: dict) -> str:
+    runner = str(params.get("exec_runner") or "local").strip().lower()
+    if runner not in {"local", "agentcore"}:
+        raise ValueError(f"exec_runner must be 'local' or 'agentcore', got {runner!r}")
+    return runner
+
+
+def exec_runner_env(params: dict) -> dict[str, str]:
+    """Env overrides for the job subprocess based on the exec_runner param.
+
+    The AgentCore runtime ARN / bucket come from the studio process env
+    (sourced from .env by start.sh); fail fast when they are missing so no
+    job is queued that can only crash."""
+    if _exec_runner(params) == "local":
+        return {}
+    missing = [
+        key
+        for key in ("SKILLOPT_AGENTCORE_RUNTIME_ARN", "SKILLOPT_AGENTCORE_S3_BUCKET")
+        if not os.environ.get(key, "").strip()
+    ]
+    if missing:
+        raise ValueError(
+            "exec_runner 'agentcore' requires the studio process environment to set "
+            + ", ".join(missing)
+            + " (run scripts/agentcore/setup_infra.py and add its output to .env)"
+        )
+    return {"SKILLOPT_EXEC_RUNNER": "agentcore"}
+
+
 def _resolve_target_backend(params: dict) -> str:
     """Validated exec backend from params (default claude_code_exec); fail-fast
-    when its CLI is not installed so no job is queued that can only crash."""
+    when its CLI is not installed so no job is queued that can only crash.
+    The CLI check is skipped for the agentcore runner — the CLI runs in the
+    remote worker image, not on this host."""
     backend = str(params.get("target_backend") or "claude_code_exec")
     if backend not in EXEC_BACKENDS:
         raise ValueError(
             f"target_backend must be one of {sorted(EXEC_BACKENDS)}, got {backend!r}"
         )
-    if cli_path(backend) is None:
+    if _exec_runner(params) == "local" and cli_path(backend) is None:
         raise ValueError(
             f"target_backend {backend!r} requires the '{EXEC_BACKENDS[backend]}' CLI, "
             "which was not found on PATH — install it and log in first"

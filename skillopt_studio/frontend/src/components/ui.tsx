@@ -240,6 +240,36 @@ export function BackendSelect({
   );
 }
 
+/** 执行位置开关:勾选后作业跑在远端 AgentCore runtime(三个向导共用)。 */
+export function ExecRunnerToggle({
+  checked, onChange, available, className = "",
+}: {
+  checked: boolean;
+  onChange: (value: boolean) => void;
+  available: boolean;
+  className?: string;
+}) {
+  const { t } = useTranslation("common");
+  const hint = available ? t("execRunner.agentcoreHint") : t("execRunner.unavailableHint");
+  return (
+    <div className={`flex items-start gap-2 ${className}`} title={available ? undefined : hint}>
+      <input
+        id="exec-runner-agentcore"
+        type="checkbox"
+        className="mt-0.5 accent-amber"
+        data-testid="agentcore-toggle"
+        checked={checked}
+        disabled={!available}
+        onChange={(event) => onChange(event.target.checked)}
+      />
+      <label htmlFor="exec-runner-agentcore" className={`text-sm ${available ? "" : "text-muted"}`}>
+        {t("execRunner.agentcoreLabel")}
+        <span className="block text-xs text-muted">{hint}</span>
+      </label>
+    </div>
+  );
+}
+
 export const PAGE_SIZES = [20, 40, 80, 120];
 
 /** 列表分页:page 越界时自动钳制,改每页条数时回到第 1 页。 */

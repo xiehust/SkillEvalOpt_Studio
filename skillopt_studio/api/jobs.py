@@ -66,6 +66,7 @@ def create_job(
     job_dir = config.jobs_dir / job_id
     try:
         cmd = _COMMAND_BUILDERS[body.type](config, body.params, job_dir)
+        env = runners.exec_runner_env(body.params)
     except ValueError as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -74,6 +75,7 @@ def create_job(
         body.params,
         cmd,
         cwd=str(runners.PROJECT_ROOT),
+        env=env,
         out_root=str(job_dir / "out"),
         job_id=job_id,
     )
