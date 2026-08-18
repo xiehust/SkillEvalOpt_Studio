@@ -12,6 +12,7 @@ import threading
 import traceback
 from typing import Any
 
+from skillopt.model import agentcore_runner
 from skillopt.model.backend_config import (
     get_claude_code_exec_config,
     get_codex_exec_config,
@@ -1279,6 +1280,24 @@ def run_claude_code_exec(
             timeout=timeout,
             policy=policy,
         )
+    if agentcore_runner.is_enabled():
+        response, raw = agentcore_runner.run_remote_exec(
+            backend="claude_code_exec",
+            work_dir=work_dir,
+            prompt=prompt,
+            model=model,
+            timeout=timeout,
+            images=images,
+            data_dirs=data_dirs,
+            exec_kwargs={
+                "allowed_tools": allowed_tools,
+                "permission_mode": permission_mode,
+                "allow_file_edits": allow_file_edits,
+            },
+            exec_config=get_claude_code_exec_config(),
+        )
+        _persist_claude_artifacts(work_dir, raw, response)
+        return response, raw
     config = get_claude_code_exec_config()
     mode = _sdk_mode(config.get("use_sdk"))
     retries = int(config.get("empty_response_retries", 0) or 0)
@@ -1530,6 +1549,23 @@ def run_codex_exec(
             timeout=timeout,
             policy=policy,
         )
+    if agentcore_runner.is_enabled():
+        response, raw = agentcore_runner.run_remote_exec(
+            backend="codex_exec",
+            work_dir=work_dir,
+            prompt=prompt,
+            model=model,
+            timeout=timeout,
+            images=images,
+            data_dirs=data_dirs,
+            exec_kwargs={
+                "sandbox": sandbox,
+                "full_auto": full_auto,
+            },
+            exec_config=get_codex_exec_config(),
+        )
+        _persist_codex_artifacts(work_dir, raw, response)
+        return response, raw
     config = get_codex_exec_config()
     mode = _sdk_mode(config.get("use_sdk"))
     retries = int(config.get("empty_response_retries", 0) or 0)
