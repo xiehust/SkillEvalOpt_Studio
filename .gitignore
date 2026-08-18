@@ -4,7 +4,13 @@ __pycache__/
 build/
 dist/
 site/
+.playwright/
+.playwright-cli/
 .pytest_cache/
+/.agents/
+/.claude/
+/.codex/
+/.kiro/
 data/*
 !data/README.md
 !data/searchqa_id_split/
