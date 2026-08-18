@@ -203,3 +203,26 @@ Diagnosed taskgen-20260716-014610-bf11d6: a parent Trellis UserPromptSubmit hook
 ### Next Steps
 
 - None - task complete
+
+
+## Session 7: AgentCore remote exec runner: async invoke + S3 round-trip, deployed & e2e-verified
+
+**Date**: 2026-08-18
+**Task**: AgentCore remote exec runner: async invoke + S3 round-trip, deployed & e2e-verified
+**Branch**: `main`
+
+### Summary
+
+Moved exec-backend task execution (eval/taskgen/train rollouts) onto Bedrock AgentCore Runtime behind SKILLOPT_EXEC_RUNNER=agentcore: per-task microVM sessions, managed session storage (no VPC/NAT), work_dir tar round-trip via S3 with a 30s worker progress sync, Bedrock-direct CLIs (zero keys). Invoke is asynchronous per runtime-long-run docs (accepted reply + HealthyBusy keep-alive; result.json is the completion channel polled by the local runner) so tasks may exceed 15 min. Judge stays local. Deployed runtime skillopt_exec_worker-o9CXNw6bpQ (us-west-2) via idempotent scripts/agentcore/setup_infra.py; Studio got an exec_runner toggle (API env passthrough + wizard checkbox, zh/en). E2E: eval 3 tasks, taskgen 2 tasks, 1-step mini-train (17 remote execs), studio job, async-marker verification; tests 1280 passed. Demo logtriage 0/3 scores are by-design sample behavior, not infra failure.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `c6b7e75` | (see git log) |
+| `73533e6` | (see git log) |
+| `7198fee` | (see git log) |
+
+### Status
+
+[OK] **Completed**
