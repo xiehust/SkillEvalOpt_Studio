@@ -21,6 +21,7 @@
 - **技能库** —— 自动扫描本机四个技能源(`~/.claude/skills` / `~/.codex/skills` / `~/.kiro/skills` / `~/.agents/skills`)并支持 zip 上传;详情页渲染 SKILL.md 与文件树。
 - **任务集管理** —— 上传 / 手动逐条录入 / **AI 自动生成**三种创建方式,已有任务集可**在线编辑**;所有写入走与 CLI 相同的严格校验(缺 rubric、重复 id 直接指出第几条)。
 - **真实评估与训练作业** —— 选技能 × 任务集 × 执行后端(Claude Code CLI / Codex CLI,按技能来源自动推荐),以子进程方式运行 `evaluate_skill.py` / `train.py`,支持排队、取消(整进程组清理)、增量日志。
+- **本地或云端执行** —— 任务执行可一键切换到 **AWS Bedrock AgentCore Runtime**:每个任务在独立 microVM 中运行(1 任务 = 1 session),CLI 走 Bedrock 直连零密钥,异步调用支持超长任务;编排与判分仍在本地。
 - **结果可视化** —— 评估的逐任务判分表、训练的验证分数曲线 + 步骤时间线 + 技能 diff(SEED → BEST)、任意产物文件浏览。
 
 ### 快速开始
@@ -42,6 +43,19 @@ cp .env.example .env ##设计.env里的bedrock api key
 ```
 
 详细使用手册:[docs/guide/studio.md](docs/guide/studio.md)。
+
+#### 可选:任务执行上云(Bedrock AgentCore)
+
+评估、taskgen、训练的 rollout 可以不占本机进程,改跑在 AWS Bedrock AgentCore Runtime 的按任务隔离 microVM 里(免 VPC/NAT,工作区经 S3 往返,容器内 claude/codex 直连 Bedrock、全链路零 API 密钥;异步调用 + `HealthyBusy` 保活,单任务最长 8 小时):
+
+```bash
+pip install boto3
+python3 scripts/agentcore/setup_infra.py     # 一条命令:S3 桶 + ECR 镜像 + 执行角色 + runtime(幂等)
+# 把脚本输出的 SKILLOPT_AGENTCORE_* 两行写入 .env,然后按需开启:
+export SKILLOPT_EXEC_RUNNER=agentcore        # CLI 全局开关;Studio 向导里则有「在 AgentCore 云端执行」勾选框
+```
+
+模型名需用 Bedrock ID(如 `us.anthropic.claude-sonnet-5` / `openai.gpt-5.6-sol`)。详见 [docs/guide/agentcore.md](docs/guide/agentcore.md)。
 
 ### 任务集:三种创建方式,全部可编辑
 
@@ -86,6 +100,7 @@ cp .env.example .env ##设计.env里的bedrock api key
 | **双执行后端(Claude Code / Codex CLI)** | 评估、训练、任务生成的目标 agent 均可选 `claude_code_exec` 或 `codex_exec`,按技能来源自动推荐;模型接入任意 OpenAI 兼容网关(环境变量已去 Azure 化:`OPENAI_ENDPOINT` / `OPENAI_API_KEY` / `OPENAI_AUTH_MODE`) |
 | **AI 自动生成评估任务集(taskgen)** | `scripts/generate_tasks.py`:agent 阅读技能全文后自动撰写带 rubric 的任务集(结果写文件而非解析 stdout,`load_tasks` 严格校验,失败自动带错误反馈重试);Studio 中以作业形式运行,审阅-导入-保存,永不跳过人工确认 |
 | **SkillEval&Opt Studio** | 上文的可视化操作台本身(原版仅有 Gradio 监控面板):技能库扫描/上传、任务集在线编辑、手动逐条录入 + JSON 格式说明、作业队列与取消、结果可视化 |
+| **AgentCore 云端执行** | 任务执行层可切换到 AWS Bedrock AgentCore Runtime:每任务独立 microVM session、managed session storage(免 VPC)、工作区 tar 经 S3 往返 + 30s 进度同步、异步 invoke(`HealthyBusy` 保活,支持 >15 分钟长任务)、容器内 CLI 直连 Bedrock 零密钥;`scripts/agentcore/setup_infra.py` 一键幂等部署,CLI 环境变量与 Studio 勾选框双入口。判分与训练编排保持本地。见 [docs/guide/agentcore.md](docs/guide/agentcore.md) |
 | **运维便利** | `start.sh` / `stop.sh` 生命周期脚本(pidfile + 健康检查 + 自动加载 `.env`)、`/api/environment` CLI 安装检测与向导内红字提醒 |
 
 ---
